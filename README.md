@@ -95,7 +95,10 @@ ThinkingAgent — это проектонезависимый субагент, 
 
 На Colab:
 
-* ячейки A–F: окружение, сборка FastAPI-сервера, запуск LLM и туннеля, фон, остановка;
+* ячейки A–F: окружение, сборка FastAPI-сервера, запуск LLM и туннеля, фон,
+  остановка; ячейка A кладёт шесть моделей Qwen2.5 — 1.5B/3B/7B и те же три
+  без цензуры (переключаются во вкладке «Модели», uncensored-сборки подписаны
+  суффиксом UNC: `1.5B-UNC` / `3B-UNC` / `7B-UNC`);
 * `scripts/build_colab.py` — автоматическая сборка zip с исходниками и генерация
   готового ноутбука.
 
@@ -109,7 +112,7 @@ ThinkingAgent — это проектонезависимый субагент, 
 | Каталог | Что лежит |
 |---|---|
 | `thinking/` | ядро на чистом stdlib: `schemas.py` — контракты и валидация JSON («источник правды»), `client.py` — синхронный клиент с повторами и историей, `fallback.py` — офлайн-заглушка, `colab/` — исходники всех ячеек ноутбука |
-| `tools/` | `thinking_cli.py` — CLI + сервер веб-панели, `thinking_panel.html` — интерфейс на 9 вкладок, `thinking_test.py` — 315 офлайн-проверок, `thinking_online_test.py` — проверки против живого Colab |
+| `tools/` | `thinking_cli.py` — CLI + сервер веб-панели, `thinking_panel.html` — интерфейс на 9 вкладок, `thinking_test.py` — 325 офлайн-проверок, `thinking_online_test.py` — проверки против живого Colab |
 | `scripts/` | автоматизация: `build_colab.py` (zip исходников + ноутбук с вшитой ссылкой за одну команду), `build_bats.py` (пересборка `.bat` с UTF-8 и `chcp 65001`), `smoke_chat.py` |
 | `docs/` | ТЗ и контракты, быстрый старт, `ДИАГНОСТИКА_ПОТОКОВ.md` (обрывы SSE), `ПЛАН_РАЗВИТИЯ.md` (дорожная карта), снимок схемы `schema_plan.json` |
 | `config/` | `thinking.json` — настройки без секретов; `thinking.local.json` — адрес и токен Colab (создаёт `set-url`, **не попадает в git**) |
@@ -173,7 +176,7 @@ ThinkingAgent — это проектонезависимый субагент, 
 
 ### 🧪 Тестирование
 
-* **315 офлайн-проверок** (`tools/thinking_test.py`) — контракты, фолбэк, кэш,
+* **325 офлайн-проверок** (`tools/thinking_test.py`) — контракты, фолбэк, кэш,
   предохранитель, саммари памяти, панель.
 * Онлайн-проверки (`tools/thinking_online_test.py`) — связь, токен, метрики,
   реальный план от LLM, рефлексия.
@@ -288,7 +291,7 @@ ThinkingAgent/
 │  ├─ client.py                 ← синхронный клиент, история, benefits()
 │  ├─ fallback.py               ← офлайн-заглушка
 │  └─ colab/                    ← исходники ячеек Colab (их же заливает zip)
-│     ├─ cell_a_setup.py        ← ячейка A: окружение + сборка + модель
+│     ├─ cell_a_setup.py        ← ячейка A: окружение + сборка + 6 моделей
 │     ├─ cell_c_server.py       ← ячейка C: сборка /content/thinking_server.py
 │     ├─ cell_d_launch.py       ← ячейка D: LLM + API + туннель → URL/токен
 │     ├─ cell_e_background.py   ← ячейка E: фоновый режим/снапшот
@@ -296,7 +299,7 @@ ThinkingAgent/
 ├─ tools/
 │  ├─ thinking_cli.py           ← CLI главного агента + панель (/api/state, SSE)
 │  ├─ thinking_panel.html       ← веб-интерфейс (9 вкладок, по-русски)
-│  ├─ thinking_test.py          ← 315 офлайн-проверок
+│  ├─ thinking_test.py          ← 325 офлайн-проверок
 │  └─ thinking_online_test.py   ← онлайн-проверки против живого Colab
 ├─ config/
 │  ├─ thinking.json             ← опции (без секретов)
@@ -359,7 +362,7 @@ python scripts/build_colab.py
    | Ячейка | Что делает | Ожидаемый итог |
    |---|---|---|
    | 1 | скачивает zip исходников в `/content/tc` | `OK: исходники на месте` |
-   | 2 (A) | зависимости, сборка llama-cpp (CPU/CUDA), скачивание Qwen2.5-7B Q4 (~4.4 ГБ) | `OK-A`, `BUILD = …` |
+   | 2 (A) | зависимости, сборка llama-cpp (CPU/CUDA), шесть Qwen2.5 (1.5B/3B/7B и три без цензуры, ~14 ГБ) | `OK-A`, `BUILD = …` |
    | 3 (C) | собирает `/content/thinking_server.py` | `записан … строк: N` |
    | 4 (D) | поднимает LLM, API, cloudflared; смоук-тест | `смоук: X.X с`, `THINKING_URL=…`, `THINKING_TOKEN=…` |
    | 5 (E) | фон/снапшот (необязательно) | `фон запущен: снапшот событий каждые 60 с` |
@@ -621,7 +624,7 @@ curl -s -X POST "$THINKING_URL/plan" -H "X-Agent-Token: $THINKING_TOKEN" \
 ## 12. Проверки
 
 ```bash
-python tools/thinking_test.py            # 315 офлайн-проверок (контракты, фолбэк, кэш, панель)
+python tools/thinking_test.py            # 325 офлайн-проверок (контракты, фолбэк, кэш, панель)
 python tools/thinking_online_test.py     # онлайн-проверки против живого Colab
 python tools/thinking_online_test.py --quick   # без LLM: связь, токен, метрики, события
 python tools/thinking_online_test.py --stream  # + отдельная проверка /plan/stream

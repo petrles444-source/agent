@@ -105,15 +105,25 @@ have = [p for p in glob.glob(os.path.join(MODEL_DIR, "**", "*.gguf"), recursive=
 
 # Качаем ВСЕ нужные модели (их переключают прямо в панели), но не качаем заново
 # то, что уже лежит: повторный запуск остаётся быстрым. Порядок важен: на GPU
-# активной становится первая (7B), без GPU — 3B (см. ниже).
+# активной становится первая (7B), без GPU — обычная 3B (см. ниже).
+# Тег (3-й элемент) — точная подстрока имени уже скачанного файла: по нему
+# узнаём свою модель. Чужой тег не должен подходить чужому файлу, иначе при
+# повторном запуске uncensored-модель принялась бы за обычную (старые теги
+# «3b»/«1.5b»/«uncensored» так и делали — теперь они конкретные).
 from huggingface_hub import hf_hub_download, list_repo_files     # noqa: E402
 
-WANTED = [("bartowski/Qwen2.5-3B-Instruct-GGUF", 1_000_000_000, "3b"),
-          ("Qwen/Qwen2.5-1.5B-Instruct-GGUF", 600_000_000, "1.5b"),
+WANTED = [("bartowski/Qwen2.5-3B-Instruct-GGUF", 1_000_000_000,
+           "3b-instruct-q4"),                    # обычная 3B
+          ("Qwen/Qwen2.5-1.5B-Instruct-GGUF", 600_000_000,
+           "1.5b-instruct-q4"),                  # обычная 1.5B
           ("bartowski/Qwen2.5-7B-Instruct-GGUF", 3_000_000_000,
-           "7b-instruct-q4"),                      # обычная 7B
+           "7b-instruct-q4"),                    # обычная 7B
           ("QuantFactory/Qwen2.5-7B-Instruct-Uncensored-GGUF", 3_000_000_000,
-           "uncensored")]                          # та же 7B без цензуры
+           "7b-instruct-uncensored"),            # 7B без цензуры
+          ("mradermacher/Qwen2.5-3B-Instruct-Uncensored-GGUF", 1_000_000_000,
+           "3b-instruct-uncensored"),            # лёгкая 3B без цензуры
+          ("mradermacher/Qwen2.5-1.5B-Instruct-uncensored-GGUF", 600_000_000,
+           "1.5b-instruct-uncensored")]          # самая быстрая без цензуры
 if GPU:                                   # с видеокартой 7B — первая (активна)
     WANTED.insert(0, ("bartowski/Qwen2.5-7B-Instruct-GGUF", 3_000_000_000,
                       "7b-instruct-q4"))
@@ -121,7 +131,7 @@ if GPU:                                   # с видеокартой 7B — п�
 
 
 def _has(tag: str) -> str:
-    """Путь к уже скачанной модели по её размеру (1.5b / 3b / 7b)."""
+    """Путь к уже скачанной модели по точному тегу (3b-instruct-q4, …)."""
     low = tag.lower()
     for p in have:
         name = os.path.basename(p).lower()
@@ -144,7 +154,8 @@ def _fetch(repo: str, min_size: int) -> str:
     return got if size >= min_size else ""
 
 
-MODELS: list[str] = []                       # 3b, 1.5b, 7b — в этом порядке
+MODELS: list[str] = []                       # 3b, 1.5b, 7b и те же три без
+                                              # цензуры — в этом порядке
 for repo, min_size, tag in WANTED:
     path = _has(tag)
     if path:
@@ -165,8 +176,10 @@ if not MODELS:                              # аварийный план: чт�
     MODELS = have
 assert MODELS, "ни одна модель не нашлась"
 
-# Без видеокарты активной делаем 3B — на CPU 7B считается ~1 ток/с и мешает
-# работать; 1.5B остаётся запасной (быстрее, но отвечает короче и проще).
+# Без видеокарты активной делаем обычную 3B (она идёт первой) — на CPU 7B
+# считается ~1 ток/с и мешает работать; 1.5B остаётся запасной (быстрее, но
+# отвечает короче и проще). Сборки без цензуры — по желанию, их выбирают
+# во вкладке «Модели» (подписи 1.5B-UNC / 3B-UNC / 7B-UNC).
 if GPU:
     MODEL = MODELS[0]
 else:
