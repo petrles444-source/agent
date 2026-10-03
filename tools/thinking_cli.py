@@ -46,7 +46,7 @@ if str(ROOT) not in sys.path:
 
 from thinking.client import ThinkingClient, ThinkingError  # noqa: E402
 from thinking.schemas import (ChatReply, MAX_MEMORY_FACTS, MAX_MEMORY_TURNS,  # noqa: E402
-                              SchemaError)
+                              SchemaError, utcnow)
 from thinking.fallback import offline_reason  # noqa: E402
 
 # русские названия тегов — в интерфейсе латиница не показывается
@@ -222,11 +222,26 @@ def cmd_ask(client: ThinkingClient, args: argparse.Namespace) -> int:
 
 def cmd_reflect(client: ThinkingClient, args: argparse.Namespace) -> int:
     if args.async_mode:
-        th = threading.Thread(
-            target=lambda: _do_reflect(client, args, echo=True),
-            daemon=True)
-        th.start()
-        _out("рефлексия запущена в фоне — результат: python tools/thinking_cli.py tail")
+        # Фон — только отсоединённым процессом: daemon-поток умирал вместе
+        # с CLI на середине HTTP-запроса, и результат рефлексии терялся
+        # (баг аудита AUD-03). Дочерний процесс сам дописывает журнал и
+        # отчёт, родитель сразу освобождает терминал.
+        cmd = [sys.executable, os.path.abspath(__file__), "reflect",
+               args.plan_id, "--step", str(args.step), "--result", args.result]
+        if args.observation:
+            cmd += ["--observation", args.observation]
+        if args.error:
+            cmd += ["--error", args.error]
+        kw: dict = {}
+        if os.name == "posix":
+            kw["start_new_session"] = True   # переживает закрытие терминала
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(ROOT), **kw)
+        except OSError as exc:
+            _out(f"! фон не запустился ({exc}) — выполняю синхронно")
+            return _do_reflect(client, args, echo=True)
+        _out(f"рефлексия запущена в фоне (pid {proc.pid}) — "
+             f"результат: python tools/thinking_cli.py tail")
         return 0
     return _do_reflect(client, args, echo=True)
 
@@ -269,12 +284,23 @@ def cmd_tail(client: ThinkingClient, args: argparse.Namespace) -> int:
     client.start_stream(lambda ev: _out(
         f"{ev.get('ts', '')}  [{EVENT_RU.get(ev.get('type', ''), ev.get('type'))}] "
         f"{str(ev.get('text', ''))[:400]}"))
+    was_online, last_warn = True, 0.0
     try:
-        seen = len(client.buffered)
         while True:
             time.sleep(0.5)
-            if not client.online:
+            if client.online:
+                if not was_online:
+                    _out("[связь восстановлена]")
+                was_online, last_warn = True, 0.0
+                continue
+            # Печатаем при изменении состояния и не чаще раза в 15 с —
+            # иначе при длинном офлайне хвост спамит «[нет связи]» каждые
+            # 0,5 с (аудит AUD-23).
+            now = time.time()
+            if was_online or now - last_warn >= 15:
                 _out(f"[нет связи] {client.last_error or 'реконнект…'}")
+                last_warn = now
+            was_online = False
     except KeyboardInterrupt:
         client.stop_stream()
         _out("остановлено")
@@ -549,7 +575,16 @@ def _cache_get(client: ThinkingClient, kind: str, message: str) -> dict | None:
     if not path or not Path(path).exists():
         return None
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()[-60:]
+        # Читаем только хвост файла (до 512 КБ): полное чтение всего
+        # журнала (после ротации — до 8 МБ) на каждом промахе кэша было
+        # заметно при живом чате (аудит AUD-25). Обрезанная первая строка
+        # не распарсится — она и не нужна: окно и так хвостовые 60 строк.
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 512 * 1024))
+            tail = fh.read().decode("utf-8", "replace")
+        lines = tail.splitlines()[-60:]
     except OSError:
         return None
     for line in reversed(lines):
@@ -600,6 +635,46 @@ def _cache_journal(client: ThinkingClient, message: str, reply: dict) -> None:
             cached=True)
     except Exception as exc:                                # noqa: BLE001
         _out(f"! кэш: не записал в журнал диалога: {exc}")
+
+
+def memory_action(client: ThinkingClient, data: dict) -> tuple[int, dict]:
+    """Действия вкладки «Память» — вынесены из обработчика панели, чтобы
+    тесты звали их напрямую как поведение (раньше в ветках export/import
+    падал NameError из-за неимпортированного utcnow — аудит AUD-01,
+    баг с первого релиза панели)."""
+    act = str(data.get("action") or "")
+    if act == "export":
+        # «Поделиться памятью»: обычный JSON с профилем и фактами
+        return 200, {"memory": client.memory(), "exported": utcnow()}
+    if act == "import":
+        raw = data.get("memory")
+        if not isinstance(raw, dict):
+            return 400, {"error": "импорт: нужен объект memory"}
+        # ввозим только известные поля, с лимитами схемы
+        turns = [t for t in (raw.get("turns") or [])
+                 if isinstance(t, dict) and str(t.get("text") or "").strip()]
+        clean = {"profile": str(raw.get("profile") or "")[:800],
+                 "facts": [str(f)[:300] for f in (raw.get("facts") or [])
+                           if str(f).strip()][-MAX_MEMORY_FACTS:],
+                 "turns": turns[-MAX_MEMORY_TURNS:],
+                 "updated": utcnow()}
+        client._write_memory(clean)  # noqa: SLF001 — свой же метод
+        _out(f"[память] импорт: фактов {len(clean['facts'])}, "
+             f"реплик {len(clean['turns'])}")
+        return 200, {"memory": client.memory()}
+    if act == "forget":
+        mem = client.forget(facts=bool(data.get("facts", True)),
+                            turns=bool(data.get("turns", True)))
+    elif act == "remove" and data.get("fact"):
+        mem = client.memory()
+        mem["facts"] = [f for f in mem["facts"]
+                        if f != str(data["fact"])]
+        client._write_memory(mem)  # noqa: SLF001 — свой же метод
+        mem = client.memory()
+    else:
+        mem = client.remember(fact=str(data.get("fact") or ""),
+                              profile=str(data.get("profile") or ""))
+    return 200, {"memory": mem}
 
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +1007,7 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 _out(f"[откат] {out['name']} ← {out['restored']}")
                 self._json_out(200, out)
                 return
-            if path == "/api/devump":
+            if path == "/api/dev/dump":
                 try:
                     target = _dev_dump(client)
                 except OSError as exc:
@@ -1003,6 +1078,7 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
                 seen = 0
+                last_ping = 0.0
                 try:
                     while True:
                         for ev in client.buffered:
@@ -1011,7 +1087,12 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                                 seen = seq
                                 payload = json.dumps(ev, ensure_ascii=False, default=str)
                                 self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                        self.wfile.write(b": ping\n\n")
+                        # ping — раз в 5 с, а не каждый тик: частые
+                        # комментарии шумят в логах прокси (аудит AUD-25)
+                        now = time.time()
+                        if now - last_ping >= 5:
+                            self.wfile.write(b": ping\n\n")
+                            last_ping = now
                         self.wfile.flush()
                         time.sleep(0.3)
                 except (BrokenPipeError, ConnectionResetError,

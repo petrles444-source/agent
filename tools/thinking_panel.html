@@ -1351,7 +1351,9 @@ async function devSave(source, forceName, forceContent) {
     if (r.error) { devOut("не записалось: " + r.error, "err"); return ""; }
     devSaved = content;
     devOut((r.existed ? "сохранено (откат доступен): " : "создано: ") + r.name, "ok");
-    devRefresh(r.name);
+    /* ждём обновления списка и перечитывания файла с диска — иначе у
+       «Запустить» есть гонка: редактор ещё показывает старый текст */
+    await devRefresh(r.name);
     return r.name;
   } catch (e) {
     devOut("панель не ответила: " + e, "err");
@@ -1415,7 +1417,7 @@ async function devLog() {
 }
 async function devDump() {
   try {
-    const r = await api("/api/devump", {});
+    const r = await api("/api/dev/dump", {});
     if (r.error) { devOut("дамп не собрался: " + r.error, "err"); return; }
     devOut("дамп собран: " + r.path, "ok");
   } catch (e) {
@@ -1501,9 +1503,20 @@ async function devConfirmAnswer(kind) {
     devChatAdd("ai", "Применение отменено человеком.");
     return;
   }
-  const name = await devSave("model");
+  /* Код и имя — из предложения модели (devPending), а не из редактора:
+     раньше сюда шли пустые аргументы, и на диск шло прежнее содержимое
+     редактора под именем текущего файла (баг аудита AUD-02 — человек видел
+     код модели, применялся старый код). */
+  const name = await devSave("model", p.filename, p.code);
   if (!name) {
     devChatAdd("ai", "Изменение НЕ применено: файл не записался (см. вывод).");
+    return;
+  }
+  if (p.filename && name !== p.filename) {
+    /* страховка: сервер мог нормализовать имя («../», абсолютный путь) —
+       тогда код модели лёг не туда, куда показывало окно */
+    devChatAdd("ai", "⚠ записалось не в тот файл: ожидался «" + p.filename
+      + "», записано в «" + name + "» — проверь вкладку «Разработка».");
     return;
   }
   devChatAdd("ai", "Применено: " + name + ". Старая версия сохранена для отката.");
@@ -1585,7 +1598,7 @@ async function state() {
       + (s.last_error ? " · " + s.last_error : "");
     showLimitWarn(h);
     const sig = JSON.stringify([s.interactions, s.reports, s.benefits,
-                                s.chat, s.tokens]);
+                                s.chat, s.tokens, s.memory]);
     if (sig !== lastSig) {
       lastSig = sig;
       renderReports(s.reports || []);
@@ -1594,8 +1607,11 @@ async function state() {
       renderBenefit(s.benefits);
       renderChat(s.chat || []);
       renderTokens(s.tokens);
+      /* Память тоже под сигнатурой (AUD-15): раньше renderMemory вызывался
+         каждый цикл (2,5 с) и пересоздавал поле ввода, стирая набранный
+         факт посреди набора. Теперь — только при реальном изменении. */
+      renderMemory(s.memory);
     }
-    renderMemory(s.memory);
   } catch (e) { setBadge(false); }
 }
 /* Лимиты бесплатного Colab: чётких квот нет, цифры в сообщениях — ориентир.
