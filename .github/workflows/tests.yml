@@ -1,0 +1,31 @@
+# Офлайн-проверки субагента «Мышление» на каждый push/PR.
+# Тесты не ходят в сеть и не требуют Colab — только чистый Python stdlib.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  offline:
+    name: офлайн-проверки (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+        os: [ubuntu-latest]
+        include:
+          # Windows-окружение разработчика — проверяем и его
+          - os: windows-latest
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Контракты, фолбэк, кэш, память, панель, Colab-ячейки
+        run: python tools/thinking_test.py

@@ -28,6 +28,11 @@ from thinking.schemas import (MAX_MEMORY_FACTS, MAX_MEMORY_TURNS, ChatReply,
                               has_secret, redact_secrets, utcnow)
 
 
+def _norm_fact(text: str) -> str:
+    """Нормализация факта для дедупликации: регистр, пробелы, края пунктуации."""
+    return " ".join(str(text).split()).lower().strip(" .,;:!?…")
+
+
 def _turn_line(turn: dict) -> str:
     """Одна реплика памяти в компактной строке для промта."""
     who = "субагент" if turn.get("role") == "subagent" else "я"
@@ -332,7 +337,7 @@ class ThinkingClient:
                 "context": context or {},
                 "constraints": constraints or [],
                 "max_steps": max(1, min(30, int(max_steps))),
-            }, timeout=max(self.timeout, float(self.cfg.get("plan_timeout", 180))))
+            }, timeout=max(self.timeout, float(self.cfg.get("plan_timeout", 360))))
         except Exception as exc:
             self.stats["errors"] += 1
             self._record("plan", task, t0, ok=False, summary=f"не ответил: {exc}"[:400])
@@ -360,7 +365,7 @@ class ThinkingClient:
         plan: dict = {}
         # Первый байт может ждать и подсказку, и генерацию — даём плановый
         # таймаут, а не обычный: токены после старта идут плотно.
-        read_to = max(self.timeout, float(self.cfg.get("plan_timeout", 180)))
+        read_to = max(self.timeout, float(self.cfg.get("plan_timeout", 360)))
         with self._open("POST", "/plan/stream", body, stream=True,
                         timeout=read_to) as resp:
             buf: list[str] = []
@@ -831,8 +836,13 @@ class ThinkingClient:
             body["profile"] = str(mem["profile"])[:800]
 
         out: dict = {}
+        # Медленная модель (7B на CPU считает ~1 ток/с) и «окна» на пути до
+        # туннеля: не-потоковый чат ждём дольше обычного 45-секундного лимита,
+        # иначе честный ответ превращается в заглушку «субагент недоступен».
+        read_to = timeout or max(self.timeout,
+                                 float(self.cfg.get("chat_json_timeout", 300)))
         try:
-            out = self._json("POST", "/chat", body, timeout=timeout)
+            out = self._json("POST", "/chat", body, timeout=read_to)
         except ThinkingError as exc:
             if _looks_like_missing_route(exc):
                 # сервер без /chat (старый Colab) — не ошибка, а повод сработать
@@ -929,7 +939,7 @@ class ThinkingClient:
         попыткой — интерфейс может сказать человеку «повторяю…».
         Ошибки сервера/схемы (ThinkingError) не повторяются.
         """
-        stall = float(self.cfg.get("stream_stall", 45))
+        stall = float(self.cfg.get("stream_stall", 75))
         budget = max(stall * 2, float(self.cfg.get("chat_timeout", 600)))
         total = 1 + max(0, int(self.cfg.get("stream_retries", 2)))
         t0 = time.time()
@@ -1012,11 +1022,23 @@ class ThinkingClient:
         if use_memory and mem.get("profile"):
             body["profile"] = str(mem["profile"])[:800]
 
-        pieces, done = self._stream_read(
-            "/chat/stream", body, on_token=on_token, on_retry=on_retry,
-            label="поток чата")
-        if not done:
-            raise ThinkingError("поток чата завершился без ответа")
+        try:
+            pieces, done = self._stream_read(
+                "/chat/stream", body, on_token=on_token, on_retry=on_retry,
+                label="поток чата")
+            if not done:
+                raise ThinkingError("поток чата завершился без ответа")
+        except ThinkingError as exc:
+            # Запасной транспорт (решение от 03.10): при обрывах «окнами»
+            # короткий не-потоковый /chat проходит там, где SSE умирает.
+            # Ошибки самого сервера не повторяем — он ответит тем же.
+            if str(exc).startswith("сервер:"):
+                raise
+            log.warning("поток чата не прошёл (%s) — пробую /chat без потока", exc)
+            out = self.chat(text, use_memory=use_memory, max_steps=max_steps,
+                            timeout=timeout)
+            out["stream_fallback"] = True     # панель покажет «без потока»
+            return out
         out = dict(done)
         if not str(out.get("reply") or "").strip():
             out["reply"] = "".join(pieces).strip()
@@ -1094,12 +1116,18 @@ class ThinkingClient:
                 "/dev/stream", body, on_token=on_token, on_retry=on_retry,
                 label="поток разработки")
         except ThinkingError as exc:
-            if not _looks_like_missing_route(exc):
+            if str(exc).startswith("сервер:"):
+                # Сервер сам ответил отказом — повторять бессмысленно.
                 self.stats["errors"] += 1
                 self._record("dev", body["message"], t0, ok=False,
                              summary=f"не ответил: {exc}"[:400])
                 raise
-            # Потокового маршрута нет — пробуем обычный POST /dev
+            if not _looks_like_missing_route(exc):
+                # Поток оборвался после попыток: короткий не-потоковый
+                # POST /dev в «плохие окна» проходит там, где SSE умирает.
+                log.warning("поток разработки не прошёл (%s) — пробую /dev без потока",
+                            exc)
+            # Нет потокового маршрута либо он не прошёл — обычный POST /dev
             try:
                 out = self._json("POST", "/dev", body, timeout=timeout or read_to)
                 done = out if isinstance(out, dict) else {}
@@ -1163,16 +1191,37 @@ class ThinkingClient:
                 "updated": str(data.get("updated") or "")}
 
     def remember(self, fact: str = "", profile: str = "") -> dict:
-        """Добавляет факт (и/или описание проекта) в память."""
+        """Добавляет факт (и/или описание проекта) в память.
+
+        Дедупликация: точный дубль (после нормализации) не добавляется,
+        а пересекающийся факт заменяется более полным — вместо двух почти
+        одинаковых строк остаётся одна.
+        """
         fact = str(fact or "").strip()
         self._check_secrets(fact, profile)
         mem = self.memory()
         if profile.strip():
             mem["profile"] = profile.strip()[:800]
         if fact:
-            facts = [f for f in mem["facts"] if f != fact]
-            facts.append(fact[:300])
-            mem["facts"] = facts[-MAX_MEMORY_FACTS:]
+            new = _norm_fact(fact)
+            facts = list(mem["facts"])
+            if not any(_norm_fact(f) == new for f in facts):
+                merged = False
+                for i, old in enumerate(facts):
+                    o = _norm_fact(old)
+                    # пересечение: одна строка целиком содержится в другой
+                    if o and o != new and min(len(o), len(new)) >= 12 and \
+                            (o in new or new in o):
+                        if len(fact) > len(old):      # оставляем более полный
+                            facts[i] = fact[:300]
+                        merged = True
+                        log.info("память: факт объединён с похожим — %s", fact[:80])
+                        break
+                if not merged:
+                    facts.append(fact[:300])
+                mem["facts"] = facts[-MAX_MEMORY_FACTS:]
+            else:
+                log.info("память: дубль не добавлен — %s", fact[:80])
         mem["updated"] = utcnow()
         self._write_memory(mem)
         return mem

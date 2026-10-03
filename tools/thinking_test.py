@@ -738,6 +738,76 @@ def test_quickwins() -> None:
           '"cached": bool(cached)' in client_src,
           "клиент: журнал диалога помечает ответ из кэша")
 
+    # --- запасной транспорт: не-потоковый fallback ---
+    fb = make_client()
+
+    def _stall(*_a, **_k):
+        raise ThinkingError("поток чата оборвался после 3 попыток: timeout")
+
+    fb._stream_read = _stall
+    fb.chat = lambda message, **_k: {"reply": "ответ через /chat"}
+    res = fb.chat_stream("вопрос на fallback")
+    check(res.get("reply") == "ответ через /chat" and
+          res.get("stream_fallback") is True,
+          "запасной транспорт: chat_stream падает на не-потоковый /chat")
+
+    fb2 = make_client()
+    fb2._stream_read = lambda *_a, **_k: (_ for _ in ()).throw(
+        ThinkingError("сервер: LLM отказал"))
+    called: list = []
+    fb2.chat = lambda *a, **k: called.append(a)
+    try:
+        fb2.chat_stream("вопрос на серверную ошибку")
+        check(False, "запасной транспорт: серверная ошибка должна всплыть")
+    except ThinkingError:
+        check(not called, "запасной транспорт: серверная ошибка не дублируется /chat")
+
+    dv = make_client(devlog_path=str(TMP / "devlog_qw.jsonl"))
+    dv._stream_read = lambda *_a, **_k: (_ for _ in ()).throw(
+        ThinkingError("поток разработки оборвался после 3 попыток: timeout"))
+    dv._json = lambda *_a, **_k: {"proposal": {"action": "edit",
+                                                "filename": "a.py",
+                                                "code": "x = 1", "comment": "ок"}}
+    prop = dv.dev("измени a.py")
+    check(prop.get("action") == "edit",
+          "запасной транспорт: dev падает на обычный POST /dev")
+    check("stream_fallback" in client_src and "без потока" in panel,
+          "запасной транспорт: панель помечает ответ без потока")
+
+    # --- дедупликация фактов ---
+    ded = make_client(memory_path=str(TMP / "mem_dedup.json"))
+    ded.remember(fact="Тестовый факт о проекте")
+    ded.remember(fact="  тестовый факт о проекте. ")
+    check(len(ded.memory()["facts"]) == 1, "память: точный дубль не добавляется")
+    ded.remember(fact="Тестовый факт о проекте и ещё детали про таймауты")
+    got = ded.memory()["facts"]
+    check(len(got) == 1 and "ещё детали" in got[0],
+          "память: пересекающийся факт заменён более полным")
+
+    # --- экспорт/импорт памяти ---
+    check('act == "export"' in cli_src and "_write_memory(clean)" in cli_src,
+          "память: экспорт и импорт через /api/memory (с лимитами)")
+    check("exportMemory" in panel and "importMemory" in panel,
+          "память: кнопки экспорта/импорта в панели")
+
+    # --- CI и CHANGELOG ---
+    workflows = list((ROOT / ".github" / "workflows").glob("*.yml"))
+    wf_text = "".join(p.read_text(encoding="utf-8") for p in workflows)
+    check(bool(workflows) and "thinking_test.py" in wf_text,
+          "CI: GitHub Actions гоняет офлайн-тесты")
+    check((ROOT / "CHANGELOG.md").read_text(encoding="utf-8").count("##") >= 2,
+          "CHANGELOG.md: есть разделы по датам")
+
+    # --- тайминги под медленную модель и «окна» туннеля ---
+    check('"chat_json_timeout", 300' in client_src,
+          "чат: не-потоковый ответ ждёт до 300 с, а не 45")
+    check('"stream_stall", 75' in client_src,
+          "поток: stall 75 с — учитывает обработку промта на CPU")
+    check('"plan_timeout", 360' in client_src,
+          "план: read-timeout 360 с под медленную модель")
+    check("напиши ещё раз, обычно помогает повтор" in panel,
+          "панель: человеческая подсказка при обрыве в «Разработке»")
+
 
 def main() -> int:
     test_schemas()

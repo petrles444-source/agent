@@ -45,7 +45,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from thinking.client import ThinkingClient, ThinkingError  # noqa: E402
-from thinking.schemas import ChatReply, SchemaError  # noqa: E402
+from thinking.schemas import (ChatReply, MAX_MEMORY_FACTS, MAX_MEMORY_TURNS,  # noqa: E402
+                              SchemaError)
 from thinking.fallback import offline_reason  # noqa: E402
 
 # русские названия тегов — в интерфейсе латиница не показывается
@@ -578,7 +579,10 @@ def _cache_put(client: ThinkingClient, kind: str, message: str,
     ttl, norm = _cache_ttl(client), _cache_norm(message)
     if not norm or ttl <= 0 or reply.get("fallback"):
         return
-    _ANSWER_CACHE[f"{kind}\x00{norm}"] = (time.time(), dict(reply))
+    # служебный флаг «ответ без потока» в кэш не кладём: кэшированный
+    # повтор — это уже не про обрыв, а про скорость
+    clean = {k: v for k, v in reply.items() if k != "stream_fallback"}
+    _ANSWER_CACHE[f"{kind}\x00{norm}"] = (time.time(), clean)
     while len(_ANSWER_CACHE) > _CACHE_MAX:
         _ANSWER_CACHE.pop(next(iter(_ANSWER_CACHE)))
 
@@ -780,10 +784,34 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 return
             if path == "/api/memory":
                 try:
-                    if data.get("action") == "forget":
+                    act = str(data.get("action") or "")
+                    if act == "export":
+                        # «Поделиться памятью»: обычный JSON с профилем и фактами
+                        self._json_out(200, {"memory": client.memory(),
+                                             "exported": utcnow()})
+                        return
+                    if act == "import":
+                        raw = data.get("memory")
+                        if not isinstance(raw, dict):
+                            self._json_out(400, {"error": "импорт: нужен объект memory"})
+                            return
+                        # ввозим только известные поля, с лимитами схемы
+                        turns = [t for t in (raw.get("turns") or [])
+                                 if isinstance(t, dict) and str(t.get("text") or "").strip()]
+                        clean = {"profile": str(raw.get("profile") or "")[:800],
+                                 "facts": [str(f)[:300] for f in (raw.get("facts") or [])
+                                           if str(f).strip()][-MAX_MEMORY_FACTS:],
+                                 "turns": turns[-MAX_MEMORY_TURNS:],
+                                 "updated": utcnow()}
+                        client._write_memory(clean)  # noqa: SLF001 — свой же метод
+                        _out(f"[память] импорт: фактов {len(clean['facts'])}, "
+                             f"реплик {len(clean['turns'])}")
+                        self._json_out(200, {"memory": client.memory()})
+                        return
+                    if act == "forget":
                         mem = client.forget(facts=bool(data.get("facts", True)),
                                             turns=bool(data.get("turns", True)))
-                    elif data.get("action") == "remove" and data.get("fact"):
+                    elif act == "remove" and data.get("fact"):
                         mem = client.memory()
                         mem["facts"] = [f for f in mem["facts"]
                                         if f != str(data["fact"])]

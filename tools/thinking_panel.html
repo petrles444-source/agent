@@ -777,6 +777,14 @@ async function renderMemory(mem) {
   const btn = el("button", "mini", "Запомнить");
   btn.onclick = () => addFact(inp);
   bar.appendChild(btn);
+  const ex = el("button", "mini", "Экспорт памяти");
+  ex.title = "скачать memory.json — поделиться с коллегой или перенести в другой проект";
+  ex.onclick = () => exportMemory();
+  bar.appendChild(ex);
+  const im = el("button", "mini", "Импорт памяти");
+  im.title = "загрузить ранее выгруженный memory.json (заменит текущую память)";
+  im.onclick = () => importMemory();
+  bar.appendChild(im);
   if (facts.length || (m.turns || []).length) {
     const f = el("button", "mini del", "Стереть память");
     f.onclick = async () => { if (!confirm("Стереть память субагента?")) return;
@@ -790,6 +798,39 @@ async function addFact(inp) {
   inp.value = "";
   await api("/api/memory", {fact: v});
   state();
+}
+async function exportMemory() {
+  // «Поделиться памятью»: скачиваем текущий memory.json файлом
+  try {
+    const res = await api("/api/memory", {action: "export"});
+    const blob = new Blob([JSON.stringify(res.memory || {}, null, 2)],
+                          {type: "application/json;charset=utf-8"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "thinking_memory.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) { alert("Экспорт памяти не удался: " + e); }
+}
+function importMemory() {
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "application/json,.json";
+  inp.onchange = async () => {
+    const f = inp.files && inp.files[0];
+    if (!f) return;
+    try {
+      const mem = JSON.parse(await f.text());
+      if (!mem || typeof mem !== "object" || Array.isArray(mem))
+        throw new Error("ожидался JSON-объект");
+      if (!confirm("Импорт заменит текущую память субагента. Продолжить?")) return;
+      await api("/api/memory", {action: "import", memory: mem});
+      state();
+    } catch (e) { alert("Импорт памяти не удался: " + e); }
+  };
+  inp.click();
 }
 
 /* ---------- чат с субагентом ---------- */
@@ -994,6 +1035,7 @@ async function sendChat() {
       b.textContent = r.reply || b.textContent || "(пусто)";
       const meta = [dttm(r.at)];
       if (r.cached) meta.push("из кэша");
+      if (r.stream_fallback) meta.push("без потока — SSE не прошёл, ответ через /chat");
       if (r.duration_ms) meta.push("ожидание " + sec(r.duration_ms));
       if (r.tokens_in || r.tokens_out)
         meta.push("токены " + (r.tokens_in || 0) + "+" + (r.tokens_out || 0));
@@ -1407,7 +1449,15 @@ async function devSend() {
   try {
     const res = await api("/api/dev/chat",
       {message: msg, active: devCurrent || document.getElementById("devsel").value});
-    if (res.error) { devChatAdd("ai", "Ошибка: " + res.error); return; }
+    if (res.error) {
+      /* Человеку — связь, а не urllib: «The read operation timed out»
+         ничего не говорит о том, что делать дальше. */
+      const hint = /оборвался|timed out|недоступен|предохранитель|HTTP 5/.test(res.error)
+        ? " Связь с Colab прервалась — напиши ещё раз, обычно помогает повтор."
+        : "";
+      devChatAdd("ai", "Ошибка: " + res.error + hint);
+      return;
+    }
     const p = res.proposal || {};
     if (p.action === "none" || !p.code) {
       devChatAdd("ai", p.comment || "(модель не стала менять файлы)");
