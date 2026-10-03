@@ -203,11 +203,16 @@ class ThinkingClient:
         self.stats = {"plans": 0, "reflects": 0, "fallbacks": 0, "chats": 0,
                       "blocked_ms": 0, "background_ms": 0, "errors": 0}
         self._disk_cache: tuple = (None, [], [])
-        self._mem_cache: tuple = (None, {})
+        # (аудит AUD-20: неиспользуемый _mem_cache удалён — memory() всегда
+        # читает файл по mtime, а кэширование давало бы риск устаревших данных)
         # Предохранитель транспорта: N ошибок подряд → пауза вместо спама
         # ретраями, когда туннель мёртв (HTTP 5xx, обрывы, таймауты).
+        # Каналы раздельные (AUD-05): REST и длинный поток считают отдельно.
         self._cb_errors = 0
         self._cb_open_until = 0.0
+        self._cb_stream_errors = 0
+        self._cb_stream_until = 0.0
+        self.health_data: dict = {}
 
     # ------------------------------------------------------------------ #
     #  конфигурация
@@ -244,11 +249,17 @@ class ThinkingClient:
               timeout: Optional[float] = None, stream: bool = False):
         if not self.base:
             raise ThinkingError("base_url пуст — выполните set-url или задайте THINKING_URL")
-        if time.time() < self._cb_open_until:
+        # Предохранители разведены (аудит AUD-05): пять обрывов длинного
+        # потока событий не должны блокировать короткие REST-вызовы (чат,
+        # разработка, health) на 10 минут — у каналов свои счётчики и своя
+        # пауза. Живой туннель (успех любого канала) сбрасывает оба счётчика.
+        gate = self._cb_stream_until if stream else self._cb_open_until
+        if time.time() < gate:
             # Туннель уже доказал, что он мёртв: не ходим по нему вхолостую.
+            errs = self._cb_stream_errors if stream else self._cb_errors
             raise ThinkingError(
-                f"предохранитель: {self._cb_errors} ошибок подряд, "
-                f"пауза ещё {int(self._cb_open_until - time.time())} с")
+                f"предохранитель{' потока' if stream else ''}: {errs} ошибок подряд, "
+                f"пауза ещё {int(gate - time.time())} с")
         url = f"{self.base}{path}"
         payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {"Accept": "text/event-stream" if stream else "application/json"}
@@ -268,6 +279,7 @@ class ThinkingClient:
                 self.last_ok = utcnow()
                 self.last_error = ""
                 self._cb_errors = 0      # успех сбрасывает счётчик ошибок
+                self._cb_stream_errors = 0  # живой туннель виден обоим каналам
                 return resp
             except urllib.error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", "replace")[:400]
@@ -283,15 +295,25 @@ class ThinkingClient:
             log.warning("thinking %s %s не прошёл (%s), повтор через %.1f с",
                         method, path, last, wait)
             time.sleep(wait)
-        self.online = False
-        self.last_error = str(last)[:200]
-        self._cb_errors += 1
         limit = int(self.cfg.get("breaker_errors", 5))
-        if self._cb_errors >= limit:
-            pause = float(self.cfg.get("breaker_pause", 600))
-            self._cb_open_until = time.time() + pause
-            log.warning("предохранитель открыт: %d ошибок подряд — пауза %.0f с",
-                        self._cb_errors, pause)
+        if stream:
+            # Длинный поток — отдельный канал: его неудачи копятся только у
+            # потока и не трогают онлайн-статус (его ведёт REST /health).
+            self._cb_stream_errors += 1
+            if self._cb_stream_errors >= limit:
+                pause = float(self.cfg.get("breaker_pause", 600))
+                self._cb_stream_until = time.time() + pause
+                log.warning("предохранитель потока открыт: %d ошибок подряд — пауза %.0f с",
+                            self._cb_stream_errors, pause)
+        else:
+            self.online = False
+            self.last_error = str(last)[:200]
+            self._cb_errors += 1
+            if self._cb_errors >= limit:
+                pause = float(self.cfg.get("breaker_pause", 600))
+                self._cb_open_until = time.time() + pause
+                log.warning("предохранитель открыт: %d ошибок подряд — пауза %.0f с",
+                            self._cb_errors, pause)
         raise ThinkingError(f"субагент недоступен: {last}")
 
     def _json(self, method: str, path: str, body: Optional[dict] = None,
@@ -318,13 +340,12 @@ class ThinkingClient:
             self.health_data = {}
             return False
 
-    health_data: dict = {}
-
     def _check_secrets(self, *parts: Any) -> None:
         blob = " ".join(str(p) for p in parts)
         if has_secret(blob):
             raise SchemaError("в запросе обнаружен секрет — в контекст/задачу "
-                              "нельзя передавать токены и пароли")
+                              "нельзя передавать токены и пароли: уберите "
+                              "значение (оставьте ссылку вида os.getenv(...))")
 
     def plan(self, task: str, context: Optional[dict] = None,
              constraints: Optional[list[str]] = None, max_steps: int = 12) -> dict:
@@ -343,13 +364,22 @@ class ThinkingClient:
             self._record("plan", task, t0, ok=False, summary=f"не ответил: {exc}"[:400])
             raise
         if isinstance(out, dict):
-            self._remember_json("plan", out)
-            self._report_plan(out, task)
-            self.stats["plans"] += 1
-            self.stats["blocked_ms"] += int((time.time() - t0) * 1000)
-            self._record("plan", task, t0, ok=True,
-                         summary=self._plan_summary(out), plan_id=out.get("plan_id"))
+            self._account_plan(out, task, t0)
         return out
+
+    def _account_plan(self, plan: dict, task: str, t0: float) -> None:
+        """Единый учёт успешного плана — для обычного и потокового вызова.
+
+        Раньше plan_stream не вызывал этот блок (аудит AUD-06): успешный
+        план через поток числился ошибкой предыдущего вызова, а в отчёты,
+        метрики и учёт токенов не попадал вовсе.
+        """
+        self._remember_json("plan", plan)
+        self._report_plan(plan, task)
+        self.stats["plans"] += 1
+        self.stats["blocked_ms"] += int((time.time() - t0) * 1000)
+        self._record("plan", task, t0, ok=True,
+                     summary=self._plan_summary(plan), plan_id=plan.get("plan_id"))
 
     def ask(self, question: str, max_steps: int = 4) -> dict:
         return self.plan(question, max_steps=max_steps)
@@ -359,6 +389,7 @@ class ThinkingClient:
                     on_event: Optional[Callable[[dict], None]] = None) -> dict:
         """POST /plan/stream: отдаёт токены по мере генерации, возвращает план."""
         self._check_secrets(task, json.dumps(context or {}, ensure_ascii=False))
+        t0 = time.time()
         body = {"task": task, "context": context or {},
                 "constraints": constraints or [],
                 "max_steps": max(1, min(30, int(max_steps)))}
@@ -400,7 +431,7 @@ class ThinkingClient:
                         except Exception as exc:
                             log.debug("обработчик потока упал: %s", exc)
         if plan:
-            self._remember_json("plan", plan)
+            self._account_plan(plan, task, t0)
             return plan
         raise ThinkingError("поток завершился без итогового плана")
 
@@ -858,8 +889,10 @@ class ThinkingClient:
                            "Пока что решение принимаю я сам — структура задачи не изменилась."),
                     source="local-fallback", fallback=True,
                     memory_used=use_memory and bool(mem.get("facts")),
-                    tokens_in=estimate_tokens(text), tokens_out=estimate_tokens(text),
-                    tokens_estimate=True)
+                    # Модель не вызывалась — токенов не потрачено (AUD-22):
+                    # раньше заглушка «тратила» оценку от длины сообщения.
+                    tokens_in=0, tokens_out=0,
+                    tokens_estimate=False)
                 reply.duration_ms = int((time.time() - t0) * 1000)
                 self._remember_chat(text, reply)
                 self.stats["chats"] += 1
@@ -872,8 +905,7 @@ class ThinkingClient:
                 out = self._chat_via_plan(text, context, max_steps)
             except (ThinkingError, SchemaError):
                 out = {"reply": "", "source": "local-fallback", "fallback": True,
-                       "tokens_in": estimate_tokens(text),
-                       "tokens_out": estimate_tokens(text)}
+                       "tokens_in": 0, "tokens_out": 0, "tokens_estimate": False}
         reply = ChatReply.from_dict(out)
         reply.duration_ms = int((time.time() - t0) * 1000)
         if not reply.at:
@@ -1043,6 +1075,13 @@ class ThinkingClient:
         if not str(out.get("reply") or "").strip():
             out["reply"] = "".join(pieces).strip()
         reply = ChatReply.from_dict(out)
+        if not reply.tokens_in and not reply.tokens_out:
+            # usage у потока сервер не отдаёт (стрим llama.cpp его не пишет) —
+            # оцениваем по длине текста, честно помечая оценкой (AUD-22):
+            # иначе стриминговые чаты не входили в учёт токенов вовсе.
+            reply.tokens_in = estimate_tokens(text)
+            reply.tokens_out = estimate_tokens(reply.reply)
+            reply.tokens_estimate = True
         reply.duration_ms = int((time.time() - t0) * 1000)
         if not reply.at:
             reply.at = utcnow()
@@ -1067,7 +1106,9 @@ class ThinkingClient:
         text = str(message or "").strip()
         if not text:
             raise SchemaError("пустое сообщение")
-        self._check_secrets(text)
+        # Активный файл уезжает в промт целиком — его тоже проверяем:
+        # секрет в открытом редакторе не должен уезжать в Colab (AUD-13).
+        self._check_secrets(text, active_code or "")
         return {
             "message": text[:3000],
             "files": [str(f)[:200] for f in (files or [])][:80],
@@ -1159,8 +1200,9 @@ class ThinkingClient:
             task = f"{text}\nЧТО Я ПОМНЮ О ПРОЕКТЕ: {facts}"
         plan = self.plan(task, context=context, max_steps=max_steps)
         if not isinstance(plan, dict) or plan.get("source") == "local-fallback":
+            # Заглушка: модель не отвечала — токенов не потрачено (AUD-22)
             return {"reply": "", "source": "local-fallback", "fallback": True,
-                    "tokens_in": estimate_tokens(task), "tokens_out": estimate_tokens(plan)}
+                    "tokens_in": 0, "tokens_out": 0, "tokens_estimate": False}
         steps = plan.get("steps") or []
         lines = [str(s.get("desc") or "") for s in steps][:4]
         reply = plan.get("rationale") or plan.get("goal") or ""
@@ -1289,8 +1331,6 @@ class ThinkingClient:
 
     def _write_memory(self, mem: dict) -> None:
         _write_json(self._mem_path, mem)
-        self._mem_cache = (self._mem_path.stat().st_mtime, mem) \
-            if self._mem_path.exists() else (None, mem)
 
     def _remember_chat(self, question: str, reply: ChatReply,
                        cached: bool = False) -> None:
@@ -1446,7 +1486,6 @@ class ThinkingClient:
             self.reports = [r for r in self.reports if r.get("rid") != rid]
             self.interactions = [r for r in self.interactions if r.get("rid") != rid]
         self._disk_cache = (None, [], [])
-        self._mem_cache = (None, {})
         return removed
 
     # ------------------------------------------------------------------ #
@@ -1501,13 +1540,17 @@ class ThinkingClient:
         calls_agent = sum(1 for i in inter
                           if i.get("kind") in ("plan", "reflect", "dev"))
         calls_chat = sum(1 for i in inter if i.get("kind") == "chat")
-        fb = sum(1 for i in inter if i.get("fallback")) \
-            + (0 if since else self.stats["fallbacks"])
+        fb = sum(1 for i in inter if i.get("fallback"))
         plans = sum(1 for i in inter if i.get("kind") == "plan" and i.get("ok"))
         reflects = sum(1 for i in inter if i.get("kind") == "reflect" and i.get("ok"))
         blocked = sum(i.get("duration_ms", 0) for i in inter if not i.get("background"))
-        bg = sum(i.get("duration_ms", 0) for i in inter if i.get("background")) \
-            + (0 if since else self.stats["background_ms"])
+        bg = sum(i.get("duration_ms", 0) for i in inter if i.get("background"))
+        if not inter and not since:
+            # Журнала ещё нет (свежий процесс/удалённый файл) — берём
+            # счётчики процесса. Раньше они прибавлялись к сумме по журналу
+            # всегда, и «за всё время» считало каждый фолбэк дважды (AUD-07).
+            fb = self.stats["fallbacks"]
+            bg = self.stats["background_ms"]
         avg = (sum(i.get("duration_ms", 0) for i in inter) // total) if total else 0
         steps_total = sum(len(r.get("steps") or []) for r in reps
                           if r.get("type") == "plan")

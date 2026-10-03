@@ -51,13 +51,38 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _secret_rhs(match: "re.Match[str]") -> str:
+    """Правая часть «ключ = значение» из совпадения SECRET_RE."""
+    full, key = match.group(0), match.group(1) or ""
+    tail = full.split(key, 1)[-1] if key in full else full
+    return tail.lstrip("=: \t")
+
+
+# Значения-ссылки, а не секреты: ключ присваивается вызову/переменной
+# окружения или пуст/логичен. Раньше «token = os.getenv(…)» в сообщении
+# или в коде блокировал запрос ложным срабатыванием (аудит AUD-13),
+# при этом настоящие литералы (пароли, ключи) блокируются как раньше.
+_SECRET_REF = ("os.getenv(", "os.environ[", "environ[", "getenv(",
+               "self.", "cfg[", "config.", "settings.", "args.",
+               '""', "''", "None", "True", "False")
+
+
+def _is_secret_value(match: "re.Match[str]") -> bool:
+    return not _secret_rhs(match).startswith(_SECRET_REF)
+
+
 def redact_secrets(text: str) -> str:
-    """Заменяет значения секретов на [скрыто] перед записью/отправкой."""
-    return SECRET_RE.sub(lambda m: f"{m.group(1)}=[скрыто]", text or "")
+    """Заменяет значения секретов на [скрыто] перед записью/отправкой.
+
+    Ссылки на переменные окружения (os.getenv(...)) не трогаем — это код,
+    а не значение."""
+    def _sub(m: "re.Match[str]") -> str:
+        return m.group(0) if not _is_secret_value(m) else f"{m.group(1)}=[скрыто]"
+    return SECRET_RE.sub(_sub, text or "")
 
 
 def has_secret(text: str) -> bool:
-    return bool(SECRET_RE.search(text or ""))
+    return any(_is_secret_value(m) for m in SECRET_RE.finditer(text or ""))
 
 
 def _str_list(value: Any, limit: int = 40) -> list[str]:
