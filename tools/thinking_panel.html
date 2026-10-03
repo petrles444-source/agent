@@ -202,6 +202,22 @@
                 border-bottom:1px dashed #21262d; }
   .note { background:#1c2431; border:1px solid #30363d; border-radius:6px;
           padding:7px 10px; font-size:12.5px; color:#9ecbff; margin-top:8px; }
+  /* Печать / PDF: печатается только содержимое активной вкладки,
+     без навигации, кнопок и полей ввода (window.print() → «Сохранить как PDF»). */
+  @media print {
+    #tabs, #tokbox, #tokhelp, #limitwarn, .hint, .mem, .membar,
+    .chatbar, .devbar, #chatbar, button, input, textarea, select,
+    .overlay, .per { display:none !important; }
+    header { position:static; box-shadow:none; border:0;
+             -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    main { display:block; padding:0; }
+    .pane { display:none !important; }
+    .pane.on { display:block !important; border:0; box-shadow:none; }
+    .scroll, #chatlog, #devchat { height:auto !important;
+                                   max-height:none !important;
+                                   overflow:visible !important; }
+    body { -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  }
 </style>
 </head>
 <body>
@@ -220,6 +236,7 @@
       <button class="mini" id="tokbtn" title="зачем нужен токен и как он работает"
               onclick="toggleTokHelp()">?</button>
       <button onclick="exportMd()">Скачать отчёт .md</button>
+      <button onclick="window.print()" title="сохранить как PDF через диалог печати браузера">Печать / PDF</button>
     </span>
   </div>
   <div id="tokhelp" class="helbox">
@@ -301,7 +318,7 @@
     <div class="mem" id="membar"></div>
     <div class="scroll" id="chatlog"><div class="empty">напишите первое сообщение</div></div>
     <div id="chatbar">
-      <textarea id="chatinput" rows="2" placeholder="спроси субагента… (Ctrl+Enter — отправить)"></textarea>
+      <textarea id="chatinput" rows="2" placeholder="спроси субагента… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
       <label class="meta" style="display:flex;gap:5px;align-items:center">
         <input type="checkbox" id="chatmem" checked style="width:auto"> память</label>
       <button id="chatsend" onclick="sendChat()">Отправить</button>
@@ -364,7 +381,7 @@
           модель подготовит изменение, ты подтвердишь, и оно применится.</div></div>
         <div class="devbar">
           <textarea id="devinput" rows="2"
-                    placeholder="что сделать с кодом… (Ctrl+Enter)"></textarea>
+                    placeholder="что сделать с кодом… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
           <button id="devsend" onclick="devSend()">Отправить</button>
         </div>
       </div>
@@ -777,7 +794,9 @@ async function addFact(inp) {
 
 /* ---------- чат с субагентом ---------- */
 let chatBusy = false;
+let chatErr = null;   // {q, e} — чтобы ошибка не пропала при перерисовке истории
 function renderChat(list) {
+  if (chatBusy) return;   // запрос в полёте: живой обмен не стираем
   const box = clearBox("chatlog");
   box.innerHTML = "";
   if (!list || !list.length) {
@@ -795,7 +814,8 @@ function renderChat(list) {
     const b = el("div", "bub");
     b.appendChild(document.createTextNode(t.reply || "(пусто)"));
     const meta = [dttm(t.at)];
-    if (t.duration_ms) meta.push("ждание " + sec(t.duration_ms));
+    if (t.cached) meta.push("из кэша");
+    if (t.duration_ms) meta.push("ожидание " + sec(t.duration_ms));
     if (t.tokens_in || t.tokens_out) {
       meta.push("токены ≈" + (t.tokens_in + t.tokens_out)
                 + (t.tokens_estimate ? " (оценка)" : ""));
@@ -805,6 +825,16 @@ function renderChat(list) {
     ai.appendChild(b);
     box.appendChild(ai);
   });
+  if (chatErr) {   // последняя ошибка показывается поверх истории, пока не исчезнет
+    const me = el("div", "line me");
+    me.appendChild(el("span", "who", "я"));
+    me.appendChild(el("div", "bub", chatErr.q));
+    box.appendChild(me);
+    const ai = el("div", "line ai");
+    ai.appendChild(el("span", "who", "субагент"));
+    ai.appendChild(el("div", "bub", "Ошибка: " + chatErr.e));
+    box.appendChild(ai);
+  }
   box.scrollTop = box.scrollHeight;
 }
 
@@ -903,6 +933,7 @@ async function sendChat() {
   const msg = inp.value.trim();
   if (!msg) return;
   chatBusy = true;
+  chatErr = null;
   inp.value = "";
   const btn = document.getElementById("chatsend");
   btn.disabled = true;
@@ -936,24 +967,34 @@ async function sendChat() {
       message: msg,
       memory: document.getElementById("chatmem").checked
     }, (ev) => {
-      if (ev.type === "token") {
+      if (ev.type === "retry") {
+        // Путь до туннеля замир: клиент повторяет запрос. Частичный текст
+        // очищаем сразу — иначе повторный ответ продублирует его.
+        b.textContent = "обрыв потока — повторяю… (" + ev.attempt + "/" + ev.of + ")";
+        b.dataset.retry = "1";
+        box.scrollTop = box.scrollHeight;
+      } else if (ev.type === "token") {
         // первый токен — убираем текст ожидания, дальше наращиваем ответ
-        if (b.textContent === "…" ||
-            /^модель считает… \d+ с$/.test(b.textContent)) b.textContent = "";
+        if (b.dataset.retry) { b.textContent = ""; delete b.dataset.retry; }
+        else if (b.textContent === "…" ||
+                 /^модель считает… \d+ с$/.test(b.textContent)) b.textContent = "";
         b.textContent += ev.text;
         box.scrollTop = box.scrollHeight;
       }
     });
     if (res.type === "error" || res.error) {
       // SSE-ошибки приходят как {type:"error", text}, JSON-ошибки — как {error}
-      b.textContent = "Ошибка: " + String(res.text || res.error);
+      const errText = String(res.text || res.error);
+      b.textContent = "Ошибка: " + errText;
+      chatErr = {q: msg, e: errText};
     } else {
       // done-событие потока несёт поля ответа НА ВЕРХНЕМ УРОВНЕ (reply — строка),
       // а не-потоковый путь возвращает {reply: {…объект…}} — раскрываем оба.
       const r = (res.reply && typeof res.reply === "object") ? res.reply : res;
       b.textContent = r.reply || b.textContent || "(пусто)";
       const meta = [dttm(r.at)];
-      if (r.duration_ms) meta.push("ждание " + sec(r.duration_ms));
+      if (r.cached) meta.push("из кэша");
+      if (r.duration_ms) meta.push("ожидание " + sec(r.duration_ms));
       if (r.tokens_in || r.tokens_out)
         meta.push("токены " + (r.tokens_in || 0) + "+" + (r.tokens_out || 0));
       if (r.memory_used) meta.push("использовал память");
@@ -962,6 +1003,7 @@ async function sendChat() {
     }
   } catch (e) {
     b.textContent = "Панель не ответила: " + e;
+    chatErr = {q: msg, e: String(e)};
   } finally {
     clearInterval(tick);
     chatBusy = false;
@@ -1049,7 +1091,7 @@ function renderDialog(list) {
     const h1 = el("div", "msghead");
     h1.appendChild(el("span", "who me", "Я запросил"));
     h1.appendChild(el("span", "", dttm(m.at)));
-    h1.appendChild(el("span", "", "ждание " + sec(m.duration_ms)));
+    h1.appendChild(el("span", "", "ожидание " + sec(m.duration_ms)));
     const st = el("span", "st " + (m.fallback ? "fb" : (m.ok ? "ok" : "bad")),
                   m.fallback ? "Colab недоступен → заглушка"
                              : (m.ok ? "ответ получен" : "ошибка"));
@@ -1597,12 +1639,17 @@ function connect() {
   es.onmessage = e => { try { handle(JSON.parse(e.data)); } catch (err) {} };
 }
 document.getElementById("tok").value = TOKEN;
-document.getElementById("chatinput").addEventListener("keydown", e => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendChat(); }
-});
-document.getElementById("devinput").addEventListener("keydown", e => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); devSend(); }
-});
+/* Enter — отправить, Shift+Enter — новая строка (как в мессенджерах). */
+function enterSends(e, send) {
+  if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    send();
+  }
+}
+document.getElementById("chatinput").addEventListener("keydown", e =>
+  enterSends(e, sendChat));
+document.getElementById("devinput").addEventListener("keydown", e =>
+  enterSends(e, devSend));
 connect();
 state();
 setInterval(state, 2500);

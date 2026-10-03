@@ -666,6 +666,79 @@ def test_dev_metrics_limits() -> None:
           "build_colab: есть опции --name и --ver")
 
 
+# --------------------------------------------------------------------------- #
+#  Быстрые улучшения: кэш ответов, предохранитель, саммари, фиксы панели
+# --------------------------------------------------------------------------- #
+def test_quickwins() -> None:
+    """Кэш ответов, предохранитель транспорта, саммари диалога, правки панели."""
+    import time
+
+    cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    panel = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    client_src = (ROOT / "thinking" / "client.py").read_text(encoding="utf-8")
+
+    # --- кэш ответов ---
+    check("_ANSWER_CACHE" in cli_src, "кэш: таблица ответов в панели")
+    check("answer_cache_ttl" in cli_src, "кэш: TTL настраивается")
+    mod = _load_cli_module()
+    cache_client = make_client(chat_path=str(TMP / "chat_qw.json"))
+    mod._cache_put(cache_client, "chat:1", "  Кэш-Тест   вопрос ",
+                   {"reply": "да"})
+    hit = mod._cache_get(cache_client, "chat:1", "кэш-тест вопрос")
+    check(bool(hit) and hit.get("cached") is True and hit.get("reply") == "да",
+          "кэш: нормализация ключа и флаг cached")
+    check(mod._cache_get(cache_client, "chat:1", "другой вопрос") is None,
+          "кэш: чужой вопрос не подхватывается")
+
+    # --- предохранитель ---
+    check("breaker_pause" in client_src and "_cb_open_until" in client_src,
+          "предохранитель: состояние и пауза в клиенте")
+    br = make_client()
+    br.base = "http://127.0.0.1:9"        # сеть не трогаем: пауза раньше запроса
+    br._cb_errors = 9
+    br._cb_open_until = time.time() + 60
+    try:
+        br._open("GET", "/health")
+        check(False, "предохранитель: запрос на паузе должен быть заблокирован")
+    except ThinkingError as exc:
+        check("предохранитель" in str(exc),
+              "предохранитель: на паузе запрос не уходит в сеть")
+    except Exception as exc:                             # noqa: BLE001
+        check(False, f"предохранитель: не тот отказ — {exc}")
+    br._cb_open_until = 0.0
+
+    # --- саммари диалога ---
+    check("Саммари диалога" in client_src, "память: саммари старых реплик")
+    mem_client = make_client(memory_path=str(TMP / "mem_qw.json"))
+    for i in range(8):
+        mem_client.remember_turn(f"вопрос номер {i}", f"ответ номер {i}")
+    mem = mem_client.memory()
+    sums = [f for f in mem["facts"] if str(f).startswith("Саммари диалога: ")]
+    check(len(sums) == 1 and len(sums[0]) <= 300,
+          "память: из выпавших реплик одно саммари ≤300 знаков")
+    check(len(mem["turns"]) <= 12, "память: окно реплик не растёт")
+    check(any("вопрос номер 7" in str(t.get("text")) for t in mem["turns"]),
+          "память: свежие реплики остаются в окне")
+
+    # --- панель ---
+    check("ждание" not in panel, "панель: ждание заменено на ожидание")
+    check("ожидание " in panel, "панель: подпись ожидания на месте")
+    check('"из кэша"' in panel, "панель: метка ответа из кэша в истории")
+    check("enterSends" in panel and "Shift+Enter" in panel,
+          "панель: Enter отправляет, Shift+Enter — новая строка")
+    check("@media print" in panel and "window.print()" in panel,
+          "панель: печать/PDF через window.print()")
+    check("if (chatBusy) return" in panel,
+          "панель: чат в полёте не перерисовывается поверх")
+
+    # --- прогрев ---
+    check("[прогрев]" in cli_src, "панель: прогрев /health раз в ~25 минут")
+    check("_cache_journal" in cli_src, "кэш: ответ из кэша пишется в журнал диалога")
+    check('cached": bool(cached)' in client_src or
+          '"cached": bool(cached)' in client_src,
+          "клиент: журнал диалога помечает ответ из кэша")
+
+
 def main() -> int:
     test_schemas()
     test_fallback()
@@ -676,6 +749,7 @@ def main() -> int:
     test_rus_labels()
     test_colab_cells()
     test_dev_metrics_limits()
+    test_quickwins()
     print(f"ПРОЙДЕНО: {PASSED}")
     print(f"ПРОВАЛЕНО: {FAILED}")
     return 1 if FAILED else 0

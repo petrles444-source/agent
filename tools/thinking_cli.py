@@ -45,8 +45,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from thinking.client import ThinkingClient, ThinkingError  # noqa: E402
+from thinking.schemas import ChatReply, SchemaError  # noqa: E402
 from thinking.fallback import offline_reason  # noqa: E402
-from thinking.schemas import SchemaError  # noqa: E402
 
 # русские названия тегов — в интерфейсе латиница не показывается
 ACTION_RU = {
@@ -515,6 +515,90 @@ def cmd_reflect_metrics(client: ThinkingClient, args: argparse.Namespace) -> int
 
 
 # --------------------------------------------------------------------------- #
+#  Кэш ответов: повторный тот же вопрос не жжёт Colab. При обрывах потока
+#  человек нередко шлёт одно и то же сообщение несколько раз подряд — теперь
+#  повтор отдаётся мгновенно. TTL — answer_cache_ttl (по умолчанию 30 минут),
+#  живёт и в памяти процесса, и в постоянном журнале диалога.
+# --------------------------------------------------------------------------- #
+_ANSWER_CACHE: dict[str, tuple[float, dict]] = {}
+_CACHE_MAX = 120
+
+
+def _cache_norm(message: str) -> str:
+    """Нормализация ключа: регистр и повторные пробелы не должны делить кэш."""
+    return " ".join(str(message).split()).lower()
+
+
+def _cache_ttl(client: ThinkingClient) -> float:
+    try:
+        return max(0.0, float(client.cfg.get("answer_cache_ttl", 1800)))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _cache_get(client: ThinkingClient, kind: str, message: str) -> dict | None:
+    ttl, norm = _cache_ttl(client), _cache_norm(message)
+    if not norm or ttl <= 0:
+        return None
+    hit = _ANSWER_CACHE.get(f"{kind}\x00{norm}")
+    if hit and time.time() - hit[0] <= ttl and not hit[1].get("fallback"):
+        return dict(hit[1], cached=True)
+    # перезапуск панели: такой же вопрос мог остаться в журнале диалога
+    path = getattr(client, "_chat_path", None)
+    if not path or not Path(path).exists():
+        return None
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()[-60:]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if _cache_norm(str(rec.get("question") or "")) != norm or rec.get("fallback"):
+            continue
+        try:
+            age = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(str(rec.get("at")))).total_seconds()
+        except ValueError:
+            continue
+        if 0 <= age <= ttl:
+            return {"reply": rec.get("reply"), "at": rec.get("at"),
+                    "duration_ms": rec.get("duration_ms"),
+                    "tokens_in": rec.get("tokens_in"),
+                    "tokens_out": rec.get("tokens_out"),
+                    "tokens_estimate": rec.get("tokens_estimate"),
+                    "cached": True}
+    return None
+
+
+def _cache_put(client: ThinkingClient, kind: str, message: str,
+               reply: dict) -> None:
+    ttl, norm = _cache_ttl(client), _cache_norm(message)
+    if not norm or ttl <= 0 or reply.get("fallback"):
+        return
+    _ANSWER_CACHE[f"{kind}\x00{norm}"] = (time.time(), dict(reply))
+    while len(_ANSWER_CACHE) > _CACHE_MAX:
+        _ANSWER_CACHE.pop(next(iter(_ANSWER_CACHE)))
+
+
+def _cache_journal(client: ThinkingClient, message: str, reply: dict) -> None:
+    """Ответ из кэша тоже пишем в журнал диалога.
+
+    Иначе перерисовка истории (она строится из журнала) стирает обмен,
+    которого в журнале нет, — человек видит ответ секунду и он исчезает.
+    """
+    try:
+        client._remember_chat(                              # noqa: SLF001
+            message, ChatReply.from_dict(
+                {k: v for k, v in reply.items() if k != "cached"}),
+            cached=True)
+    except Exception as exc:                                # noqa: BLE001
+        _out(f"! кэш: не записал в журнал диалога: {exc}")
+
+
+# --------------------------------------------------------------------------- #
 #  Панель реального времени
 # --------------------------------------------------------------------------- #
 def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
@@ -522,7 +606,19 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
     if not html_path.exists():
         _out(f"! нет {html_path}")
         return 3
-    html = html_path.read_bytes()
+    # HTML читается по mtime: правка веб-панели видна сразу, без рестарта.
+    html_cache: dict = {"mtime": -1.0, "data": b""}
+
+    def _panel_html() -> bytes:
+        try:
+            st = html_path.stat()
+            if st.st_mtime != html_cache["mtime"]:
+                html_cache["mtime"] = st.st_mtime
+                html_cache["data"] = html_path.read_bytes()
+        except OSError:
+            pass
+        return html_cache["data"]
+
     client.sync_history(tail=200)
     client.start_stream(lambda ev: None)
 
@@ -532,9 +628,20 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
 
     def _poll_loop() -> None:
         every = max(2.0, float(client.cfg.get("panel_poll", 5)))
+        # Раз в ~25 минут — явный прогрев /health: Colab между рабочими
+        # сессиями не засыпает, туннель считается живым.
+        warm_every = max(1, int(1500 / every))
+        n = 0
         while not stop_poll.wait(every):
+            n += 1
             try:
                 client.sync_history(tail=50)
+                if n % warm_every == 0:
+                    try:
+                        ok = client.health(timeout=15)
+                    except Exception:                          # noqa: BLE001
+                        ok = False
+                    _out(f"[прогрев] /health {'ok' if ok else 'не прошёл'}")
             except Exception as exc:                           # noqa: BLE001
                 _out(f"! опрос событий не прошёл: {exc}")
 
@@ -583,6 +690,13 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 if not message:
                     self._json_out(400, {"error": "пустое сообщение"})
                     return
+                kind = "chat:%d" % int(bool(data.get("memory", True)))
+                hit = _cache_get(client, kind, message)
+                if hit:
+                    _out(f"[чат] из кэша: {message[:80]}")
+                    _cache_journal(client, message, hit)
+                    self._json_out(200, {"reply": hit})
+                    return
                 _out(f"[чат] {message[:120]}")
                 try:
                     reply = client.chat(message,
@@ -594,6 +708,7 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 except ThinkingError as exc:
                     self._json_out(502, {"error": str(exc)[:300]})
                     return
+                _cache_put(client, kind, message, reply)
                 self._json_out(200, {"reply": reply})
                 return
             if path == "/api/model":
@@ -619,6 +734,10 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 if not message:
                     self._json_out(400, {"error": "пустое сообщение"})
                     return
+                kind = "chat:%d" % int(bool(data.get("memory", True)))
+                cached = _cache_get(client, kind, message)
+                if cached:
+                    _out(f"[чат] из кэша: {message[:80]}")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -637,10 +756,19 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                     self.wfile.flush()
 
                 try:
-                    reply = client.chat_stream(
-                        message, on_token=lambda piece: _emit({"type": "token",
-                                                               "text": piece}),
-                        use_memory=bool(data.get("memory", True)))
+                    if cached:
+                        reply = cached
+                        _cache_journal(client, message, reply)
+                        _emit({"type": "token",
+                               "text": str(reply.get("reply") or "")})
+                    else:
+                        reply = client.chat_stream(
+                            message, on_token=lambda piece: _emit({"type": "token",
+                                                                   "text": piece}),
+                            on_retry=lambda n, total: _emit(
+                                {"type": "retry", "attempt": n, "of": total}),
+                            use_memory=bool(data.get("memory", True)))
+                        _cache_put(client, kind, message, reply)
                     done = {"type": "done", **reply}
                     _emit(done)
                 except SchemaError as exc:
@@ -734,7 +862,9 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                                for f in _dev_files(client)],
                         active_name=active if code else "",
                         active_code=code,
-                        on_token=None)
+                        on_token=None,
+                        on_retry=lambda n, total: _out(
+                            f"[разработка] поток оборвался, повтор {n}/{total}"))
                 except SchemaError as exc:
                     self._json_out(400, {"error": str(exc)})
                     return
@@ -788,7 +918,7 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
             path = self.path.split("?")[0]
             query = urllib.parse.parse_qs(self.path.partition("?")[2])
             if path in ("/", "/index.html"):
-                self._send(200, "text/html; charset=utf-8", html)
+                self._send(200, "text/html; charset=utf-8", _panel_html())
             elif path == "/api/state":
                 # ?since= — период «за сегодня»: панель передаёт локальную
                 # полночь в UTC, остальное фильтрует клиент.

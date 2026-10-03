@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import socket
@@ -198,6 +199,10 @@ class ThinkingClient:
                       "blocked_ms": 0, "background_ms": 0, "errors": 0}
         self._disk_cache: tuple = (None, [], [])
         self._mem_cache: tuple = (None, {})
+        # Предохранитель транспорта: N ошибок подряд → пауза вместо спама
+        # ретраями, когда туннель мёртв (HTTP 5xx, обрывы, таймауты).
+        self._cb_errors = 0
+        self._cb_open_until = 0.0
 
     # ------------------------------------------------------------------ #
     #  конфигурация
@@ -234,6 +239,11 @@ class ThinkingClient:
               timeout: Optional[float] = None, stream: bool = False):
         if not self.base:
             raise ThinkingError("base_url пуст — выполните set-url или задайте THINKING_URL")
+        if time.time() < self._cb_open_until:
+            # Туннель уже доказал, что он мёртв: не ходим по нему вхолостую.
+            raise ThinkingError(
+                f"предохранитель: {self._cb_errors} ошибок подряд, "
+                f"пауза ещё {int(self._cb_open_until - time.time())} с")
         url = f"{self.base}{path}"
         payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {"Accept": "text/event-stream" if stream else "application/json"}
@@ -252,6 +262,7 @@ class ThinkingClient:
                 self.online = True
                 self.last_ok = utcnow()
                 self.last_error = ""
+                self._cb_errors = 0      # успех сбрасывает счётчик ошибок
                 return resp
             except urllib.error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", "replace")[:400]
@@ -269,6 +280,13 @@ class ThinkingClient:
             time.sleep(wait)
         self.online = False
         self.last_error = str(last)[:200]
+        self._cb_errors += 1
+        limit = int(self.cfg.get("breaker_errors", 5))
+        if self._cb_errors >= limit:
+            pause = float(self.cfg.get("breaker_pause", 600))
+            self._cb_open_until = time.time() + pause
+            log.warning("предохранитель открыт: %d ошибок подряд — пауза %.0f с",
+                        self._cb_errors, pause)
         raise ThinkingError(f"субагент недоступен: {last}")
 
     def _json(self, method: str, path: str, body: Optional[dict] = None,
@@ -802,7 +820,8 @@ class ThinkingClient:
         context: dict[str, Any] = {}
         if use_memory:
             # память идёт в контексте: субагент видит, что помнит о проекте
-            context["memory"] = {"facts": mem.get("facts", [])[:12],
+            # последние факты важнее старых — в промт уходят они
+            context["memory"] = {"facts": mem.get("facts", [])[-12:],
                                  "recent": [_turn_line(t) for t in
                                             turns[-6:]]}
             context["dialog"] = True
@@ -854,6 +873,8 @@ class ThinkingClient:
         if not reply.reply:
             reply.reply = "Субагент промолчал — задача не разобрана."
         self._remember_chat(text, reply)
+        if use_memory and not reply.fallback:
+            self._safe_remember_turn(text, reply)
         self.stats["chats"] += 1
         self._record_chat(text, reply.reply, t0, fallback=reply.fallback,
                           plan_id=reply.plan_id, tokens_in=reply.tokens_in,
@@ -888,9 +909,86 @@ class ThinkingClient:
             raise SchemaError(f"сервер вернул не словарь: {type(out).__name__}")
         return out
 
+    # ------------------------------------------------------------------ #
+    #  чтение SSE-потока с повтором при обрыве
+    # ------------------------------------------------------------------ #
+    def _stream_read(self, path: str, body: dict,
+                     on_token: Optional[Callable[[str], None]] = None,
+                     on_retry: Optional[Callable[[int, int], None]] = None,
+                     label: str = "поток") -> tuple[list[str], dict]:
+        """Читает поток events и повторяет запрос при обрыве.
+
+        Беспроводной путь до туннеля Cloudflare местами замирает посреди
+        ответа: сервер доделывает генерацию (это видно в журнале событий),
+        а клиенту байты не приходят и EOF не закрывается. Повтор почти
+        всегда проходит, поэтому: read-timeout stream_stall секунд на
+        чтение, затем до stream_retries повторных попыток (всего —
+        1 + stream_retries), пока не придёт done.
+
+        on_retry(attempt, total) вызывается перед каждой повторной
+        попыткой — интерфейс может сказать человеку «повторяю…».
+        Ошибки сервера/схемы (ThinkingError) не повторяются.
+        """
+        stall = float(self.cfg.get("stream_stall", 45))
+        budget = max(stall * 2, float(self.cfg.get("chat_timeout", 600)))
+        total = 1 + max(0, int(self.cfg.get("stream_retries", 2)))
+        t0 = time.time()
+        last: Optional[BaseException] = None
+        for attempt in range(1, total + 1):
+            pieces: list[str] = []
+            done: dict = {}
+            try:
+                with self._open("POST", path, body, stream=True,
+                                timeout=stall) as resp:
+                    for raw in resp:
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(ev, dict):
+                            continue
+                        etype = ev.get("type")
+                        if etype == "token":
+                            piece = str(ev.get("text") or "")
+                            if piece:
+                                pieces.append(piece)
+                                if on_token:
+                                    try:
+                                        on_token(piece)
+                                    except Exception as exc:  # обработчик не роняет поток
+                                        log.debug("on_token упал: %s", exc)
+                        elif etype == "error":
+                            raise ThinkingError(f"сервер: {ev.get('text')}")
+                        elif etype == "done":
+                            done = ev
+                            break   # ответ получен: не ждём EOF (keep-alive)
+            except ThinkingError:
+                raise               # ошибки сервера/схемы не повторяем
+            except (OSError, http.client.IncompleteRead) as exc:
+                last = exc          # таймаут чтения, обрыв соединения
+            if done:
+                return pieces, done
+            if last is None:
+                last = ThinkingError(f"{label} завершился без ответа")
+            if attempt >= total or time.time() - t0 > budget:
+                break
+            log.warning("%s %s оборвался (%s), повтор %d/%d",
+                        label, path, last, attempt, total - 1)
+            if on_retry:
+                try:
+                    on_retry(attempt, total)
+                except Exception as exc:
+                    log.debug("on_retry упал: %s", exc)
+            last = None
+        raise ThinkingError(f"{label} оборвался после {total} попыток: {last}")
+
     def chat_stream(self, message: str, on_token: Optional[Callable[[str], None]] = None,
                     use_memory: bool = True, max_steps: int = 4,
-                    timeout: Optional[float] = None) -> dict:
+                    timeout: Optional[float] = None,
+                    on_retry: Optional[Callable[[int, int], None]] = None) -> dict:
         """POST /chat/stream: ответ приходит токенами, поэтому длинный текст
         не обрывается 120-секундным лимитом туннеля, а человек видит его сразу.
 
@@ -905,7 +1003,8 @@ class ThinkingClient:
         mem = self.memory()
         context: dict[str, Any] = {}
         if use_memory:
-            context["memory"] = {"facts": mem.get("facts", [])[:12],
+            # последние факты важнее старых — в промт уходят они
+            context["memory"] = {"facts": mem.get("facts", [])[-12:],
                                  "recent": [_turn_line(t) for t in mem["turns"][-6:]]}
             context["dialog"] = True
         body = {"message": text[:2000], "context": context,
@@ -913,37 +1012,9 @@ class ThinkingClient:
         if use_memory and mem.get("profile"):
             body["profile"] = str(mem["profile"])[:800]
 
-        pieces: list[str] = []
-        done: dict = {}
-        read_to = max(self.timeout, float(self.cfg.get("chat_timeout", 600)))
-        with self._open("POST", "/chat/stream", body, stream=True,
-                        timeout=read_to) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                try:
-                    ev = json.loads(line[5:].strip())
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(ev, dict):
-                    continue
-                etype = ev.get("type")
-                if etype == "token":
-                    piece = str(ev.get("text") or "")
-                    if piece:
-                        pieces.append(piece)
-                        if on_token:
-                            try:
-                                on_token(piece)
-                            except Exception as exc:      # обработчик не роняет чат
-                                log.debug("on_token упал: %s", exc)
-                    continue
-                if etype == "error":
-                    raise ThinkingError(f"сервер: {ev.get('text')}")
-                if etype == "done":
-                    done = ev
-                    break   # ответ получен: не ждём EOF (keep-alive сервера)
+        pieces, done = self._stream_read(
+            "/chat/stream", body, on_token=on_token, on_retry=on_retry,
+            label="поток чата")
         if not done:
             raise ThinkingError("поток чата завершился без ответа")
         out = dict(done)
@@ -956,6 +1027,8 @@ class ThinkingClient:
         if use_memory:
             reply.memory_used = bool(mem.get("facts") or mem.get("turns"))
         self._remember_chat(text, reply)
+        if use_memory and not reply.fallback:
+            self._safe_remember_turn(text, reply)
         self.stats["chats"] += 1
         self._record_chat(text, reply.reply, t0, fallback=reply.fallback,
                           plan_id=reply.plan_id, tokens_in=reply.tokens_in,
@@ -1001,7 +1074,8 @@ class ThinkingClient:
     def dev(self, message: str, files: Optional[list] = None,
             active_name: str = "", active_code: str = "",
             on_token: Optional[Callable[[str], None]] = None,
-            timeout: Optional[float] = None) -> dict:
+            timeout: Optional[float] = None,
+            on_retry: Optional[Callable[[int, int], None]] = None) -> dict:
         """Запрос в режиме разработчика: модель предлагает изменение файла.
 
         Ничего не пишет на диск — только возвращает предложение
@@ -1016,32 +1090,9 @@ class ThinkingClient:
         pieces: list[str] = []
         done: dict = {}
         try:
-            with self._open("POST", "/dev/stream", body, stream=True,
-                            timeout=read_to) as resp:
-                for raw in resp:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    try:
-                        ev = json.loads(line[5:].strip())
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(ev, dict):
-                        continue
-                    if ev.get("type") == "token":
-                        piece = str(ev.get("text") or "")
-                        if piece:
-                            pieces.append(piece)
-                            if on_token:
-                                try:
-                                    on_token(piece)
-                                except Exception as exc:
-                                    log.debug("on_token упал: %s", exc)
-                    elif ev.get("type") == "error":
-                        raise ThinkingError(f"сервер: {ev.get('text')}")
-                    elif ev.get("type") == "done":
-                        done = ev
-                        break   # предложение получено: не ждём EOF (keep-alive)
+            pieces, done = self._stream_read(
+                "/dev/stream", body, on_token=on_token, on_retry=on_retry,
+                label="поток разработки")
         except ThinkingError as exc:
             if not _looks_like_missing_route(exc):
                 self.stats["errors"] += 1
@@ -1076,7 +1127,7 @@ class ThinkingClient:
         """Старый путь: /chat недоступен — спрашиваем /plan и собираем ответ."""
         task = text
         if context.get("memory", {}).get("facts"):
-            facts = "; ".join(str(f) for f in context["memory"]["facts"][:6])
+            facts = "; ".join(str(f) for f in context["memory"]["facts"][-6:])
             task = f"{text}\nЧТО Я ПОМНЮ О ПРОЕКТЕ: {facts}"
         plan = self.plan(task, context=context, max_steps=max_steps)
         if not isinstance(plan, dict) or plan.get("source") == "local-fallback":
@@ -1126,6 +1177,13 @@ class ThinkingClient:
         self._write_memory(mem)
         return mem
 
+    def _safe_remember_turn(self, text: str, reply) -> None:
+        """Запоминает реплику в диалог, не роняя чат из-за ошибки записи."""
+        try:
+            self.remember_turn(text, reply.reply, plan_id=reply.plan_id)
+        except OSError as exc:
+            log.warning("реплика не записана в память: %s", exc)
+
     def remember_turn(self, question: str, answer: str,
                       fallback: bool = False, plan_id: str = "") -> None:
         mem = self.memory()
@@ -1135,9 +1193,39 @@ class ThinkingClient:
         turns.append(ChatTurn(role="subagent", text=str(answer)[:4000],
                               at=utcnow(), plan_id=str(plan_id)[:64],
                               fallback=bool(fallback)).to_dict())
+        overflow = turns[:-MAX_MEMORY_TURNS]
         mem["turns"] = turns[-MAX_MEMORY_TURNS:]
+        if overflow:
+            # Старые реплики не выбрасываем молча: сжимаем в одно саммари в
+            # конце facts — оно уходит в промт (последние 12 фактов).
+            mem["facts"] = self._summarize_turns(mem.get("facts") or [], overflow)
         mem["updated"] = utcnow()
         self._write_memory(mem)
+
+    @staticmethod
+    def _summarize_turns(facts: list[str], overflow: list[dict]) -> list[str]:
+        """Сжимает выпавшие из окна реплики в одно саммари-факт (≤300 знаков).
+
+        Саммари одно: старое дописывается в начало нового, а хвост (свежее)
+        остаётся, пока не упрётся в лимит факта.
+        """
+        prefix = "Саммари диалога: "
+        parts = []
+        for t in overflow:
+            txt = " ".join(str(t.get("text") or "").split())
+            if not txt:
+                continue
+            who = "я" if t.get("role") == "user" else "субагент"
+            parts.append(f"{who}: {txt[:70]}")
+        if not parts:
+            return facts
+        rest = [f for f in facts if not f.startswith(prefix)]
+        old = [f for f in facts if f.startswith(prefix)]
+        merged = ((old[-1][len(prefix):] + " | ") if old else "") + "; ".join(parts)
+        room = 300 - len(prefix) - 1
+        if len(merged) > room:
+            merged = "…" + merged[-room:]
+        return (rest + [prefix + merged])[-MAX_MEMORY_FACTS:]
 
     def forget(self, facts: bool = True, turns: bool = True) -> dict:
         """Стирает память по частям — чтобы не терять контекст целиком."""
@@ -1155,13 +1243,15 @@ class ThinkingClient:
         self._mem_cache = (self._mem_path.stat().st_mtime, mem) \
             if self._mem_path.exists() else (None, mem)
 
-    def _remember_chat(self, question: str, reply: ChatReply) -> None:
+    def _remember_chat(self, question: str, reply: ChatReply,
+                       cached: bool = False) -> None:
         self.chat_log.append({"at": reply.at, "question": question[:2000],
                               "reply": reply.reply[:4000],
                               "fallback": reply.fallback,
                               "tokens_in": reply.tokens_in,
                               "tokens_out": reply.tokens_out,
                               "tokens_estimate": reply.tokens_estimate,
+                              "cached": bool(cached),
                               "duration_ms": reply.duration_ms})
         if len(self.chat_log) > 60:
             del self.chat_log[:-60]
