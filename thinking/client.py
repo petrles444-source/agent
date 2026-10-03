@@ -632,7 +632,10 @@ class ThinkingClient:
         except Exception:
             seq = 0
         with self._lock:
-            if seq and any(e.get("seq") == seq for e in self._events[-20:]):
+            # Окно дедупа ≥ хвоста опроса (50) и начального батча SSE (50):
+            # иначе каждая перезагрузка истории дописывает одни и те же
+            # события в буфер и в thoughts.jsonl (журнал раздувался в разы).
+            if seq and any(e.get("seq") == seq for e in self._events[-200:]):
                 return
             self._seq = max(self._seq, seq)
             ev["text"] = redact_secrets(str(ev.get("text") or ""))
@@ -940,6 +943,7 @@ class ThinkingClient:
                     raise ThinkingError(f"сервер: {ev.get('text')}")
                 if etype == "done":
                     done = ev
+                    break   # ответ получен: не ждём EOF (keep-alive сервера)
         if not done:
             raise ThinkingError("поток чата завершился без ответа")
         out = dict(done)
@@ -1037,6 +1041,7 @@ class ThinkingClient:
                         raise ThinkingError(f"сервер: {ev.get('text')}")
                     elif ev.get("type") == "done":
                         done = ev
+                        break   # предложение получено: не ждём EOF (keep-alive)
         except ThinkingError as exc:
             if not _looks_like_missing_route(exc):
                 self.stats["errors"] += 1

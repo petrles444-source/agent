@@ -219,7 +219,13 @@ try:
             print("ИМЕНОВАННЫЙ туннель: адрес не распознан в логе, смотрите /content/tunnel.log")
     # 2) Быстрый туннель — бесплатно и без аккаунта, но адрес случайный на каждый запуск
     if not tunnel:
-        subprocess.Popen(["nohup", "cloudflared", "tunnel", "--url", "http://localhost:8000"],
+        # --protocol http2: quick-туннель по умолчанию ходит по QUIC/UDP, а на
+        # Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted 7168 kiB,
+        # got 416 kiB») — SSE-потоки посреди передачи замирали, done не доходил.
+        # HTTP/2 идёт по TCP и этих потерь не видит.
+        subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate",
+                          "--protocol", "http2",
+                          "--url", "http://localhost:8000"],
                          stdout=open("/content/tunnel.log", "a", encoding="utf-8"),
                          stderr=subprocess.STDOUT, start_new_session=True)
         for _ in range(40):

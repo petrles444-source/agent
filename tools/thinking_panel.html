@@ -319,10 +319,17 @@
       в журнал, кнопкой собирается дамп.</p>
     <div class="devgrid">
       <div class="devcol">
-        <div class="devhead">Код
+        <div class="devhead"><b id="devlang">Python</b>
           <select id="devsel" onchange="devOpen(this.value)"></select>
           <button class="mini" onclick="devRefresh()">⟳</button>
           <button class="mini" onclick="devNew()">Новый файл</button>
+          <span id="devnewrow" style="display:none;gap:4px;align-items:center">
+            <input id="devnewname" placeholder="имя: main.py" style="width:130px"
+                   onkeydown="if(event.key==='Enter')devNewOk();
+                               if(event.key==='Escape')devNewCancel()">
+            <button class="mini" onclick="devNewOk()" title="создать">✓</button>
+            <button class="mini" onclick="devNewCancel()" title="отмена">✕</button>
+          </span>
           <span class="meta" id="devfname">—</span>
         </div>
         <div class="devbody" style="padding:0">
@@ -660,7 +667,7 @@ async function apiStream(path, data, onToken) {
   if (!r.body) return await r.json();
   const reader = r.body.getReader();
   const dec = new TextDecoder("utf-8");
-  let buf = "", last = null;
+  let buf = "", last = null, finish = false;
   while (true) {
     const {done, value} = await reader.read();
     if (done) break;
@@ -673,7 +680,15 @@ async function apiStream(path, data, onToken) {
         if (!line.startsWith("data:")) continue;
         try { last = JSON.parse(line.slice(5).trim()); } catch (e) {}
         if (last && onToken) onToken(last);
+        // Готово: не ждём EOF (соединение после done может держаться открытым —
+        // иначе кнопка «Отправить» виснет вместе с промисом).
+        if (last && (last.type === "done" || last.type === "error"))
+          finish = true;
       }
+    }
+    if (finish) {
+      try { await reader.cancel(); } catch (e) {}
+      break;
     }
   }
   return last || {};
@@ -903,6 +918,17 @@ async function sendChat() {
   ai.appendChild(b);
   box.appendChild(ai);
   box.scrollTop = box.scrollHeight;
+  /* Секундомер: пока модель считает (или туннель задерживается), видно,
+     что запрос жив, а не завис. */
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    if (b.textContent === "…") b.textContent = "модель считает… " +
+      Math.round((Date.now() - t0) / 1000) + " с";
+    else if (/^модель считает… \d+ с$/.test(b.textContent))
+      b.textContent = "модель считает… " +
+        Math.round((Date.now() - t0) / 1000) + " с";
+    btn.textContent = "Жду… " + Math.round((Date.now() - t0) / 1000) + " с";
+  }, 1000);
   try {
     // Потоком: текст идёт по мере генерации, поэтому длинный ответ не обрывается
     // 120-секундным лимитом туннеля, а человек видит текст сразу.
@@ -911,14 +937,20 @@ async function sendChat() {
       memory: document.getElementById("chatmem").checked
     }, (ev) => {
       if (ev.type === "token") {
+        // первый токен — убираем текст ожидания, дальше наращиваем ответ
+        if (b.textContent === "…" ||
+            /^модель считает… \d+ с$/.test(b.textContent)) b.textContent = "";
         b.textContent += ev.text;
         box.scrollTop = box.scrollHeight;
       }
     });
-    if (res.error) {
-      b.textContent = "Ошибка: " + res.error;
+    if (res.type === "error" || res.error) {
+      // SSE-ошибки приходят как {type:"error", text}, JSON-ошибки — как {error}
+      b.textContent = "Ошибка: " + String(res.text || res.error);
     } else {
-      const r = res.reply || res;
+      // done-событие потока несёт поля ответа НА ВЕРХНЕМ УРОВНЕ (reply — строка),
+      // а не-потоковый путь возвращает {reply: {…объект…}} — раскрываем оба.
+      const r = (res.reply && typeof res.reply === "object") ? res.reply : res;
       b.textContent = r.reply || b.textContent || "(пусто)";
       const meta = [dttm(r.at)];
       if (r.duration_ms) meta.push("ждание " + sec(r.duration_ms));
@@ -926,11 +958,12 @@ async function sendChat() {
         meta.push("токены " + (r.tokens_in || 0) + "+" + (r.tokens_out || 0));
       if (r.memory_used) meta.push("использовал память");
       if (r.fallback) meta.push("заглушка");
-      b.appendChild(el("div", "meta", meta.join(" · ")));
+      b.appendChild(el("div", "meta", meta.filter(Boolean).join(" · ")));
     }
   } catch (e) {
     b.textContent = "Панель не ответила: " + e;
   } finally {
+    clearInterval(tick);
     chatBusy = false;
     btn.disabled = false;
     btn.textContent = "Отправить";
@@ -1121,7 +1154,17 @@ async function runReflect() {
 }
 
 /* ---------- режим разработчика ---------- */
-let devCurrent = "", devBusy = false, devPending = null;
+let devCurrent = "", devBusy = false, devPending = null, devSaved = "";
+/* Язык текущего файла — шапка говорит сразу, что открыто: Python по умолчанию,
+   HTML для .html: файловая папка принимает любой текстовый код. */
+function devLang(name) {
+  const b = document.getElementById("devlang");
+  if (!b) return;
+  const n = String(name || "");
+  const ext = n.includes(".") ? n.split(".").pop().toLowerCase() : "py";
+  b.textContent = (ext === "html" || ext === "htm") ? "HTML"
+                : ext === "py" ? "Python" : (ext || "TXT").toUpperCase();
+}
 
 async function devRefresh(keep) {
   try {
@@ -1144,7 +1187,15 @@ async function devRefresh(keep) {
       await devOpen(pick, true);
     } else {
       devCurrent = "";
+      devSaved = "";
       document.getElementById("devfname").textContent = "—";
+      devLang("");
+      // Пустая папка: показываем понятный пункт вместо пустого выпадающего списка
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = "— файлов нет: «Новый файл» —";
+      o.disabled = true;
+      sel.appendChild(o);
     }
     devLog();
   } catch (e) {
@@ -1157,7 +1208,9 @@ async function devOpen(name, silent) {
     const d = await apiGet("/api/dev/file?name=" + encodeURIComponent(name));
     if (d.error) { devOut(d.error, "err"); return; }
     document.getElementById("devcode").value = d.content || "";
+    devSaved = d.content || "";
     devCurrent = d.name;
+    devLang(d.name);
     document.getElementById("devfname").textContent = d.name;
     document.getElementById("devsel").value = d.name;
     if (!silent) devOut("открыт " + d.name, "info");
@@ -1175,26 +1228,44 @@ function devOut(text, cls) {
   box.scrollTop = box.scrollHeight;
 }
 function devNew() {
-  const name = (prompt("Имя нового файла в dev_sandbox/ (например myscript.py):",
-                       "myscript.py") || "").trim();
+  /* prompt() в части веб-оболочек не показывается вообще — поэтому имя
+     нового файла вводится строкой прямо в шапке окна. */
+  const row = document.getElementById("devnewrow");
+  row.style.display = "inline-flex";
+  const inp = document.getElementById("devnewname");
+  inp.value = "main.py";
+  inp.focus();
+  inp.select();
+}
+function devNewCancel() {
+  document.getElementById("devnewrow").style.display = "none";
+}
+function devNewOk() {
+  const name = (document.getElementById("devnewname").value || "").trim();
   if (!name) return;
+  devNewCancel();
   devCurrent = name;
+  devSaved = "";
   document.getElementById("devfname").textContent = name + " (новый)";
   document.getElementById("devsel").value = "";
   document.getElementById("devcode").value = "";
+  devLang(name);
   devOut("новый файл: " + name + " — напишите код и «Сохранить» "
-         + "(или попросите модель справа)", "info");
+         + "(или сразу «Запустить» — окно сохранит само)", "info");
 }
-async function devSave(source) {
-  const name = devCurrent || document.getElementById("devsel").value;
-  if (!name) { alert("сначала выберите или создайте файл"); return ""; }
+async function devSave(source, forceName, forceContent) {
+  const name = forceName || devCurrent || document.getElementById("devsel").value;
+  if (!name) { devOut("нет имени файла — нажмите «Новый файл»", "err"); return ""; }
+  const content = forceContent !== undefined
+        ? forceContent : document.getElementById("devcode").value;
   try {
     const r = await api("/api/dev/file", {
       name: name,
-      content: document.getElementById("devcode").value,
+      content: content,
       source: source || "user"
     });
     if (r.error) { devOut("не записалось: " + r.error, "err"); return ""; }
+    devSaved = content;
     devOut((r.existed ? "сохранено (откат доступен): " : "создано: ") + r.name, "ok");
     devRefresh(r.name);
     return r.name;
@@ -1218,6 +1289,16 @@ async function devRollback() {
 }
 async function devRun(name) {
   name = name || devCurrent || document.getElementById("devsel").value;
+  const code = document.getElementById("devcode").value;
+  if (!name && !code.trim()) { devOut("нет файла для запуска", "err"); return; }
+  /* Окно с кодом — источник истины: что набрано, то и уходит на диск перед
+     запуском (без выбранного файла — в main.py). Вывод всегда соответствует
+     тексту на экране, откаты работают как обычно. */
+  if (code.trim() && code !== devSaved) {
+    const saved = await devSave("user", name || "main.py", code);
+    if (!saved) return;
+    name = saved;
+  }
   if (!name) { devOut("нет файла для запуска", "err"); return; }
   devOut("$ python " + name, "cmd");
   try {
@@ -1275,6 +1356,12 @@ async function devSend() {
   btn.disabled = true;
   btn.textContent = "Жду…";
   devChatAdd("me", msg);
+  /* Секундомер на кнопке: видно, что запрос жив (модель на CPU считает
+     десятки секунд), а не завис. */
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    btn.textContent = "Жду… " + Math.round((Date.now() - t0) / 1000) + " с";
+  }, 1000);
   try {
     const res = await api("/api/dev/chat",
       {message: msg, active: devCurrent || document.getElementById("devsel").value});
@@ -1291,6 +1378,7 @@ async function devSend() {
   } catch (e) {
     devChatAdd("ai", "Панель не ответила: " + e);
   } finally {
+    clearInterval(tick);
     devBusy = false;
     btn.disabled = false;
     btn.textContent = "Отправить";
