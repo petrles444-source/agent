@@ -13,7 +13,7 @@
   "fallback_on_error": true,
   "reconnect_delay": 5,
   "panel_poll": 5,
-  "plan_timeout": 180,
+  "plan_timeout": 360,
   "reflect_timeout": 180,
   "log_path": "logs/thinking/thoughts.jsonl",
   "log_max_bytes": 5242880,

@@ -9,9 +9,14 @@ Colab-ячеек (thinking/colab). Снимок схемы сверяется с
 """
 from __future__ import annotations
 
+import argparse
+import http.server
 import json
+import re
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +28,7 @@ from thinking import client as client_mod# noqa: E402
 from thinking.client import ThinkingClient, ThinkingError       # noqa: E402
 from thinking.client import _is_read_timeout                  # noqa: E402
 from thinking.fallback import local_plan, offline_reason        # noqa: E402
-from thinking.schemas import (ACTIONS, EVENT_TYPES, Plan, ReflectResponse,  # noqa: E402
+from thinking.schemas import (ACTIONS, EVENT_TYPES, ChatReply, Plan, ReflectResponse,  # noqa: E402
                               SchemaError, extract_json, has_secret,
                               plan_schema, redact_secrets, utcnow)
 
@@ -74,6 +79,11 @@ def make_client(**kw) -> ThinkingClient:
         "log_path": str(TMP / "thoughts.jsonl"),
         "interactions_path": str(TMP / "interactions.jsonl"),
         "reports_path": str(TMP / "reports.jsonl"),
+        # Память и журнал диалога — только в TMP (AUD-04): раньше тесты
+        # работали с реальными logs/thinking/memory.json и forget() в
+        # test_chat_memory_tokens стирал пользовательские факты.
+        "memory_path": str(TMP / "memory.json"),
+        "chat_path": str(TMP / "chat.jsonl"),
         "retry": {"max_attempts": 1, "backoff_base": 1.0},
         "enabled": True,
         "fallback_on_error": True,
@@ -242,6 +252,9 @@ def test_client() -> None:
         check(data.get("token") == "токен", "set_url: пишет токен в локальный конфиг")
     finally:
         client_mod.LOCAL_PATH = saved
+        # Тест оставил в TMP-конфиге example.invalid — иначе все следующие
+        # make_client() ходят в сеть на несуществующий хост (AUD-04)
+        (TMP / "thinking.local.json").unlink(missing_ok=True)
 
     # недоступный сервер: ошибка фиксируется, приложение не падает
     c3 = make_client(base="http://127.0.0.1:1", retry={"max_attempts": 1})
@@ -350,8 +363,9 @@ def test_chat_memory_tokens() -> None:
           "чат: не-объект отбраковывается")
     check(estimate_tokens("") == 0 and estimate_tokens("абв") == 1,
           "токены: оценка по длине текста")
-    check(raises(lambda: ChatReply.from_dict({"tokens_in": -5}), ValueError) or True,
-          "токены: отрицательные значения не проходят (или приводятся к 0)")
+    neg = ChatReply.from_dict({"tokens_in": -5, "tokens_out": -1})
+    check(neg.tokens_in == 0 and neg.tokens_out == 0,
+          "токены: отрицательные значения приводятся к 0")
 
     # --- память ---
     c = make_client()
@@ -486,6 +500,292 @@ def test_rus_labels() -> None:
             break
     else:
         check(True, "все подписи на русском")
+
+
+# --------------------------------------------------------------------------- #
+#  Регрессии аудита (audit.md) — поведенческие тесты вместо «строка есть»
+# --------------------------------------------------------------------------- #
+def test_memory_action() -> None:
+    """Экспорт/импорт памяти работают (AUD-01: раньше NameError на utcnow)."""
+    mod = _load_cli_module()
+    c = make_client()
+    code, payload = mod.memory_action(c, {"action": "export"})
+    check(code == 200 and "exported" in payload
+          and payload["memory"]["facts"] == [],
+          "память: экспорт возвращает структуру и метку времени")
+    c.remember("факт для импорта")
+    code, payload = mod.memory_action(c, {"action": "export"})
+    exported = payload["memory"]
+    c.forget()
+    check(c.memory()["facts"] == [], "память: forget стирает факты")
+    code, payload = mod.memory_action(c, {"action": "import", "memory": exported})
+    check(code == 200 and "факт для импорта" in payload["memory"]["facts"],
+          "память: импорт восстанавливает факты")
+    code, payload = mod.memory_action(c, {"action": "import", "memory": "не словарь"})
+    check(code == 400 and "error" in payload,
+          "память: импорт отбраковывает не-объект")
+    code, payload = mod.memory_action(c, {"action": "remove",
+                                         "fact": "факт для импорта"})
+    check(code == 200 and payload["memory"]["facts"] == [],
+          "память: remove удаляет факт")
+    code, payload = mod.memory_action(c, {"action": "remember", "fact": "ещё факт"})
+    check(code == 200 and "ещё факт" in payload["memory"]["facts"],
+          "память: remember через action")
+
+
+def test_panel_routes() -> None:
+    """Все маршруты, которые зовёт панель, существуют в CLI (AUD-18)."""
+    cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    routes = set()
+    for m in re.finditer(r'api(?:Get|Stream)?\(\s*"(/api/[^"]+)"', html):
+        routes.add(m.group(1).split("?")[0])
+    for m in re.finditer(r'fetch\(\s*"(/api/[^"]+)"', html):
+        routes.add(m.group(1).split("?")[0])
+    check(bool(routes), "маршруты: в панели есть вызовы /api/*")
+    missing = [r for r in sorted(routes) if f'"{r}"' not in cli_src]
+    check(not missing, f"маршруты: все вызовы панели есть в CLI (нет: {missing})")
+
+
+def test_breaker_channels() -> None:
+    """Обрыв потока не блокирует REST и наоборот (AUD-05)."""
+    c = make_client()
+    c.base = "http://127.0.0.1:1"   # мёртвый порт: соединение отказывает мгновенно
+    # открываем REST-предохранитель вручную (5 ошибок подряд)
+    c._cb_errors = 5
+    c._cb_open_until = time.time() + 60
+    try:
+        c._json("GET", "/health")
+        check(False, "breaker: REST блокируется при открытом предохранителе")
+    except ThinkingError as exc:
+        check("предохранитель" in str(exc),
+              "breaker: REST блокируется при открытом предохранителе")
+    # поток при этом не заблокирован предохранителем (падает по сети)
+    try:
+        c._open("GET", "/events/stream", stream=True)
+        check(False, "breaker: поток не должен блокироваться REST-предохранителем")
+    except ThinkingError as exc:
+        check("предохранитель" not in str(exc),
+              "breaker: поток не блокируется REST-предохранителем (AUD-05)")
+    # и наоборот: открыт потоковый — REST работает
+    c2 = make_client()
+    c2.base = "http://127.0.0.1:1"
+    c2._cb_stream_errors = 5
+    c2._cb_stream_until = time.time() + 60
+    try:
+        c2._open("GET", "/events/stream", stream=True)
+        check(False, "breaker: поток блокируется своим предохранителем")
+    except ThinkingError as exc:
+        check("предохранитель" in str(exc),
+              "breaker: поток блокируется своим предохранителем")
+    try:
+        c2._json("GET", "/health")
+        check(False, "breaker: REST не должен блокироваться потоковым предохранителем")
+    except ThinkingError as exc:
+        check("предохранитель" not in str(exc),
+              "breaker: REST не блокируется потоковым предохранителем (AUD-05)")
+
+
+def test_plan_stream_accounting() -> None:
+    """Успешный план через поток попадает в метрики и отчёты (AUD-06)."""
+    plan_json = json.dumps({"plan_id": "mock1", "goal": "цель",
+                            "steps": [{"id": 1, "action": "build",
+                                       "desc": "собрать"}]})
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            body = (
+                'data: {"type": "thought", "text": "думаю"}\n\n'
+                f'data: {{"type": "final", "text": {json.dumps(plan_json)}}}\n\n'
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c = make_client()
+        c.base = f"http://127.0.0.1:{srv.server_address[1]}"
+        plan = c.plan_stream("тестовая задача")
+        check(plan.get("plan_id") == "mock1", "plan_stream: план разобран из потока")
+        check(c.stats["plans"] == 1, "plan_stream: план попал в stats (AUD-06)")
+        inter = c.status()["interactions"]
+        check(any(i.get("kind") == "plan" and i.get("ok") for i in inter),
+              "plan_stream: успешный план записан в журнал (AUD-06)")
+        reps = [r for r in c.reports if r.get("type") == "plan"]
+        check(bool(reps), "plan_stream: отчёт плана записан (AUD-06)")
+    finally:
+        srv.shutdown()
+
+
+def test_benefits_no_double_count() -> None:
+    """benefits не считает фолбэки дважды (AUD-07)."""
+    c = make_client(interactions_path=str(TMP / "ben_inter.jsonl"),
+                    reports_path=str(TMP / "ben_reps.jsonl"))
+    c._record("plan", "задача 1", time.time(), ok=False, fallback=True,
+              summary="нет связи")
+    c._record("plan", "задача 2", time.time(), ok=False, fallback=True,
+              summary="нет связи")
+    ben = c.status()["benefits"]
+    check(ben["fallbacks"] == 2,
+          "benefits: фолбэки считаются один раз, а не дважды (AUD-07)")
+
+
+def test_token_honesty() -> None:
+    """Заглушки не тратят токены (AUD-22)."""
+    c = make_client(interactions_path=str(TMP / "tok_inter.jsonl"),
+                    reports_path=str(TMP / "tok_reps.jsonl"),
+                    chat_path=str(TMP / "tok_chat.jsonl"),
+                    memory_path=str(TMP / "tok_mem.json"))
+    c.base = "http://127.0.0.1:1"   # мёртвый сервер -> заглушка
+    reply = c.chat("привет")
+    check(reply.get("fallback") is True, "токены: заглушка при недоступном сервере")
+    check(reply.get("tokens_in") == 0 and reply.get("tokens_out") == 0,
+          "токены: заглушка не тратит токены (AUD-22)")
+    check(c.tokens()["tokens_total"] == 0,
+          "токены: сводка не раздута заглушкой (AUD-22)")
+
+
+def test_secrets_smart() -> None:
+    """os.getenv(...) — не секрет; литерал — секрет (AUD-13)."""
+    check(not has_secret("token = os.getenv('THINKING_TOKEN')"),
+          "секреты: os.getenv(...) не блокирует запрос (AUD-13)")
+    check(has_secret("password=hunter2"),
+          "секреты: литерал по-прежнему блокируется")
+    check(redact_secrets("token = os.getenv('X')") == "token = os.getenv('X')",
+          "секреты: redact не трогает ссылки на переменные (AUD-13)")
+    check(redact_secrets("password=hunter2") == "password=[скрыто]",
+          "секреты: redact маскирует литерал")
+    c = make_client()
+    check(raises(lambda: c._dev_body("посмотри конфиг",
+                                     active_code='token = "abc123"'), SchemaError),
+          "секреты: код с секретом блокирует dev-запрос (AUD-13)")
+    check(not raises(lambda: c._dev_body("посмотри конфиг",
+                                         active_code="token = os.getenv('X')"),
+                     SchemaError),
+          "секреты: код со ссылкой на переменную проходит (AUD-13)")
+
+
+def test_reflect_async_spawns_process() -> None:
+    """reflect --async запускает отсоединённый процесс, а не daemon-поток
+    (AUD-03: daemon-поток умирал вместе с CLI, результат терялся)."""
+    mod = _load_cli_module()
+    calls = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            self.pid = 4242
+            calls.append((cmd, kw))
+
+    old_popen = mod.subprocess.Popen
+    mod.subprocess.Popen = FakePopen
+    try:
+        args = argparse.Namespace(plan_id="p1", step=1, result="ok",
+                                  observation=None, error=None, async_mode=True)
+        rc = mod.cmd_reflect(make_client(), args)
+        check(rc == 0 and len(calls) == 1,
+              "reflect --async: запускает дочерний процесс (AUD-03)")
+        cmd = calls[0][0]
+        check(cmd[0] == sys.executable and "reflect" in cmd and "p1" in cmd,
+              "reflect --async: дочерний процесс зовёт reflect с теми же аргументами")
+        check("--async" not in cmd,
+              "reflect --async: у дочернего процесса нет --async")
+    finally:
+        mod.subprocess.Popen = old_popen
+
+
+def test_devsave_args() -> None:
+    """«Применить» передаёт код и имя файла модели в devSave (AUD-02)."""
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    check('devSave("model", p.filename, p.code)' in html,
+          "панель: Применить передаёт код и имя файла модели (AUD-02)")
+    check('devSave("model")' not in html,
+          "панель: нет вызова devSave без аргументов (AUD-02)")
+    check("await devRefresh(r.name)" in html,
+          "панель: devSave ждёт обновления списка файлов (AUD-02)")
+
+
+def test_memory_sig() -> None:
+    """Рендер памяти под сигнатурой state (AUD-15)."""
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    check("s.chat, s.tokens, s.memory" in html,
+          "панель: память входит в сигнатуру рендера (AUD-15)")
+    m = re.search(r"if \(sig !== lastSig\) \{(.*?)\n    \}", html, re.S)
+    check(m is not None and "renderMemory(s.memory)" in m.group(1),
+          "панель: renderMemory только при изменении сигнатуры (AUD-15)")
+
+
+def test_config_timeouts() -> None:
+    """plan_timeout в конфиге совпадает с кодом (AUD-25)."""
+    cfg = json.loads((ROOT / "config" / "thinking.json").read_text(encoding="utf-8"))
+    check(cfg.get("plan_timeout") == 360,
+          "конфиг: plan_timeout совпадает с кодом (360, AUD-25)")
+
+
+def test_nctx_alignment() -> None:
+    """n_ctx в _llm_cmd совпадает с ячейкой D (AUD-08)."""
+    src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    check('_env_export("THINKING_CTX"' in src,
+          "ячейка C: _llm_cmd читает THINKING_CTX из env-файла (AUD-08)")
+    check('"8192" if gpu else "4096"' in src,
+          "ячейка C: фолбэк n_ctx совпадает с ячейкой D (AUD-08)")
+    d_src = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    check("export THINKING_CTX" in d_src,
+          "ячейка D: пишет THINKING_CTX в env-файл (AUD-08)")
+
+
+def test_sse_queue_limit() -> None:
+    """Очереди SSE-подписчиков ограничены (AUD-11)."""
+    src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    check("asyncio.Queue(maxsize=200)" in src,
+          "сервер: очередь SSE ограничена 200 событиями (AUD-11)")
+    check("asyncio.QueueFull" in src,
+          "сервер: переполненная очередь отключает подписчика (AUD-11)")
+
+
+def test_smoke_guarded() -> None:
+    """Смоук-тест ячейки D обёрнут в try/except (AUD-24)."""
+    src = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    check("except Exception as _smoke_exc" in src,
+          "ячейка D: смоук не роняет ячейку (AUD-24)")
+
+
+def test_tail_throttle() -> None:
+    """Хвост печатает о разрыве при изменении состояния, не каждые 0,5 с (AUD-23)."""
+    src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    check("now - last_warn >= 15" in src,
+          "хвост: троттлинг предупреждений 15 с (AUD-23)")
+    check("[связь восстановлена]" in src,
+          "хвост: сообщение о восстановлении связи (AUD-23)")
+
+
+def test_cache_tail_read() -> None:
+    """_cache_get читает хвост журнала, а не весь файл (AUD-25)."""
+    mod = _load_cli_module()
+    c = make_client()
+    for i in range(100):
+        c._remember_chat(f"вопрос {i}",
+                         ChatReply.from_dict({"reply": f"ответ {i}"}))
+    check(mod._cache_get(c, "chat", "несуществующий вопрос") is None,
+          "кэш: промах по несуществующему вопросу")
+    hit = mod._cache_get(c, "chat", "вопрос 99")
+    check(hit is not None and hit.get("reply") == "ответ 99",
+          "кэш: находит последний ответ из хвоста журнала")
+
+
+def test_events_ping() -> None:
+    """Локальный /events шлёт ping раз в 5 с (AUD-25)."""
+    src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    check("now - last_ping >= 5" in src,
+          "панель: ping раз в 5 с, а не каждый тик (AUD-25)")
 
 
 def test_colab_cells() -> None:
@@ -852,6 +1152,23 @@ def main() -> int:
     test_reliability()
     test_chat_memory_tokens()
     test_rus_labels()
+    test_memory_action()
+    test_panel_routes()
+    test_breaker_channels()
+    test_plan_stream_accounting()
+    test_benefits_no_double_count()
+    test_token_honesty()
+    test_secrets_smart()
+    test_reflect_async_spawns_process()
+    test_devsave_args()
+    test_memory_sig()
+    test_config_timeouts()
+    test_nctx_alignment()
+    test_sse_queue_limit()
+    test_smoke_guarded()
+    test_tail_throttle()
+    test_cache_tail_read()
+    test_events_ping()
     test_colab_cells()
     test_dev_metrics_limits()
     test_quickwins()

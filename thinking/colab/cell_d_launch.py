@@ -108,6 +108,10 @@ def wait_http(url, tries=150, gap=2, payload=None):
 # Контекст 4096 на CPU (быстрее считать) и 8192 на GPU — качество не страдает.
 GPU = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
 CTX = "8192" if GPU else "4096"
+# Пишем контекст в env-файл: его читает _llm_cmd при сторожевом перезапуске
+# (ячейка C), чтобы n_ctx не разъехался между запуском и перезапуском (AUD-08)
+with open(env_file, "a", encoding="utf-8") as fh:
+    fh.write(f'export THINKING_CTX="{CTX}"\n')
 llm_cmd = [sys.executable, "-m", "llama_cpp.server",
            "--model", MODEL, "--n_ctx", CTX, "--n_gpu_layers", "-1",
            "--host", "127.0.0.1", "--port", "8001", "--model_alias", "thinking",
@@ -145,16 +149,27 @@ llm_cmd[llm_cmd.index("--model") + 1] = MODEL
 print("LLM ready:", health.text[:200])
 
 # ---- 3) смоук-тест генерации ----------------------------------------------
+# На CPU модель может отвечать дольше 180 с или упасть на старте — это не
+# повод ронять ячейку целиком: API и туннель поднимаются дальше, а проверить
+# генерацию можно руками (AUD-24).
 t0 = time.time()
-smoke = requests.post(
-    "http://127.0.0.1:8001/v1/chat/completions",
-    json={"model": "thinking", "temperature": 0,
-          "max_tokens": 24, "messages": [{"role": "user",
-                                          "content": "Ответь ровно одним словом: готов"}]},
-    timeout=180)
-dt = time.time() - t0
-txt = smoke.json()["choices"][0]["message"]["content"]
-print(f"смоук: {dt:.1f} с -> {txt[:80]!r}")
+try:
+    smoke = requests.post(
+        "http://127.0.0.1:8001/v1/chat/completions",
+        json={"model": "thinking", "temperature": 0,
+              "max_tokens": 24, "messages": [{"role": "user",
+                                              "content": "Ответь ровно одним словом: готов"}]},
+        timeout=180)
+    dt = time.time() - t0
+    txt = smoke.json()["choices"][0]["message"]["content"]
+    print(f"смоук: {dt:.1f} с -> {txt[:80]!r}")
+except Exception as _smoke_exc:
+    print(f"! смоук не прошёл: {_smoke_exc}")
+    print("  модель отвечает медленно или ещё грузится — проверь руками:")
+    print("  curl -s http://127.0.0.1:8001/v1/chat/completions -X POST "
+          "-H 'Content-Type: application/json' "
+          "-d '{\"model\":\"thinking\",\"max_tokens\":24,"
+          "\"messages\":[{\"role\":\"user\",\"content\":\"привет\"}]}'")
 
 # ---- 4) API на :8000 -------------------------------------------------------
 assert os.path.exists("/content/thinking_server.py"), "сначала ячейка C (сервер)"

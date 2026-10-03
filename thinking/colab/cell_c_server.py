@@ -214,6 +214,12 @@ async def emit(type_: str, text: str, **kw) -> dict:
     for q in list(S.subs):
         try:
             q.put_nowait(ev)
+        except asyncio.QueueFull:
+            # Подписчик отстал на 200 событий — рвём соединение: клиент
+            # переподключится через /events?since= и доберёт хвост (AUD-11).
+            # Раньше очередь была без лимита и медленный клиент копил
+            # события в памяти сервера бесконечно.
+            dead.append(q)
         except Exception:
             dead.append(q)
     for q in dead:
@@ -661,7 +667,9 @@ async def events_stream(x_agent_token: str = Header(default=""), token: str = ""
     async def gen():
         for e in list(S.events)[-50:]:
             yield f"data: {json.dumps(e, ensure_ascii=False)}\n\n"
-        q: asyncio.Queue = asyncio.Queue()
+        # Очередь с лимитом: медленный подписчик не должен копить события
+        # в памяти сервера (AUD-11) — при переполнении его отключит emit()
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
         S.subs.add(q)
         try:
             while True:
@@ -933,12 +941,30 @@ def _model_hint(path: str, gpu: Optional[bool] = None) -> str:
     return f"{here}; на T4 любая модель считается заметно быстрее.{unc}"
 
 
+def _env_export(key: str, default: str = "") -> str:
+    """Последнее значение `export KEY=...` из /content/thinking_env.sh.
+
+    Ячейка D пишет туда THINKING_CTX — сторожевый перезапуск через _llm_cmd
+    должен использовать тот же контекст, что и первый запуск (AUD-08).
+    """
+    try:
+        for line in open("/content/thinking_env.sh", encoding="utf-8"):
+            if line.startswith(f"export {key}="):
+                default = line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+
 def _llm_cmd(model_path: str) -> list[str]:
     """Та же строка запуска, что и в ячейке D, но с нужной моделью."""
     gpu = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
+    # n_ctx — из thinking_env.sh (пишет ячейка D), чтобы запуск и сторожевый
+    # перезапуск не разошлись (AUD-08); фолбэк — те же значения, что в D
+    ctx = _env_export("THINKING_CTX", "8192" if gpu else "4096")
     return [sys.executable, "-m", "llama_cpp.server",
             "--model", model_path,
-            "--n_ctx", "4096" if gpu else "2048",
+            "--n_ctx", ctx,
             "--n_gpu_layers", "-1",
             "--host", LLM_HOST, "--port", str(LLM_PORT),
             "--model_alias", MODEL_NAME,
