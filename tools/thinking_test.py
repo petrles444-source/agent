@@ -733,6 +733,31 @@ def test_dev_reports() -> None:
     check(reps[0].get("code") == "x = 42", "отчёты: код в отчёте")
 
 
+def test_dev_layout_vertical() -> None:
+    """«Разработка» идёт сверху вниз: чат → код → вывод → журнал → дамп."""
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    check(re.search(r"\.devgrid\s*\{[^}]*flex-direction:\s*column", html) is not None
+          and not re.search(r"\.devgrid\s*\{[^}]*grid-template-columns", html),
+          "разработка: раскладка вертикальная, а не в три колонки")
+    # порядок блоков внутри .devgrid
+    start = html.find('<div class="devgrid">')
+    end = html.find('<div class="note">', start)
+    block = html[start:end] if start > 0 and end > start else html[start:start + 6000]
+    order = ["devcol-chat", "devcol-code", "devcol-out", "devcol-log", "devbar-dump"]
+    pos = [block.find(k) for k in order]
+    check(all(p >= 0 for p in pos) and pos == sorted(pos),
+          "разработка: порядок сверху вниз — чат, код, вывод, журнал, дамп")
+    # окна, которые просил расширить, должны быть выше среднего
+    check(".devcol-chat { height: 400px" in html,
+          "разработка: окно чата с агентом увеличено")
+    check(".devcol-out  { height: 380px" in html,
+          "разработка: вывод интерпретатора увеличен")
+    check("#devinput { flex:1; min-height:92px" in html,
+          "разработка: поле ввода агенту выше")
+    check('id="devstdin"' in block,
+          "разработка: поле ввода программы осталось в блоке вывода")
+
+
 def test_dev_run_stdin() -> None:
     """Запуск из «Разработки»: input() получает введённое, а не висит 30 с."""
     mod = _load_cli_module()
@@ -1241,6 +1266,7 @@ def main() -> int:
     test_reflect_async_spawns_process()
     test_devsave_args()
     test_dev_reports()
+    test_dev_layout_vertical()
     test_dev_run_stdin()
     test_chat_autoscroll()
     test_period_default()

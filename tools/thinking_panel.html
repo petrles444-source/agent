@@ -324,10 +324,19 @@
   .warnbox.b { margin:0 0 12px; }
 
   /* ---------- режим разработчика ---------- */
-  .devgrid { display:grid; grid-template-columns:1.5fr 1fr 1fr; gap:10px;
-             height:calc(100vh - 300px); min-height:430px; }
+  /* Режим разработчика: сверху вниз (чат → код → вывод → журнал → дамп).
+     Раньше три окна стояли рядом и на ноутбуке это читалось тяжело. */
+  .devgrid { display:flex; flex-direction:column; gap:10px; }
   .devcol { background: var(--bg-card); border: var(--border-soft); border-radius: 8px;
-            display:flex; flex-direction:column; overflow:hidden; transition: var(--t-fast); }
+            display:flex; flex-direction:column; overflow:hidden; transition: var(--t-fast);
+            min-height:0; }
+  .devcol-chat { height: 400px; }   /* окно, где я пишу агенту, — самое крупное */
+  .devcol-code { height: 330px; }
+  .devcol-out  { height: 380px; }   /* вывод интерпретатора — тоже просторный */
+  .devcol-log  { height: 170px; }
+  .devbar-dump { background: var(--bg-card); border: var(--border-soft);
+                 border-radius: 8px; padding: 12px 14px; display:flex; gap:10px;
+                 align-items:center; flex-wrap:wrap; }
   .devcol:hover { border-color: rgba(0,243,255,.3); }
   .devhead { padding:9px 12px; border-bottom:1px solid rgba(255,255,255,.1); font-size:12.5px;
              color: var(--text-primary); display:flex; gap:8px; align-items:center;
@@ -351,7 +360,7 @@
   .devbar { display:flex; gap:6px; padding:9px 12px;
             border-top:1px solid rgba(255,255,255,.1);
             flex-wrap:wrap; align-items:center; }
-  #devinput { flex:1; min-height:40px; width:auto; resize:vertical; }
+  #devinput { flex:1; min-height:92px; width:auto; resize:vertical; line-height:1.45; }
   .codesample { background: rgba(10,10,15,.85); border:1px solid rgba(0,255,157,.3);
                 border-radius:6px; padding:10px 12px; max-height:260px; overflow:auto;
                 font-size:12px; white-space:pre-wrap; word-break:break-word;
@@ -397,6 +406,11 @@
     .scroll, #chatlog, #devchat { height:auto !important;
                                    max-height:none !important;
                                    overflow:visible !important; }
+    /* вертикальная раскладка «Разработки» на печати не обрезается */
+    .devgrid { display:block !important; }
+    .devcol, .devbar-dump { height:auto !important; max-height:none !important;
+                             overflow:visible !important; margin-bottom:8px; }
+    #devout, #devloglist, #devcode { height:auto !important; max-height:none !important; }
     .card, .kpi, .block, .msg { break-inside: avoid; }
     body { background:#fff; color:#000;
            -webkit-print-color-adjust:exact; print-color-adjust:exact; }
@@ -512,13 +526,28 @@
   <!-- ============ РАЗРАБОТКА ============ -->
   <section class="pane" id="pane-dev">
     <p class="hint">Режим разработчика: субагент выходит за рамки «мышления» и
-      работает с кодом в папке <b>dev_sandbox/</b> этой программы. Три окна —
-      код (правится руками), вывод интерпретатора и чат с выбором модели.
+      работает с кодом в папке <b>dev_sandbox/</b> этой программы. Окна идут
+      сверху вниз: чат с моделью → код → вывод интерпретатора → журнал → дамп.
       Контроль сохраняется: каждое изменение от модели подтверждается тобой,
       перед правкой старая версия уходит в откат (20 последних), всё пишется
-      в журнал, кнопкой собирается дамп.</p>
+      в журнал.</p>
     <div class="devgrid">
-      <div class="devcol">
+      <div class="devcol devcol-chat">
+        <div class="devhead">Чат с агентом
+          <select id="devmodel" title="активная модель в Colab"
+                  onchange="devSwitchModel(this)"></select>
+          <span class="meta">сверху вниз: спросил → код → запуск → вывод</span>
+        </div>
+        <div id="devchat"><div class="devmsg ai">Напишите, что сделать: «напиши
+          простой код на python», «сделай новую функцию в текущем файле» —
+          модель подготовит изменение, ты подтвердишь, и оно применится.</div></div>
+        <div class="devbar">
+          <textarea id="devinput" rows="4"
+                    placeholder="что сделать с кодом… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+          <button id="devsend" onclick="devSend()">Отправить</button>
+        </div>
+      </div>
+      <div class="devcol devcol-code">
         <div class="devhead"><b id="devlang">Python</b>
           <select id="devsel" onchange="devOpen(this.value)"></select>
           <button class="mini" onclick="devRefresh()">⟳</button>
@@ -534,7 +563,7 @@
         </div>
         <div class="devbody" style="padding:0">
           <textarea id="devcode" spellcheck="false"
-                    placeholder="выберите файл или создайте новый — либо попросите модель в чат справа"></textarea>
+                    placeholder="выберите файл или создайте новый — либо попросите модель в чате выше"></textarea>
         </div>
         <div class="devbar">
           <button onclick="devSave('user')">Сохранить</button>
@@ -542,35 +571,28 @@
           <span class="meta">правки руками тоже сохраняются с откатом</span>
         </div>
       </div>
-      <div class="devcol">
+      <div class="devcol devcol-out">
         <div class="devhead">Вывод интерпретатора
           <button class="mini" onclick="devRun()">▶ Запустить</button>
           <button class="mini" onclick="document.getElementById('devout').textContent='';document.getElementById('devout').dataset.empty='yes'">Очистить</button>
+          <span class="meta">в поле ниже — данные для input(), по строке на каждый</span>
         </div>
-        <div class="devhead" style="border-top:none">
+        <pre id="devout" data-empty="yes">нажмите «Запустить» — здесь появится вывод выбранного .py-файла</pre>
+        <div class="devbar">
           <input id="devstdin" placeholder="ввод для программы (для input()) — можно пусто"
                  title="Если программа ждёт ввода (input), впишите сюда данные — по одной строке на каждый input()">
         </div>
-        <pre id="devout" data-empty="yes">нажмите «Запустить» — здесь появится вывод выбранного .py-файла</pre>
+      </div>
+      <div class="devcol devcol-log">
         <div class="devhead">Журнал разработки
-          <button class="mini" onclick="devDump()">Собрать дамп</button>
-          <button class="mini" onclick="devLog()">⟳</button>
+          <button class="mini" onclick="devLog()">⟳ Обновить</button>
         </div>
         <div class="devbody" id="devloglist"><div class="empty">журнал пуст</div></div>
       </div>
-      <div class="devcol">
-        <div class="devhead">Чат и модели
-          <select id="devmodel" title="активная модель в Colab"
-                  onchange="devSwitchModel(this)"></select>
-        </div>
-        <div id="devchat"><div class="devmsg ai">Напишите, что сделать: «напиши
-          простой код на python», «сделай новую функцию в текущем файле» —
-          модель подготовит изменение, ты подтвердишь, и оно применится.</div></div>
-        <div class="devbar">
-          <textarea id="devinput" rows="2"
-                    placeholder="что сделать с кодом… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
-          <button id="devsend" onclick="devSend()">Отправить</button>
-        </div>
+      <div class="devbar-dump">
+        <button onclick="devDump()">Собрать дамп</button>
+        <span class="meta">архив рабочей папки и журналов — на случай, если
+          понадобится разбор или перенос другому проекту</span>
       </div>
     </div>
     <div class="note">Файлы: <span id="devroot">dev_sandbox/</span> · откаты лежат
