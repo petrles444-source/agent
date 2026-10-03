@@ -128,12 +128,14 @@ INTRO = """# Субагент «Мышление» — автозапуск{ver}
 | 4 (D) | LLM + API + публичный туннель + сторож | `смоук: X.X с`, `THINKING_URL=`, `THINKING_TOKEN=` |
 | 5 (E) | фон: снапшот событий + keep-alive 12 ч | `фон запущен: …` |
 | 6 (F) | остановка (по необходимости) | `субагент остановлен` |
+| 7 | **печатает адрес и готовую команду для ПК** | `АДРЕС ТУННЕЛЯ: https://…` |
 
-После ячейки 4 скопируйте `THINKING_URL` и `THINKING_TOKEN` и на ПК выполните:
+После ячейки 4 (или 7 — там всё готово копированием) выполните на ПК:
 
 ```bash
 python tools/thinking_cli.py set-url <THINKING_URL> <THINKING_TOKEN>
 python tools/thinking_cli.py doctor
+python tools/thinking_cli.py panel     # → http://127.0.0.1:8765
 ```
 
 **Чтобы адрес не менялся изо дня в день**, задайте в ячейке D переменную
@@ -145,6 +147,71 @@ Create tunnel → token): адрес станет постоянным, и `set-
 встала — Colab: Сессия → Лимиты; лимиты часто возвращаются примерно через
 сутки (или смените Google-аккаунт). Сначала работайте на GPU, потом переходите
 на CPU (в панели это видно и подсказывается).
+"""
+
+SHOW_URL = """#@title 7/7 · Как открыть веб-панель (адрес туннеля + команда для ПК)
+import pathlib, re
+f = pathlib.Path("/content/thinking_url.txt")
+data = f.read_text(encoding="utf-8") if f.exists() else ""
+url = (re.search(r"THINKING_URL=(\\S+)", data) or [None, ""])[1]
+token = (re.search(r"THINKING_TOKEN=(\\S+)", data) or [None, ""])[1]
+print("=" * 66)
+print("  АДРЕС ТУННЕЛЯ:", url or "не найден — выполни ячейку 4/7 (D)")
+print("=" * 66)
+print()
+if url:
+    print("ШАГ 1. На ПК скопируй и выполни одну команду:")
+    print()
+    print(f'    python tools/thinking_cli.py set-url "{url}" "{token}"')
+    print()
+    print("ШАГ 2. Открой панель (в этом же окне PowerShell):")
+    print()
+    print("    python tools/thinking_cli.py panel")
+    print()
+    print("    -> откроется http://127.0.0.1:8765  (панель на 9 вкладок)")
+    print()
+    print("ШАГ 3. Проверь, что субагент отвечает:")
+    print()
+    print("    python tools/thinking_cli.py doctor")
+else:
+    print("Адреса пока нет. Выполни ячейку 4/7 (D) — она поднимает туннель,")
+    print("потом вернись сюда и выполни эту ячейку ещё раз.")
+"""
+
+FINISH = """---
+
+## Где взять адрес (чтобы не искать его каждый раз)
+
+Выполните **ячейку 7/7** в самом конце ноутбука — она напечатает всё готовое
+копированием:
+
+```
+АДРЕС ТУННЕЛЯ: https://xxxx-xxxx.trycloudflare.com
+```
+
+**Веб-панель на ПК** (самая частая задача):
+
+```bash
+python tools/thinking_cli.py panel
+```
+
+→ откроется **http://127.0.0.1:8765** — панель на 9 вкладок (Отчёты, История,
+Диалог, Память, Токены, Выгода, Модели, Разработка, Лента). Токен подставится
+сам из `config/thinking.local.json`.
+
+**Связь не работает / адрес не подходит:**
+
+```bash
+python tools/thinking_cli.py set-url <АДРЕС> <ТОКЕН>   # адрес и токен — из ячейки 7/7
+python tools/thinking_cli.py doctor                     # что сломано и где смотреть
+python tools/thinking_cli.py panel                     # открыть панель
+```
+
+`doctor` печатает причину по-человечески: не отвечает Colab, отвечает, но
+молчит, или токен не тот.
+
+**Панель молчит при открытии** — это нормально: интерфейс и история лежат
+на ПК. Colab нужен только чтобы отвечать на новые запросы.
 """
 
 
@@ -163,7 +230,7 @@ def make_notebook(url: str, inline: bool = True, ver: str = "") -> dict:
             "code", f"%%writefile {path}\n{_read_cell(name)}")
         cells += [
             _nb_cell("code",
-                     "#@title 1/6 · Исходники внутри ноутбука — загрузка не нужна\n"
+                     "#@title 1/7 · Исходники внутри ноутбука — загрузка не нужна\n"
                      "import os\n"
                      "os.makedirs('/content/tc', exist_ok=True)\n"
                      "print('ноутбук самодостаточен: каждая ячейка содержит свой код')"),
@@ -172,24 +239,26 @@ def make_notebook(url: str, inline: bool = True, ver: str = "") -> dict:
             write("/content/tc/cell_d_launch.py", "cell_d_launch.py"),
             write("/content/tc/cell_e_background.py", "cell_e_background.py"),
             write("/content/tc/cell_f_stop.py", "cell_f_stop.py"),
-            _nb_cell("code", "#@title 2/6 · Ячейка A — окружение, сборка, модель\n"
+            _nb_cell("code", "#@title 2/7 · Ячейка A — окружение, сборка, модель\n"
                              "import runpy; runpy.run_path('/content/tc/cell_a_setup.py', run_name='__main__')"),
-            _nb_cell("code", "#@title 3/6 · Ячейка C — сборка API-сервера\n"
+            _nb_cell("code", "#@title 3/7 · Ячейка C — сборка API-сервера\n"
                              "import pathlib\n"
                              "src = pathlib.Path('/content/thinking_server.py')\n"
                              "print('записан /content/thinking_server.py:', len(src.read_text(encoding='utf-8').splitlines()), 'строк')"),
-            _nb_cell("code", "#@title 4/6 · Ячейка D — LLM + API + туннель + сторож\n"
+            _nb_cell("code", "#@title 4/7 · Ячейка D — LLM + API + туннель + сторож\n"
                              "import os, runpy\n"
                              "os.environ.setdefault('THINKING_TOKEN', '')   # впишите токен, чтобы адрес не менялся\n"
                              "runpy.run_path('/content/tc/cell_d_launch.py', run_name='__main__')"),
-            _nb_cell("code", "#@title 5/6 · Ячейка E — фон (снапшот + keep-alive)\n"
+            _nb_cell("code", "#@title 5/7 · Ячейка E — фон (снапшот + keep-alive)\n"
                              "import runpy; runpy.run_path('/content/tc/cell_e_background.py', run_name='__main__')"),
-            _nb_cell("code", "#@title 6/6 · Ячейка F — остановка (по необходимости)\n"
+            _nb_cell("code", "#@title 6/7 · Ячейка F — остановка (по необходимости)\n"
                              "import runpy; runpy.run_path('/content/tc/cell_f_stop.py', run_name='__main__')"),
+            _nb_cell("code", SHOW_URL),
+            _nb_cell("markdown", FINISH),
         ]
         return _wrap(cells)
 
-    fetch = f'''#@title 1/6 · Скачивание исходников субагента
+    fetch = f'''#@title 1/7 · Скачивание исходников субагента
 import io, pathlib, shutil, urllib.request, zipfile
 URL = "{url}"  #@param {{type:"string"}}
 req = urllib.request.Request(URL, headers={{"User-Agent": "{UA}"}})
@@ -199,7 +268,7 @@ shutil.rmtree("/content/tc", ignore_errors=True)
 zipfile.ZipFile(io.BytesIO(data)).extractall("/content/tc")
 print("OK: исходники на месте:", sorted(p.name for p in pathlib.Path("/content/tc").iterdir()))
 '''
-    build_server = '''#@title 3/6 · Ячейка C — сборка API-сервера
+    build_server = '''#@title 3/7 · Ячейка C — сборка API-сервера
 import pathlib
 src = pathlib.Path("/content/tc/cell_c_server.py").read_text(encoding="utf-8")
 lines = src.splitlines()
@@ -212,11 +281,13 @@ print("записан /content/thinking_server.py:", len(lines), "строк")
     run = lambda title, name: f'#@title {title}\n!python /content/tc/{name}\n'
     cells += [
         _nb_cell("code", fetch),
-        _nb_cell("code", run("2/6 · Ячейка A — окружение, сборка, модель", "cell_a_setup.py")),
+        _nb_cell("code", run("2/7 · Ячейка A — окружение, сборка, модель", "cell_a_setup.py")),
         _nb_cell("code", build_server),
-        _nb_cell("code", run("4/6 · Ячейка D — LLM + API + туннель", "cell_d_launch.py")),
-        _nb_cell("code", run("5/6 · Ячейка E — фон (снапшот + keep-alive)", "cell_e_background.py")),
-        _nb_cell("code", run("6/6 · Ячейка F — остановка (по необходимости)", "cell_f_stop.py")),
+        _nb_cell("code", run("4/7 · Ячейка D — LLM + API + туннель", "cell_d_launch.py")),
+        _nb_cell("code", run("5/7 · Ячейка E — фон (снапшот + keep-alive)", "cell_e_background.py")),
+        _nb_cell("code", run("6/7 · Ячейка F — остановка (по необходимости)", "cell_f_stop.py")),
+        _nb_cell("code", SHOW_URL),
+        _nb_cell("markdown", FINISH),
     ]
     return _wrap(cells)
 
