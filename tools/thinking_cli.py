@@ -467,19 +467,27 @@ def _dev_rollback(client: ThinkingClient, name: str) -> dict:
             "left": len(backups) - 1}
 
 
-def _dev_run(client: ThinkingClient, name: str) -> dict:
-    """Запуск .py из рабочей папки: stdout/stderr идут в окно интерпретатора."""
+def _dev_run(client: ThinkingClient, name: str, stdin_text: str = "") -> dict:
+    """Запуск .py из рабочей папки: stdout/stderr идут в окно интерпретатора.
+
+    stdin_text — что получит программа на ввод. Если его не задать, ввод
+    закрывается (DEVNULL): иначе input() в калькуляторе висел бы все 30 с
+    молча, и человек считал бы, что «Запустить» сломан.
+    """
     target = _dev_root(client) / _safe_name(name)
     if not target.is_file():
         raise ValueError(f"нет файла {name}")
     if target.suffix != ".py":
         raise ValueError("запускать можно только .py-файлы")
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    data = str(stdin_text or "")
     try:
         # target относительный (dev_sandbox/x.py), а cwd уже dev_sandbox —
         # без resolve() путь склеивался в dev_sandbox/dev_sandbox/…
         r = subprocess.run([sys.executable, str(target.resolve())],
                            cwd=str(_dev_root(client)), env=env,
+                           input=data if data else None,
+                           stdin=None if data else subprocess.DEVNULL,
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=30)
         code, out_, err_ = r.returncode, r.stdout or "", r.stderr or ""
@@ -492,6 +500,11 @@ def _dev_run(client: ThinkingClient, name: str) -> dict:
         err_ = "интерпретатор остановлен: превышен таймаут 30 с"
     except OSError as exc:
         raise ValueError(f"не удалось запустить интерпретатор: {exc}")
+    # input() без переданного stdin даёт EOFError — объясняем по-человечески,
+    # иначе человек видит только трассировку и думает, что сломан запуск
+    if "EOFError" in (err_ or "") and not data:
+        err_ += ("\n[подсказка] программа ждёт ввода (input()). Впиши его в поле "
+                 "«ввод для программы» и запусти снова — например: 5\n7")
     _dev_log(client, "run", "user", target.name, f"код выхода {code}",
              ok=code == 0)
     return {"code": code, "stdout": (out_ or "")[-20000:],
@@ -992,7 +1005,8 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 return
             if path == "/api/dev/run":
                 try:
-                    out = _dev_run(client, str(data.get("name") or ""))
+                    out = _dev_run(client, str(data.get("name") or ""),
+                                   str(data.get("stdin") or ""))
                 except ValueError as exc:
                     self._json_out(400, {"error": str(exc)})
                     return

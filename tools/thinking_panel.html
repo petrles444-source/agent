@@ -547,6 +547,10 @@
           <button class="mini" onclick="devRun()">▶ Запустить</button>
           <button class="mini" onclick="document.getElementById('devout').textContent='';document.getElementById('devout').dataset.empty='yes'">Очистить</button>
         </div>
+        <div class="devhead" style="border-top:none">
+          <input id="devstdin" placeholder="ввод для программы (для input()) — можно пусто"
+                 title="Если программа ждёт ввода (input), впишите сюда данные — по одной строке на каждый input()">
+        </div>
         <pre id="devout" data-empty="yes">нажмите «Запустить» — здесь появится вывод выбранного .py-файла</pre>
         <div class="devhead">Журнал разработки
           <button class="mini" onclick="devDump()">Собрать дамп</button>
@@ -690,6 +694,15 @@ let PERIOD = "all";                       // «за всё время» — ре
 const STATE_URL = "/api/state";
 
 /* ---------- вкладки ---------- */
+/* Ленты, которые должны открываться на свежих сообщениях. Прокрутка делается
+   после показа панели: пока вкладка скрыта (display:none), scrollHeight равен
+   нулю и присваивание scrollTop ничего не даёт. */
+const BOTTOM_PANES = {chat: "chatlog", live: "live"};
+function scrollBottom(id) {
+  const box = document.getElementById(id);
+  if (!box) return;
+  box.scrollTop = box.scrollHeight;
+}
 document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
   document.querySelectorAll(".pane").forEach(x => x.classList.remove("on"));
@@ -697,6 +710,8 @@ document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () =>
   document.getElementById("pane-" + b.dataset.pane).classList.add("on");
   if (b.dataset.pane === "models") loadModels();
   if (b.dataset.pane === "dev") devRefresh();
+  const target = BOTTOM_PANES[b.dataset.pane];
+  if (target) scrollBottom(target);
 }));
 
 /* ---------- период: «за сегодня» / «за всё время» ---------- */
@@ -1578,8 +1593,12 @@ async function devRun(name) {
   }
   if (!name) { devOut("нет файла для запуска", "err"); return; }
   devOut("$ python " + name, "cmd");
+  /* Что получит программа на ввод: поле «ввод для программы». Пусто — ввод
+     закрывается, и input() падает сразу с EOFError вместо 30 с молчания. */
+  const stdinBox = document.getElementById("devstdin");
+  const stdinText = stdinBox ? stdinBox.value : "";
   try {
-    const r = await api("/api/dev/run", {name: name});
+    const r = await api("/api/dev/run", {name: name, stdin: stdinText});
     if (r.error) { devOut("ошибка запуска: " + r.error, "err"); return; }
     if (r.stdout) devOut(r.stdout, "out");
     if (r.stderr) devOut(r.stderr, "err");

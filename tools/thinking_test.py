@@ -733,6 +733,53 @@ def test_dev_reports() -> None:
     check(reps[0].get("code") == "x = 42", "отчёты: код в отчёте")
 
 
+def test_dev_run_stdin() -> None:
+    """Запуск из «Разработки»: input() получает введённое, а не висит 30 с."""
+    mod = _load_cli_module()
+    client = make_client(dev_path=str(TMP / "devstdin"), devlog_path=str(TMP / "dl.jsonl"))
+    prog = ('a = float(input("a: "))\n'
+            'b = float(input("b: "))\n'
+            'print("answer:", a + b)\n')
+    out = mod._dev_write(client, "calc.py", prog)
+    check(out.get("ok") is True, "разработка: файл записан для проверки запуска")
+
+    # 1. с вводом — программа получает данные и считает
+    r = mod._dev_run(client, "calc.py", "5\n7\n")
+    check(r["code"] == 0 and "12.0" in (r.get("stdout") or ""),
+          "разработка: «Запустить» с вводом считает (input() получает данные)")
+
+    # 2. без ввода — падает СРАЗУ с подсказкой, а не висит до таймаута
+    t0 = time.time()
+    r2 = mod._dev_run(client, "calc.py")
+    dt = time.time() - t0
+    check(dt < 5, f"разработка: без ввода падает сразу, а не ждёт 30 с ({dt:.1f} с)")
+    check("EOFError" in (r2.get("stderr") or ""),
+          "разработка: без ввода видна причина (EOFError), а не молчание")
+    check("ввод для программы" in (r2.get("stderr") or ""),
+          "разработка: подсказка про поле ввода есть в выводе")
+
+    # 3. программа без ввода работает как раньше
+    out2 = mod._dev_write(client, "plain.py", "print('готово: 2 + 3 =', 2 + 3)\n")
+    check(out2.get("ok") is True, "разработка: файл без ввода записан")
+    r3 = mod._dev_run(client, "plain.py")
+    check(r3["code"] == 0 and "готово: 2 + 3 = 5" in (r3.get("stdout") or ""),
+          "разработка: обычный запуск не сломался")
+
+
+def test_chat_autoscroll() -> None:
+    """Открытие вкладки чата прокручивает ленту к последним сообщениям."""
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    check("const BOTTOM_PANES = {chat:" in html,
+          "панель: вкладка чата в списке лент с автопрокруткой")
+    check("if (target) scrollBottom(target);" in html,
+          "панель: при открытии вкладки лента прокручивается вниз")
+    # scrollBottom вызывается после показа панели, а не до
+    i_show = html.find('classList.add("on");\n  if (b.dataset.pane === "models")')
+    i_scroll = html.find("if (target) scrollBottom(target);")
+    check(i_show > 0 and i_scroll > i_show,
+          "панель: прокрутка после показа панели (иначе scrollHeight = 0)")
+
+
 def test_period_default() -> None:
     """Активная кнопка периода совпадает с PERIOD по умолчанию (без врали)."""
     html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
@@ -1194,6 +1241,8 @@ def main() -> int:
     test_reflect_async_spawns_process()
     test_devsave_args()
     test_dev_reports()
+    test_dev_run_stdin()
+    test_chat_autoscroll()
     test_period_default()
     test_memory_sig()
     test_config_timeouts()
