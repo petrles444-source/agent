@@ -112,7 +112,7 @@ ThinkingAgent — это проектонезависимый субагент, 
 | Каталог | Что лежит |
 |---|---|
 | `thinking/` | ядро на чистом stdlib: `schemas.py` — контракты и валидация JSON («источник правды»), `client.py` — синхронный клиент с повторами и историей, `fallback.py` — офлайн-заглушка, `colab/` — исходники всех ячеек ноутбука |
-| `tools/` | `thinking_cli.py` — CLI + сервер веб-панели, `thinking_panel.html` — интерфейс на 9 вкладок, `thinking_test.py` — 325 офлайн-проверок, `thinking_online_test.py` — проверки против живого Colab |
+| `tools/` | `thinking_cli.py` — CLI + сервер веб-панели, `thinking_panel.html` — интерфейс на 9 вкладок, `thinking_test.py` — 371 офлайн-проверка, `thinking_online_test.py` — проверки против живого Colab |
 | `scripts/` | автоматизация: `build_colab.py` (zip исходников + ноутбук с вшитой ссылкой за одну команду), `build_bats.py` (пересборка `.bat` с UTF-8 и `chcp 65001`), `smoke_chat.py` |
 | `docs/` | ТЗ и контракты, быстрый старт, `ДИАГНОСТИКА_ПОТОКОВ.md` (обрывы SSE), `ПЛАН_РАЗВИТИЯ.md` (дорожная карта), снимок схемы `schema_plan.json` |
 | `config/` | `thinking.json` — настройки без секретов; `thinking.local.json` — адрес и токен Colab (создаёт `set-url`, **не попадает в git**) |
@@ -176,7 +176,7 @@ ThinkingAgent — это проектонезависимый субагент, 
 
 ### 🧪 Тестирование
 
-* **325 офлайн-проверок** (`tools/thinking_test.py`) — контракты, фолбэк, кэш,
+* **371 офлайн-проверка** (`tools/thinking_test.py`) — контракты, фолбэк, кэш,
   предохранитель, саммари памяти, панель.
 * Онлайн-проверки (`tools/thinking_online_test.py`) — связь, токен, метрики,
   реальный план от LLM, рефлексия.
@@ -299,7 +299,7 @@ ThinkingAgent/
 ├─ tools/
 │  ├─ thinking_cli.py           ← CLI главного агента + панель (/api/state, SSE)
 │  ├─ thinking_panel.html       ← веб-интерфейс (9 вкладок, по-русски)
-│  ├─ thinking_test.py          ← 325 офлайн-проверок
+│  ├─ thinking_test.py          ← 371 офлайн-проверка
 │  └─ thinking_online_test.py   ← онлайн-проверки против живого Colab
 ├─ config/
 │  ├─ thinking.json             ← опции (без секретов)
@@ -624,7 +624,7 @@ curl -s -X POST "$THINKING_URL/plan" -H "X-Agent-Token: $THINKING_TOKEN" \
 ## 12. Проверки
 
 ```bash
-python tools/thinking_test.py            # 325 офлайн-проверок (контракты, фолбэк, кэш, панель)
+python tools/thinking_test.py            # 371 офлайн-проверка (контракты, фолбэк, кэш, панель)
 python tools/thinking_online_test.py     # онлайн-проверки против живого Colab
 python tools/thinking_online_test.py --quick   # без LLM: связь, токен, метрики, события
 python tools/thinking_online_test.py --stream  # + отдельная проверка /plan/stream
