@@ -733,6 +733,18 @@ def test_dev_reports() -> None:
     check(reps[0].get("code") == "x = 42", "отчёты: код в отчёте")
 
 
+def test_period_default() -> None:
+    """Активная кнопка периода совпадает с PERIOD по умолчанию (без врали)."""
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    m = re.search(r'let PERIOD = "(\w+)"', html)
+    check(bool(m), "панель: период задан константой")
+    period = m.group(1) if m else ""
+    # активная кнопка в разметке должна совпадать с этим значением
+    active = re.search(r'<button class="mini per on" data-per="(\w+)"', html)
+    check(bool(active) and active.group(1) == period,
+          "панель: подсвеченная кнопка периода совпадает с PERIOD по умолчанию")
+
+
 def test_memory_sig() -> None:
     """Рендер памяти под сигнатурой state (AUD-15)."""
     html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
@@ -1182,6 +1194,7 @@ def main() -> int:
     test_reflect_async_spawns_process()
     test_devsave_args()
     test_dev_reports()
+    test_period_default()
     test_memory_sig()
     test_config_timeouts()
     test_nctx_alignment()
