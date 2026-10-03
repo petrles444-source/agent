@@ -62,6 +62,7 @@
   .chip { padding:1px 9px; border-radius:10px; font-weight:600; }
   .chip-plan { background:#1f2a4a; color:#79c0ff; border:1px solid #388bfd; }
   .chip-reflect { background:#12351f; color:#7ee787; border:1px solid #2ea043; }
+  .chip-dev { background:#3a2a10; color:#ffa657; border:1px solid #d29922; }
   .chip-fb { background:#3d1418; color:#ff7b72; border:1px solid #da3633; }
   .card h3 { margin:0 0 6px; font-size:15px; color:#e6edf3; font-weight:600; line-height:1.4; }
   .why { margin:0 0 8px; color:#9ecbff; }
@@ -503,7 +504,7 @@
 "use strict";
 let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("tk") || "";
 let es = null, lastSig = "", STATE = null, logCount = 0;
-let PERIOD = "today";                      // «за сегодня» — режим по умолчанию
+let PERIOD = "all";                       // «за всё время» — режим по умолчанию
 const STATE_URL = "/api/state";
 
 /* ---------- вкладки ---------- */
@@ -592,7 +593,7 @@ function renderReports(list) {
   document.getElementById("c-rep").textContent = list.length;
   if (!list.length) {
     box.appendChild(el("div", "empty",
-      "отчётов пока нет — выполните python tools/thinking_cli.py plan \"задача\""));
+      "отчётов пока нет — выполните plan/reflect или поработайте в «Разработке»"));
     return;
   }
   list.slice().reverse().forEach(r => box.appendChild(reportCard(r)));
@@ -600,23 +601,31 @@ function renderReports(list) {
 
 function reportCard(r) {
   const isPlan = r.type === "plan";
+  const isDev = r.type === "dev";
   const card = el("article", "card");
   const head = el("div", "cardhead");
-  const chip = el("span", "chip " + (r.fallback ? "chip-fb" : (isPlan ? "chip-plan" : "chip-reflect")),
-                  r.fallback ? "заглушка (Colab недоступен)" : (isPlan ? "ПЛАН" : "РЕФЛЕКСИЯ"));
+  const chip = el("span", "chip " + (r.fallback ? "chip-fb" : (isPlan ? "chip-plan" : (isDev ? "chip-dev" : "chip-reflect"))),
+                  r.fallback ? "заглушка (Colab недоступен)" : (isPlan ? "ПЛАН" : (isDev ? "РАЗРАБОТКА" : "РЕФЛЕКСИЯ")));
   head.appendChild(chip);
   head.appendChild(el("span", "", dttm(r.at)));
   if (r.plan_id) head.appendChild(el("span", "", "id " + r.plan_id));
-  if (!isPlan) head.appendChild(el("span", "", "шаг " + (r.step_id ?? "-")));
+  if (!isPlan && !isDev) head.appendChild(el("span", "", "шаг " + (r.step_id ?? "-")));
   if (isPlan && r.confidence != null) head.appendChild(el("span", "", "уверенность " + r.confidence));
   if (r.status) head.appendChild(el("span", "", "статус: " + r.status));
   if (r.source && !r.fallback) head.appendChild(el("span", "", "источник: " + r.source));
+  if (isDev && r.filename) head.appendChild(el("span", "", "файл: " + r.filename));
   card.appendChild(head);
 
   card.appendChild(el("h3", "", r.goal || r.task || "(без цели)"));
   if (r.rationale) card.appendChild(el("p", "why", "Почему так: " + r.rationale));
   if (r.advice) card.appendChild(el("p", "why", "Совет: " + r.advice));
   if (r.task && r.goal) card.appendChild(el("p", "ask", "Мой запрос: " + r.task));
+
+  if (isDev && r.code) {
+    const pre = el("pre", "codesample", r.code.slice(0, 2000)
+      + (r.code.length > 2000 ? "\n… (ещё " + (r.code.length - 2000) + " символов)" : ""));
+    card.appendChild(pre);
+  }
 
   if (Array.isArray(r.sub_goals) && r.sub_goals.length) {
     const u = el("ul", "lst info");

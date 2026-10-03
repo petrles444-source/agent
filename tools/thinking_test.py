@@ -713,6 +713,26 @@ def test_devsave_args() -> None:
           "панель: devSave ждёт обновления списка файлов (AUD-02)")
 
 
+def test_dev_reports() -> None:
+    """Dev-предложения пишутся в отчёты (вкладка «Отчёты» не пустует)."""
+    c = make_client(interactions_path=str(TMP / "devrep_inter.jsonl"),
+                    reports_path=str(TMP / "devrep_reps.jsonl"),
+                    chat_path=str(TMP / "devrep_chat.jsonl"),
+                    memory_path=str(TMP / "devrep_mem.json"))
+    c.base = "http://127.0.0.1:1"   # мёртвый сервер -> fallback
+    c._stream_read = lambda *_a, **_k: (_ for _ in ()).throw(
+        ThinkingError("поток разработки оборвался после 3 попыток: timeout"))
+    c._json = lambda *_a, **_k: {"proposal": {"action": "edit",
+                                                "filename": "main.py",
+                                                "code": "x = 42", "comment": "исправил"}}
+    prop = c.dev("исправь main.py")
+    check(prop.get("action") == "edit", "dev: предложение получено")
+    reps = [r for r in c.reports if r.get("type") == "dev"]
+    check(len(reps) == 1 and reps[0].get("filename") == "main.py",
+          "отчёты: dev-предложение записано (вкладка «Отчёты» не пустует)")
+    check(reps[0].get("code") == "x = 42", "отчёты: код в отчёте")
+
+
 def test_memory_sig() -> None:
     """Рендер памяти под сигнатурой state (AUD-15)."""
     html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
@@ -1161,6 +1181,7 @@ def main() -> int:
     test_secrets_smart()
     test_reflect_async_spawns_process()
     test_devsave_args()
+    test_dev_reports()
     test_memory_sig()
     test_config_timeouts()
     test_nctx_alignment()

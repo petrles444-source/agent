@@ -810,6 +810,30 @@ class ThinkingClient:
             del self.reports[:-60]
         _append_jsonl(self._rep_path, rep)
 
+    def _report_dev(self, proposal: dict, message: str) -> None:
+        """Отчёт о предложении субагента в режиме разработчика.
+
+        Основная работа субагента — правки кода. Без этого отчёта вкладка
+        «Отчёты» пустует, даже когда dev-режим активно используется.
+        """
+        rep = {
+            "n": len(self.reports) + 1, "rid": new_rid(),
+            "type": "dev",
+            "at": utcnow(),
+            "source": proposal.get("source", "colab"),
+            "fallback": proposal.get("source") == "local-fallback",
+            "task": message[:700],
+            "goal": f"[{proposal.get('action', 'none')}] {proposal.get('filename', '')}",
+            "rationale": proposal.get("comment", ""),
+            "filename": proposal.get("filename", ""),
+            "action": proposal.get("action", "none"),
+            "code": proposal.get("code", "")[:4000],
+        }
+        self.reports.append(rep)
+        if len(self.reports) > 60:
+            del self.reports[:-60]
+        _append_jsonl(self._rep_path, rep)
+
     def _report_reflect(self, out: dict, plan_id: str, step_id: int, result: str) -> None:
         rep = {
             "n": len(self.reports) + 1, "rid": new_rid(),
@@ -1190,6 +1214,7 @@ class ThinkingClient:
         self._record("dev", body["message"], t0, ok=True,
                      summary=f"[{proposal['action']}] {proposal['filename']}: "
                              f"{proposal['comment']}"[:400])
+        self._report_dev(proposal, body["message"])
         return proposal
 
     def _chat_via_plan(self, text: str, context: dict, max_steps: int) -> dict:
