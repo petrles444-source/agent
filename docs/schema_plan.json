@@ -1,0 +1,237 @@
+{
+  "plan": {
+    "definitions": {
+      "PlanStep": {
+        "properties": {
+          "action": {
+            "enum": [
+              "build",
+              "test",
+              "refactor",
+              "verify",
+              "docs",
+              "prompt",
+              "debug",
+              "release"
+            ],
+            "type": "string"
+          },
+          "depends_on": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "desc": {
+            "maxLength": 400,
+            "minLength": 1,
+            "type": "string"
+          },
+          "expected_output": {
+            "maxLength": 400,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "integer"
+          },
+          "inputs": {
+            "type": "object"
+          },
+          "retry_policy": {
+            "enum": [
+              "none",
+              "once",
+              "exponential"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "action",
+          "desc"
+        ],
+        "type": "object"
+      }
+    },
+    "properties": {
+      "confidence": {
+        "maximum": 1,
+        "minimum": 0,
+        "type": "number"
+      },
+      "constraints": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "contradictions": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "created_at": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "fallback": {
+        "maxLength": 400,
+        "type": "string"
+      },
+      "goal": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "plan_id": {
+        "type": "string"
+      },
+      "rationale": {
+        "maxLength": 800,
+        "type": "string"
+      },
+      "source": {
+        "enum": [
+          "colab",
+          "local-fallback"
+        ],
+        "type": "string"
+      },
+      "steps": {
+        "items": {
+          "$ref": "#/definitions/PlanStep"
+        },
+        "maxItems": 30,
+        "minItems": 1,
+        "type": "array"
+      },
+      "sub_goals": {
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
+      },
+      "success_criteria": {
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 20,
+        "type": "array"
+      },
+      "unknown_files": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "plan_id",
+      "goal",
+      "steps"
+    ],
+    "title": "Plan",
+    "type": "object"
+  },
+  "reflect": {
+    "definitions": {
+      "PlanStep": {
+        "properties": {
+          "action": {
+            "enum": [
+              "build",
+              "test",
+              "refactor",
+              "verify",
+              "docs",
+              "prompt",
+              "debug",
+              "release"
+            ],
+            "type": "string"
+          },
+          "depends_on": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "desc": {
+            "maxLength": 400,
+            "minLength": 1,
+            "type": "string"
+          },
+          "expected_output": {
+            "maxLength": 400,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "integer"
+          },
+          "inputs": {
+            "type": "object"
+          },
+          "retry_policy": {
+            "enum": [
+              "none",
+              "once",
+              "exponential"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "action",
+          "desc"
+        ],
+        "type": "object"
+      }
+    },
+    "properties": {
+      "advice": {
+        "maxLength": 800,
+        "type": "string"
+      },
+      "next_steps": {
+        "items": {
+          "$ref": "#/definitions/PlanStep"
+        },
+        "type": "array"
+      },
+      "rationale": {
+        "maxLength": 400,
+        "type": "string"
+      },
+      "status": {
+        "enum": [
+          "ok",
+          "adjust",
+          "abort"
+        ],
+        "type": "string"
+      },
+      "updated_goal_stack": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "status",
+      "advice"
+    ],
+    "title": "ReflectResponse",
+    "type": "object"
+  }
+}

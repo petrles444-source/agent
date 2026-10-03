@@ -1,0 +1,5 @@
+{
+  "_комментарий": "ШАБЛОН. Скопируйте файл в config/thinking.local.json и заполните своими значениями (или просто выполните: python tools/thinking_cli.py set-url <URL> <TOKEN>). Реальный thinking.local.json добавлен в .gitignore и в git не попадает.",
+  "base_url": "https://xxxx-xxxx.trycloudflare.com",
+  "token": "ВСТАВЬТЕ_ТОКЕН_ИЗ_ЯЧЕЙКИ_D"
+}

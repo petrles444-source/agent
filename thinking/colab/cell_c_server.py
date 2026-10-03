@@ -1,0 +1,1212 @@
+%%writefile /content/thinking_server.py
+# === Субагент «Мышление» — API (ячейка C) ===
+# FastAPI + llama.cpp/vLLM. Субагент ТОЛЬКО советует: никаких инструментов,
+# вызовов API изображений и записи файлов у него нет.
+# Контракты полей должны совпадать с thinking/schemas.py (ловит tools/thinking_test.py).
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field, field_validator
+
+# ---------------------------------------------------------------- конфиг ---
+UPSTREAM = os.environ.get("THINKING_UPSTREAM",
+                          "http://127.0.0.1:8001/v1/chat/completions")
+MODEL_NAME = os.environ.get("THINKING_MODEL", "thinking")
+TOKEN = os.environ.get("THINKING_TOKEN", "")
+LLM_TIMEOUT = float(os.environ.get("THINKING_TIMEOUT", "300"))
+MAX_TOKENS = int(os.environ.get("THINKING_MAX_TOKENS", "700"))
+RPS = int(os.environ.get("THINKING_RPS", "5"))
+CONCURRENCY = int(os.environ.get("THINKING_CONCURRENCY", "1"))
+MAX_EVENTS, MAX_PLANS, PLAN_TTL_S = 1000, 64, 3600
+
+ACTIONS = {"build", "test", "refactor", "verify", "docs", "prompt", "debug", "release"}
+RETRY = {"none", "once", "exponential"}
+SECRET_RE = re.compile(
+    r"\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key|token)\b"
+    r"\s*[=:]\s*\S+", re.I)
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def redact(text: str) -> str:
+    return SECRET_RE.sub(lambda m: f"{m.group(1)}=[скрыто]", text or "")
+
+
+# --------------------------------------------------------------- схемы ----
+class PlanRequest(BaseModel):
+    task: str = Field(..., min_length=3, max_length=2000)
+    context: dict = Field(default_factory=dict)
+    constraints: list[str] = Field(default_factory=list)
+    max_steps: int = Field(12, ge=1, le=30)
+    style_hint: Optional[str] = None
+
+
+class PlanStep(BaseModel):
+    id: int
+    action: str = "verify"
+    desc: str = Field(..., max_length=400)
+    inputs: dict = Field(default_factory=dict)
+    expected_output: Optional[str] = None
+    retry_policy: str = "once"
+    depends_on: list[int] = Field(default_factory=list)
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _action(cls, v: Any) -> str:
+        v = str(v or "").strip().lower()
+        return v if v in ACTIONS else "verify"
+
+    @field_validator("retry_policy", mode="before")
+    @classmethod
+    def _retry(cls, v: Any) -> str:
+        v = str(v or "").strip().lower()
+        return v if v in RETRY else "once"
+
+
+class Plan(BaseModel):
+    plan_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    source: str = "colab"
+    rationale: str = ""
+    confidence: float = 0.7
+    goal: str
+    sub_goals: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    steps: list[PlanStep]
+    success_criteria: list[str] = Field(default_factory=list)
+    unknown_files: list[str] = Field(default_factory=list)
+    fallback: str = "выполнить напрямую, без субагента"
+    created_at: str = Field(default_factory=utcnow)
+
+    @field_validator("steps")
+    @classmethod
+    def _steps(cls, v: list[PlanStep]) -> list[PlanStep]:
+        if not v:
+            raise ValueError("план без шагов")
+        if len(v) > 30:
+            raise ValueError("слишком много шагов")
+        ids = [s.id for s in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"дублирующиеся id шагов: {ids}")
+        return v
+
+    @field_validator("rationale", "goal", mode="before")
+    @classmethod
+    def _clean(cls, v: Any) -> Any:
+        return redact(str(v or "")) if isinstance(v, str) else v
+
+
+class ReflectRequest(BaseModel):
+    plan_id: str
+    step_id: int
+    result: str = Field(..., max_length=4000)
+    observation: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    context: dict = Field(default_factory=dict)
+    history: list[dict] = Field(default_factory=list)
+    memory: dict = Field(default_factory=dict)
+    profile: Optional[str] = None
+    max_steps: int = Field(4, ge=1, le=8)
+
+
+class DevRequest(BaseModel):
+    """Запрос режима «Разработка»: модель работает с кодом на ПК человека."""
+    message: str = Field(..., min_length=1, max_length=3000)
+    files: list[str] = Field(default_factory=list)
+    active_name: str = ""
+    active_code: str = ""
+
+
+class ChatResponse(BaseModel):
+    reply: str = ""
+    rationale: str = ""
+    steps: list[dict] = Field(default_factory=list)
+    source: str = "colab"
+    plan_id: str = ""
+    fallback: bool = False
+    memory_used: bool = False
+    tokens_in: int = 0
+    tokens_out: int = 0
+    tokens_estimate: bool = True
+    duration_ms: int = 0
+    at: str = Field(default_factory=utcnow)
+
+    @field_validator("reply", "rationale", mode="before")
+    @classmethod
+    def _clean(cls, v: Any) -> Any:
+        return redact(str(v or "")) if isinstance(v, str) else v
+
+
+class ReflectResponse(BaseModel):
+    status: str = "ok"
+    advice: str = ""
+    rationale: str = ""
+    next_steps: list[PlanStep] = Field(default_factory=list)
+    updated_goal_stack: list[str] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------- состояние ---
+class State:
+    def __init__(self) -> None:
+        self.events: deque[dict] = deque(maxlen=MAX_EVENTS)
+        self.plans: dict[str, dict] = {}
+        self.subs: set[asyncio.Queue] = set()
+        self.seq = 0
+        self.t0 = time.time()
+        self.sem = asyncio.Semaphore(CONCURRENCY)
+        self.win_t, self.win_n = time.time(), 0
+        # переключение моделей на лету: процесс движка и флаг «идёт переключение»
+        self.llm_proc: Optional[subprocess.Popen] = None
+        self.switching = False
+        self.stats = {"plans": 0, "reflects": 0, "chats": 0, "errors": 0,
+                      "bad_json": 0, "llm_ms": deque(maxlen=200),
+                      # честный учёт токенов: usage приходит не от каждого
+                      # вызова, поэтому держим и «чистые» вызовы с usage
+                      "tokens_in": 0, "tokens_out": 0, "usage_calls": 0}
+
+
+S = State()   # единственный синглтон: снаружи глобальных переменных нет
+app = FastAPI(title="Субагент «Мышление»", version="1.1")
+
+
+@app.middleware("http")
+async def cors(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Agent-Token"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
+@app.options("/{path:path}")
+async def options(path: str):
+    return {"ok": True}
+
+
+# -------------------------------------------------------------- события ---
+async def emit(type_: str, text: str, **kw) -> dict:
+    S.seq += 1
+    ev = {"seq": S.seq, "type": type_, "text": redact(str(text)), "ts": utcnow(), **kw}
+    S.events.append(ev)
+    dead = []
+    for q in list(S.subs):
+        try:
+            q.put_nowait(ev)
+        except Exception:
+            dead.append(q)
+    for q in dead:
+        S.subs.discard(q)
+    return ev
+
+
+# --------------------------------------------------- разбор JSON от LLM ---
+def extract_json(text: str) -> dict:
+    t = (text or "").strip()
+    if not t:
+        raise ValueError("пустой ответ LLM")
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t).strip()
+    try:
+        out = json.loads(t)
+        if isinstance(out, dict):
+            return out
+    except json.JSONDecodeError:
+        pass
+    start = t.find("{")
+    if start < 0:
+        raise ValueError("в ответе LLM нет '{'")
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(t)):
+        ch = t[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                chunk = t[start:i + 1]
+                try:
+                    return json.loads(chunk)
+                except json.JSONDecodeError:
+                    return json.loads(re.sub(r",\s*([}\]])", r"\1", chunk))
+    raise ValueError("несбалансированный JSON в ответе LLM")
+
+
+# --------------------------------------------------------------- промты ---
+SYSTEM_PLAN = """Ты — советник главного агента: опытный техлид, который помогает
+распланировать задачу до начала работы. Тип проекта и технологию указывает
+сам агент в поле КОНТЕКСТ — не привязывайся к одной технологии.
+Ты только советуешь: инструментов, файлов и действий у тебя нет.
+Отвечай ТОЛЬКО валидным JSON, без markdown-обёрток и текста вокруг.
+Схема:
+{"goal": str, "rationale": str, "confidence": 0.0..1.0,
+ "sub_goals": [str], "constraints": [str], "contradictions": [str],
+ "steps": [{"id": int, "action": str, "desc": str, "inputs": {},
+            "expected_output": str, "retry_policy": "none|once|exponential",
+            "depends_on": [int]}],
+ "success_criteria": [str], "unknown_files": [str], "fallback": str}
+Правила:
+- goal, sub_goals, desc, contradictions, success_criteria, rationale — только по-русски.
+- action — латинский тег ровно из: build test refactor verify docs prompt debug release.
+- Упоминай только файлы из блока РАЗРЕШЁННЫЕ ФАЙЛЫ; если нужен другой — внеси его
+  в unknown_files, но не выдумывай путь.
+- Шаги проверяемые, по порядку, не больше указанного числа. Полей вне схемы не добавляй.
+- rationale — 2-3 фразы по-русски: почему выбран именно такой план."""
+
+SYSTEM_REFLECT = """Ты — рефлектор выполненного шага. Отвечай ТОЛЬКО JSON:
+{"status": "ok|adjust|abort", "advice": str, "rationale": str,
+ "next_steps": [{"id": int, "action": str, "desc": str, "inputs": {},
+                 "expected_output": str, "retry_policy": str, "depends_on": [int]}],
+ "updated_goal_stack": [str]}
+advice и rationale — по-русски, коротко (до 240 символов). Ничего кроме JSON."""
+
+
+SYSTEM_CHAT = """Ты — субагент «Мышление», собеседник человека-разработчика.
+Отвечай обычным живым текстом по-русски — БЕЗ JSON, без markdown-обёрток
+и кода-примеров вокруг ответа. Просто пиши, как обычный собеседник.
+Правила:
+- Сначала прямой ответ, потом (если уместно) 1-3 конкретных действия.
+  Без воды и вступлений; до 700 символов, если вопрос не требует большего.
+- Если в блоке ПАМЯТЬ есть факты о проекте — опирайся на них и не переспрашивай
+  то, что уже известно.
+- Если в блоке ДИАЛОГ есть прошлые реплики — не повторяй то, что уже обсудили.
+- Ты советуешь: не выдумывай пути файлов, не обещай выполнить работу сам.
+- Если вопрос про код и изменения файлов — скажи, что для этого есть вкладка
+  «Разработка» (там модель меняет файлы подтверждением человека).
+- Если не хватает данных — задай один-два уточняющих вопроса."""
+
+CHAT_TURNS_MAX = 12
+CHAT_HISTORY_CHARS = 2400
+
+
+def build_chat_prompt(req: "ChatRequest") -> str:
+    """Промт чата: память + последние реплики + сам вопрос."""
+    facts = [str(f) for f in (req.memory.get("facts") or [])][-12:]
+    mem_block = ""
+    if req.profile:
+        mem_block += f"О ПРОЕКТЕ: {str(req.profile)[:400]}\n"
+    if facts:
+        mem_block += "ПАМЯТЬ (факты, которые я уже сказал):\n"
+        mem_block += "\n".join(f"- {f}" for f in facts)[:1200] + "\n"
+    dialog = ""
+    turns = [t for t in (req.history or []) if isinstance(t, dict)][-CHAT_TURNS_MAX:]
+    if turns:
+        lines = []
+        for t in turns:
+            who = "субагент" if t.get("role") == "subagent" else "я"
+            lines.append(f"{who}: {str(t.get('text') or '')[:400]}")
+        dialog = "ДИАЛОГ (недавно обсуждали):\n" + "\n".join(lines)[-CHAT_HISTORY_CHARS:] + "\n"
+    ctx = json.dumps(req.context or {}, ensure_ascii=False)[:1500]
+    return (mem_block + dialog +
+            f"КОНТЕКСТ: {ctx}\n"
+            f"ВОПРОС: {req.message[:2000]}\n"
+            "Отвечай обычным текстом, без JSON.")
+
+
+def build_plan_prompt(req: PlanRequest) -> str:
+    ctx = json.dumps(req.context, ensure_ascii=False)
+    files = req.context.get("files") or []
+    tail = " | ".join(f"{e['type']}: {e['text'][:70]}" for e in list(S.events)[-10:])
+    return (
+        f"ЗАДАЧА: {req.task}\n"
+        f"КОНТЕКСТ: {ctx[:4000]}\n"
+        f"ОГРАНИЧЕНИЯ: {json.dumps(req.constraints, ensure_ascii=False)}\n"
+        f"МАКС. ШАГОВ: {req.max_steps}\n"
+        + (f"РАЗРЕШЁННЫЕ ФАЙЛЫ: {', '.join(str(f) for f in files)}\n" if files else "")
+        + f"ПОСЛЕДНИЕ СОБЫТИЯ: {tail[:500]}\n"
+        "Ответ — только JSON по схеме из system-промта."
+    )
+
+
+SYSTEM_DEV = """Ты — режим «Разработка» субагента «Мышление»: ты работаешь с кодом
+человека, который физически лежит на его компьютере (ты сам файлы не трогаешь —
+только присылаешь изменение, а применит его человек кнопкой).
+Отвечай ТОЛЬКО валидным JSON, без markdown-обёрток и текста вокруг.
+Схема:
+{"action": "create|edit|none", "filename": str, "code": str, "comment": str}
+Правила:
+- action="create" — новый файл в рабочей папке; action="edit" — замена
+  СУЩЕСТВУЮЩЕГО файла из списка ФАЙЛЫ (имя возьми ровно оттуда);
+  action="none" — вопрос или обсуждение без изменения кода (code пустой).
+- filename — только имя файла (без каталогов), обычно с расширением .py.
+- code — ПОЛНОЕ новое содержимое файла целиком (не диф, не фрагмент):
+  иначе применение частями непонятно. Только код, без markdown и пояснений
+  внутри кода.
+- comment — по-русски, 1-3 предложения: что изменено и что это даёт.
+- Пиши рабочий Python: без TODO, без заглушек, с обработкой ошибок там,
+  где они нужны; стандартная библиотека (у человека только она).
+- Если данных мало или просят невозможное — action="none" и задай вопрос
+  в comment. Ничего кроме JSON."""
+
+
+def build_dev_prompt(req: "DevRequest") -> str:
+    """Промт режима разработчика: файлы + открытый файл + запрос человека."""
+    files = ", ".join(str(f) for f in (req.files or [])[:80]) or "—"
+    out = (f"ФАЙЛЫ В РАБОЧЕЙ ПАПКЕ: {files}\n"
+           f"ЗАПРОС: {req.message[:3000]}\n")
+    if req.active_name:
+        out += (f"ОТКРЫТ СЕЙЧАС ФАЙЛ: {req.active_name}\n"
+                f"ЕГО КОД:\n{req.active_code[:8000]}\n")
+    return out + "Ответ — только JSON по схеме из system-промта."
+
+
+async def dev_data(raw: str) -> dict:
+    """Разбор ответа режима разработчика: JSON либо честный текст."""
+    try:
+        data = extract_json(raw)
+        action = str(data.get("action") or "none").lower()
+        if action not in ("create", "edit", "none"):
+            action = "none"
+        return {"action": action,
+                "filename": str(data.get("filename") or "")[:200],
+                "code": str(data.get("code") or "")[:20000],
+                "comment": redact(str(data.get("comment") or ""))[:1200]}
+    except Exception:
+        S.stats["bad_json"] += 1
+        text = _plain_reply(raw)
+        # Модель ответила текстом — пусть идёт комментарием, файлы не трогаем
+        return {"action": "none", "filename": "", "code": "",
+                "comment": redact(text)[:1200]}
+
+
+# ------------------------------------------------------- вызовы LLM -------
+async def chat_json(system: str, user: str, max_tokens: int = MAX_TOKENS) -> str:
+    text, _ = await chat_json_usage(system, user, max_tokens)
+    return text
+
+
+async def chat_json_usage(system: str, user: str,
+                          max_tokens: int = MAX_TOKENS) -> tuple[str, dict]:
+    """Как chat_json, но возвращает ещё и usage — по нему считаются токены.
+
+    llama.cpp-сервер отдаёт usage не всегда, поэтому при отсутствии честно
+    отдаём пустой dict: ПК посчитает оценку по длине текста сам.
+    """
+    async with S.sem:
+        t = time.time()
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as c:
+            r = await c.post(UPSTREAM, json={
+                "model": MODEL_NAME, "stream": False, "temperature": 0.2,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}],
+            })
+            r.raise_for_status()
+            data = r.json()
+        S.stats["llm_ms"].append(int((time.time() - t) * 1000))
+    usage = data.get("usage") or {}
+    if isinstance(usage, dict) and usage:
+        S.stats["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+        S.stats["tokens_out"] += int(usage.get("completion_tokens") or 0)
+        S.stats["usage_calls"] += 1
+    return data["choices"][0]["message"]["content"], (usage if isinstance(usage, dict) else {})
+
+
+async def chat_stream(system: str, user: str, max_tokens: int = MAX_TOKENS):
+    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as c:
+        async with c.stream("POST", UPSTREAM, json={
+            "model": MODEL_NAME, "stream": True, "temperature": 0.2,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+        }) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    d = json.loads(chunk)
+                except Exception:
+                    continue
+                piece = d.get("choices", [{}])[0].get("delta", {}).get("content")
+                if piece:
+                    yield piece
+
+
+# ------------------------------------------------- токен + rate limit -----
+def _auth(x_agent_token: str, query_token: str) -> None:
+    got = x_agent_token or query_token
+    if TOKEN and got != TOKEN:
+        raise HTTPException(401, "неверный токен")
+    now = time.time()
+    if now - S.win_t >= 1.0:
+        S.win_t, S.win_n = now, 0
+    S.win_n += 1
+    if S.win_n > RPS:
+        raise HTTPException(429, "слишком часто (rate limit)")
+
+
+async def _guard(raw: str) -> dict:
+    try:
+        return extract_json(raw)
+    except Exception as exc:
+        S.stats["bad_json"] += 1
+        try:
+            with open("/content/last_bad_json.txt", "w", encoding="utf-8") as fh:
+                fh.write(raw or "")
+        except Exception:
+            pass
+        await emit("error", f"LLM вернула не-JSON: {exc}")
+        raise HTTPException(502, f"LLM вернула не-JSON: {exc}")
+
+
+def _plain_reply(raw: str) -> str:
+    """Ответ без JSON — просто текст.
+
+    Маленькие модели (1.5B) часто отвечают обычной фразой вместо JSON.
+    Раньше такой ответ считался поломкой (HTTP 502 «пустой ответ»), хотя
+    человек-то получил осмысленный текст. Теперь текст идёт как есть,
+    а счётчик plain_text показывает, что модель ушла от формата.
+    """
+    t = (raw or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t).strip()
+    return t
+
+
+async def guard_reply(raw: str) -> dict:
+    """Как _guard, но не падает на обычном тексте: отдаёт {'reply': текст}."""
+    try:
+        data = extract_json(raw)
+        if str(data.get("reply") or "").strip():
+            return data
+    except Exception as exc:
+        S.stats["bad_json"] += 1
+        await emit("error", f"LLM ответила текстом, а не JSON: {exc}")
+    text = _plain_reply(raw)
+    if not text:
+        raise HTTPException(502, "пустой ответ чата")
+    # Частая форма: модель обернула JSON-объект в текст, но не довела его до
+    # конца (обрезали по max_tokens). Тогда разбираем поле reply вручную.
+    m = re.search(r'"reply"\s*:\s*"(.*?)"\s*(?:,|})', text, re.S)
+    if m:
+        text = m.group(1).replace('\\"', '"').replace("\\n", "\n").strip()
+    S.stats["plain_text"] = int(S.stats.get("plain_text", 0)) + 1
+    return {"reply": text, "rationale": "", "steps": []}
+
+
+PLAN_LIST_FIELDS = ("sub_goals", "constraints", "contradictions",
+                    "success_criteria", "unknown_files")
+
+
+def coerce_plan(data: dict) -> dict:
+    """Мягко приводит план к схеме.
+
+    Маленькие модели часто ошибаются в типах: список пишут строкой, а id шага
+    — словом вроде "s1". Раньше это was 500; теперь такое просто чинится.
+    """
+    out = dict(data or {})
+    for key in PLAN_LIST_FIELDS:
+        v = out.get(key)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            out[key] = [v] if v.strip() else []
+        elif not isinstance(v, list):
+            out[key] = [str(v)]
+    steps = out.get("steps")
+    if isinstance(steps, list):
+        norm = []
+        for i, s in enumerate(steps, 1):
+            if isinstance(s, dict):
+                try:
+                    sid = int(s.get("id"))
+                except (TypeError, ValueError):
+                    sid = i
+                norm.append({**s, "id": sid})
+            else:
+                norm.append({"id": i, "desc": str(s)[:300]})
+        out["steps"] = norm
+    return out
+
+
+async def plan_data(raw: str, task: str) -> dict:
+    """Как _guard, но обычный текст модели превращается в план из одного шага.
+
+    Иначе слабая модель (1.5B) давала бы ошибку вместо полезного ответа,
+    хотя рассуждать она может — просто не в том формате.
+    """
+    try:
+        data = extract_json(raw)
+        if isinstance(data.get("steps"), list) and data["steps"]:
+            return coerce_plan(data)
+    except Exception as exc:
+        S.stats["bad_json"] += 1
+        await emit("error", f"LLM ответила текстом, а не JSON: {exc}")
+    text = _plain_reply(raw)
+    if not text:
+        raise HTTPException(502, "пустой ответ плана")
+    S.stats["plain_text"] = int(S.stats.get("plain_text", 0)) + 1
+    return coerce_plan({
+        "goal": str(task or "")[:300] or "(задача не названа)",
+        "rationale": text[:600],
+        # id у шага — число: серверная схема жёстко требует int,
+        # строковый "s1" приводил к 500 на валидации.
+        "steps": [{"id": 1, "desc": text[:300]}],
+        "confidence": 0.3,
+    })
+
+
+async def reflect_data(raw: str) -> dict:
+    """Как _guard, но текстовая рефлексия тоже считается ответом."""
+    try:
+        return extract_json(raw)
+    except Exception as exc:
+        S.stats["bad_json"] += 1
+        await emit("error", f"LLM ответила текстом, а не JSON: {exc}")
+    text = _plain_reply(raw)
+    if not text:
+        raise HTTPException(502, "пустой ответ разбора")
+    S.stats["plain_text"] = int(S.stats.get("plain_text", 0)) + 1
+    return {"status": "ok", "advice": text[:800], "rationale": "", "next_steps": []}
+
+
+def _store(plan: Plan) -> None:
+    S.plans[plan.plan_id] = plan.model_dump()
+    if len(S.plans) > MAX_PLANS:
+        for key in sorted(S.plans, key=lambda k: S.plans[k].get("created_at", ""))[:8]:
+            S.plans.pop(key, None)
+
+
+# ---------------------------------------------------------- эндпоинты -----
+@app.get("/", response_class=HTMLResponse)
+async def index(token: str = ""):
+    return PANEL_HTML.replace("__TOKEN__", token)
+
+
+@app.get("/health")
+async def health(x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+    gpu, vram = "cpu", None
+    try:
+        import torch
+        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        vram = round(torch.cuda.memory_allocated() / 2 ** 30, 2)
+    except Exception:
+        pass
+    return {"status": "ok", "model": MODEL_NAME, "upstream": UPSTREAM,
+            "uptime_s": int(time.time() - S.t0), "plans": len(S.plans),
+            "events": S.seq, "gpu": gpu, "vram_used_gb": vram}
+
+
+@app.get("/metrics")
+async def metrics(x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+    ms = list(S.stats["llm_ms"])
+    calls = S.stats["plans"] + S.stats["reflects"] + S.stats["chats"]
+    return {"events": S.seq, "plans_total": S.stats["plans"],
+            "reflects": S.stats["reflects"], "chats_total": S.stats["chats"],
+            "errors": S.stats["errors"],
+            "bad_json": S.stats["bad_json"], "subscribers": len(S.subs),
+            "llm_ms_avg": int(sum(ms) / len(ms)) if ms else None,
+            "llm_ms_p95": sorted(ms)[int(len(ms) * 0.95)] if len(ms) > 5 else None,
+            "queue": CONCURRENCY,
+            # usage отдаёт не каждый вызов — панель помечает такие цифры оценкой
+            "tokens_in": S.stats["tokens_in"], "tokens_out": S.stats["tokens_out"],
+            "tokens_total": S.stats["tokens_in"] + S.stats["tokens_out"],
+            "usage_calls": S.stats["usage_calls"],
+            "usage_exact": bool(calls) and S.stats["usage_calls"] >= calls}
+
+
+@app.get("/events")
+async def events(since: int = 0, tail: int = 0,
+                 x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+    items = list(S.events)
+    if since:
+        items = [e for e in items if e["seq"] > since]
+    if tail:
+        items = items[-tail:]
+    return {"last_seq": S.seq, "events": items}
+
+
+@app.get("/events/stream")
+async def events_stream(x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+
+    async def gen():
+        for e in list(S.events)[-50:]:
+            yield f"data: {json.dumps(e, ensure_ascii=False)}\n\n"
+        q: asyncio.Queue = asyncio.Queue()
+        S.subs.add(q)
+        try:
+            while True:
+                try:
+                    # ping каждые 10 с: туннель и прокси рвут «тихое» соединение,
+                    # а панель на ПК держит read-timeout потока 40 с
+                    ev = await asyncio.wait_for(q.get(), timeout=10)
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            S.subs.discard(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/plan")
+async def plan(req: PlanRequest, x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+    await emit("thought", f"Задача: {req.task[:150]}")
+    await emit("thought", "Декомпозирую на шаги…")
+    try:
+        raw = await chat_json(SYSTEM_PLAN, build_plan_prompt(req))
+        data = await plan_data(raw, req.task)
+        p = Plan(**data)
+        _store(p)
+        S.stats["plans"] += 1
+        await emit("rationale", p.rationale or "(без объяснения)", plan_id=p.plan_id)
+        for c in p.contradictions:
+            await emit("contradiction", c, plan_id=p.plan_id)
+        for s in p.steps:
+            await emit("plan_step", f"[{s.id}] {s.desc}", plan_id=p.plan_id, step_id=s.id)
+        await emit("final", f"План {p.plan_id[:8]} готов: {len(p.steps)} шагов",
+                   plan_id=p.plan_id)
+        return p
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        S.stats["errors"] += 1
+        await emit("error", f"LLM backend недоступен: {type(exc).__name__}")
+        raise HTTPException(503, f"upstream недоступен: {type(exc).__name__}")
+    except Exception as exc:
+        S.stats["errors"] += 1
+        await emit("error", str(exc)[:300])
+        raise HTTPException(500, str(exc)[:300])
+
+
+@app.post("/plan/stream")
+async def plan_stream(req: PlanRequest, x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+    await emit("thought", f"Стрим плана: {req.task[:150]}")
+
+    async def gen():
+        buf: list[str] = []
+        try:
+            async with S.sem:
+                async for piece in chat_stream(SYSTEM_PLAN, build_plan_prompt(req)):
+                    buf.append(piece)
+                    yield f"data: {json.dumps({'type': 'token', 'text': piece}, ensure_ascii=False)}\n\n"
+            data = await plan_data("".join(buf), req.task)
+            p = Plan(**data)
+            _store(p)
+            S.stats["plans"] += 1
+            yield f"data: {json.dumps({'type': 'rationale', 'text': p.rationale}, ensure_ascii=False)}\n\n"
+            for s in p.steps:
+                yield ("data: " + json.dumps({"type": "plan_step",
+                                              "text": f"[{s.id}] {s.desc}",
+                                              "step_id": s.id},
+                                             ensure_ascii=False) + "\n\n")
+            final = json.dumps(p.model_dump(), ensure_ascii=False, default=str)
+            yield ("data: " + json.dumps({"type": "final", "text": final,
+                                          "plan_id": p.plan_id},
+                                         ensure_ascii=False) + "\n\n")
+        except Exception as exc:
+            S.stats["errors"] += 1
+            yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
+                                         ensure_ascii=False) + "\n\n")
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/reflect")
+async def reflect(req: ReflectRequest, x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+    stored = S.plans.get(req.plan_id)
+    plan_json = json.dumps(stored, ensure_ascii=False, default=str) if stored \
+        else "план не найден (возможно, после рестарта сервера)"
+    await emit("thought", f"Рефлексия шага {req.step_id}",
+               plan_id=req.plan_id, step_id=req.step_id)
+    try:
+        raw = await chat_json(SYSTEM_REFLECT,
+                              f"ПЛАН: {plan_json[:3000]}\nШАГ: {req.step_id}\n"
+                              f"РЕЗУЛЬТАТ: {req.result[:2000]}\n"
+                              f"НАБЛЮДЕНИЕ: {req.observation or '-'}\n"
+                              f"ОШИБКА: {req.error or '-'}",
+                              max_tokens=500)
+        data = await reflect_data(raw)
+        status = data.get("status")
+        if status not in ("ok", "adjust", "abort"):
+            status = "ok"
+        steps = []
+        for item in (data.get("next_steps") or [])[:8]:
+            try:
+                steps.append(PlanStep(**item))
+            except Exception:
+                continue
+        out = ReflectResponse(
+            status=status,
+            advice=redact(str(data.get("advice") or ""))[:800],
+            rationale=redact(str(data.get("rationale") or ""))[:400],
+            next_steps=steps,
+            updated_goal_stack=[str(x) for x in (data.get("updated_goal_stack") or [])][:12],
+        )
+        S.stats["reflects"] += 1
+        await emit("final" if out.status == "ok" else "contradiction",
+                   f"[{out.status}] {out.advice}", plan_id=req.plan_id, step_id=req.step_id)
+        return out
+    except HTTPException:
+        raise
+    except Exception as exc:
+        S.stats["errors"] += 1
+        await emit("error", f"рефлексия: {str(exc)[:200]}")
+        raise HTTPException(500, str(exc)[:300])
+
+
+@app.post("/cancel/{plan_id}")
+async def cancel(plan_id: str, x_agent_token: str = Header(default=""), token: str = ""):
+    _auth(x_agent_token, token)
+    S.plans.pop(plan_id, None)
+    await emit("thought", f"План {plan_id[:8]} отменён")
+    return {"status": "cancelled", "plan_id": plan_id}
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest, x_agent_token: str = Header(default=""), token: str = ""):
+    """Живой диалог человека с субагентом: память + последние реплики + ответ."""
+    _auth(x_agent_token, token)
+    t0 = time.time()
+    memory = req.memory if isinstance(req.memory, dict) else {}
+    facts = [str(f) for f in (memory.get("facts") or []) if str(f).strip()]
+    used = bool(facts or req.profile or req.history)
+    await emit("thought", f"Чат: {req.message[:120]}")
+    try:
+        raw, usage = await chat_json_usage(SYSTEM_CHAT, build_chat_prompt(req), 500)
+        data = await guard_reply(raw)
+        reply = str(data.get("reply") or "").strip()
+        if not reply:                      # модель вернула пустоту — честно об этом
+            raise HTTPException(502, "пустой ответ чата")
+        steps = []
+        for item in (data.get("steps") or [])[:5]:
+            desc = item.get("desc") if isinstance(item, dict) else item
+            if str(desc or "").strip():
+                steps.append({"desc": str(desc)[:300]})
+        S.stats["chats"] += 1
+        tin = int(usage.get("prompt_tokens") or 0)
+        tout = int(usage.get("completion_tokens") or 0)
+        out = ChatResponse(reply=reply, rationale=str(data.get("rationale") or "")[:600],
+                           steps=steps, source="colab", memory_used=used,
+                           tokens_in=tin, tokens_out=tout,
+                           tokens_estimate=not bool(usage),
+                           duration_ms=int((time.time() - t0) * 1000))
+        await emit("final", f"[чат] {reply[:200]}")
+        if tin or tout:
+            await emit("thought", f"токены: в {tin}, out {tout}")
+        return out
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        S.stats["errors"] += 1
+        await emit("error", f"чат: upstream недоступен: {type(exc).__name__}")
+        raise HTTPException(503, "LLM backend недоступен")
+    except Exception as exc:
+        S.stats["errors"] += 1
+        await emit("error", f"чат: {str(exc)[:200]}")
+        raise HTTPException(500, str(exc)[:300])
+
+
+# ------------------------------------------- выгрузка логов (для архива) ----
+DUMP_FILES = {
+    "llm.log": "/content/llm.log",
+    "api.log": "/content/thinking_api.log",
+    "tunnel.log": "/content/tunnel.log",
+    "server.py": "/content/thinking_server.py",
+    "snapshot.json": "/content/thinking_snapshot.json",
+    "last_bad_json.txt": "/content/last_bad_json.txt",
+    "model_path.txt": "/content/thinking_model_path.txt",
+}
+
+
+# ------------------------------------------------- переключение моделей ---
+MODELS_FILE = "/content/thinking_models.txt"
+ACTIVE_MODEL_FILE = "/content/thinking_active_model.txt"
+LLM_LOG = "/content/llm.log"
+LLM_HOST, LLM_PORT = "127.0.0.1", 8001
+S.llm_proc: Optional[subprocess.Popen] = None   # noqa: E305
+
+
+def _model_list() -> list[str]:
+    """Модели, доступные рантайму: то, что перечислила ячейка A/D."""
+    try:
+        with open(MODELS_FILE, encoding="utf-8") as fh:
+            items = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        items = []
+    return [p for p in items if os.path.exists(p)]
+
+
+def _active_model() -> str:
+    try:
+        with open(ACTIVE_MODEL_FILE, encoding="utf-8") as fh:
+            cur = fh.read().strip()
+            if cur and os.path.exists(cur):
+                return cur
+    except OSError:
+        pass
+    # Не угадываем по списку: иначе панель решит, что активна первая модель,
+    # а в рантайме может крутиться другая — и переключение не сработает.
+    return ""
+
+
+def _model_label(path: str) -> str:
+    """Короткое имя для интерфейса: qwen2.5-3b-instruct-q4_k_m → 3B.
+
+    Разные сборки различаются суффиксом (UNC — uncensored), иначе в панели
+    две 7B выглядят одинаково и переключение выбирает не ту.
+    """
+    name = os.path.basename(path).lower()
+    size = ""
+    for tag in ("0.5b", "1.5b", "3b", "7b", "14b"):
+        if tag in name:
+            size = tag.upper()
+            break
+    if size:
+        if "uncensored" in name or "unfiltered" in name:
+            return size + "-UNC"
+        if "dolphin" in name:
+            return size + "-DOLPHIN"
+        return size
+    return os.path.splitext(os.path.basename(path))[0][:24]
+
+
+def _model_hint(path: str, gpu: Optional[bool] = None) -> str:
+    """Подсказка нужного режима (CPU / T4 GPU) — видна в панели и CLI.
+
+    Пользователь меняет hardware accelerator в Colab, поэтому подсказка
+    учитывает и модель, и то, что запущено прямо сейчас.
+    """
+    if gpu is None:
+        gpu = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
+    name = os.path.basename(path).lower()
+    here = "сейчас T4/GPU" if gpu else "сейчас CPU"
+    unc = " Сборка без цензуры." if "uncensored" in name else ""
+    if any(tag in name for tag in ("7b", "8b", "14b")):
+        if gpu:
+            return (f"7B · {here} — считается быстро (~40–60 ток/с).{unc}")
+        return (f"7B · {here} — на CPU это ~1 ток/с, очень медленно. "
+                f"Для лучшей работы смени Runtime → Change runtime type → "
+                f"T4 GPU.{unc}")
+    if "3b" in name:
+        return (f"3B · {here} — на CPU ~2–3 ток/с, на T4 ~40 ток/с; "
+                f"компромисс скорости и качества.{unc}")
+    if "1.5b" in name or "0.5b" in name:
+        return (f"1.5B · {here} — самая быстрая на CPU (~6 ток/с), "
+                f"лучший выбор без видеокарты.{unc}")
+    return f"{here}; на T4 любая модель считается заметно быстрее.{unc}"
+
+
+def _llm_cmd(model_path: str) -> list[str]:
+    """Та же строка запуска, что и в ячейке D, но с нужной моделью."""
+    gpu = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
+    return [sys.executable, "-m", "llama_cpp.server",
+            "--model", model_path,
+            "--n_ctx", "4096" if gpu else "2048",
+            "--n_gpu_layers", "-1",
+            "--host", LLM_HOST, "--port", str(LLM_PORT),
+            "--model_alias", MODEL_NAME,
+            "--n_threads", "4", "--n_batch", "512", "--verbose", "False"]
+
+
+async def _llm_ready(tries: int = 90, gap: float = 2.0) -> bool:
+    url = f"http://{LLM_HOST}:{LLM_PORT}/v1/models"
+    for _ in range(tries):
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(url)
+            if r.status_code == 200:
+                return True
+        except httpx.HTTPError:
+            pass
+        await asyncio.sleep(gap)
+    return False
+
+
+async def _switch_to(path: str) -> dict:
+    """Убивает текущий движок и поднимает на выбранной модели."""
+    S.switching = True
+    try:
+        await emit("thought", f"Переключаю модель на {_model_label(path)}…")
+        subprocess.run(["pkill", "-f", "llama_cpp.server"], capture_output=True)
+        await asyncio.sleep(2)
+        log = open(LLM_LOG, "a", encoding="utf-8")
+        S.llm_proc = subprocess.Popen(_llm_cmd(path), stdout=log, stderr=subprocess.STDOUT)
+        if not await _llm_ready():
+            raise RuntimeError(f"{_model_label(path)} не поднялась")
+        try:
+            with open(ACTIVE_MODEL_FILE, "w", encoding="utf-8") as fh:
+                fh.write(path)
+        except OSError:
+            pass
+        S.stats["model_switches"] = int(S.stats.get("model_switches", 0)) + 1
+        await emit("final", f"Модель переключена: {_model_label(path)}")
+        return {"ok": True, "active": path, "label": _model_label(path)}
+    finally:
+        S.switching = False
+
+
+@app.get("/models")
+async def models(x_agent_token: str = Header(default=""), token: str = ""):
+    """Какие модели лежат в рантайме и какая активна сейчас (+ подсказка
+    нужного режима CPU/T4 для каждой)."""
+    _auth(x_agent_token, token)
+    items = _model_list()
+    gpu = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
+    active = _active_model()
+    return {
+        "active": active,
+        "active_label": _model_label(active) if items and active else "",
+        "switching": bool(S.switching),
+        "gpu": bool(gpu),
+        "models": [{"path": p, "label": _model_label(p),
+                    "size_gb": round(os.path.getsize(p) / 2 ** 30, 2),
+                    "hint": _model_hint(p, gpu),
+                    "active": p == active} for p in items],
+    }
+
+
+class ModelRequest(BaseModel):
+    model: str = ""
+
+
+@app.post("/model")
+async def set_model(req: ModelRequest, x_agent_token: str = Header(default=""),
+                    token: str = ""):
+    """Переключение модели на лету: панель зовёт это напрямую."""
+    _auth(x_agent_token, token)
+    want = req.model.strip()
+    items = _model_list()
+    if not items:
+        raise HTTPException(404, "в рантайме нет моделей (выполни ячейку A)")
+    target = next((p for p in items if p == want), None)
+    if target is None:                       # прислали label: "3b", "1.5B"
+        low = want.lower()
+        target = next((p for p in items if _model_label(p).lower() == low), None)
+    if target is None:
+        target = next((p for p in items if low and low in os.path.basename(p).lower()), None)
+    if target is None:
+        raise HTTPException(404, f"модель «{want}» не найдена; есть: "
+                                  + ", ".join(_model_label(p) for p in items))
+    if target == _active_model() and await _llm_ready(tries=2, gap=1.0):
+        return {"ok": True, "active": target, "label": _model_label(target),
+                "note": "уже активна"}
+    try:
+        return await _switch_to(target)
+    except Exception as exc:                 # noqa: BLE001
+        S.stats["errors"] += 1
+        await emit("error", f"переключение не удалось: {exc}")
+        raise HTTPException(500, str(exc)[:300])
+
+
+@app.post("/chat/stream")
+async def chat_stream_ep(req: ChatRequest, x_agent_token: str = Header(default=""),
+                         token: str = ""):
+    """Чат потоком: токены приходят по мере генерации.
+
+    Нужен потому, что бесплатный туннель Cloudflare рвёт молчащий запрос на
+    120-й секунде: развёрнутый ответ на 700 токенов на CPU занимает минуты.
+    Поток держит соединение живым, поэтому длина ответа больше не ограничена
+    временем ожидания первого байта.
+    """
+    _auth(x_agent_token, token)
+    t0 = time.time()
+    memory = req.memory if isinstance(req.memory, dict) else {}
+    facts = [str(f) for f in (memory.get("facts") or []) if str(f).strip()]
+    used = bool(facts or req.profile or req.history)
+    await emit("thought", f"Чат (поток): {req.message[:120]}")
+    max_tokens = int(os.environ.get("THINKING_CHAT_MAX_TOKENS",
+                                    str(max(MAX_TOKENS, 700))))
+
+    async def gen():
+        buf: list[str] = []
+        try:
+            async with S.sem:
+                async for piece in chat_stream(SYSTEM_CHAT,
+                                               build_chat_prompt(req), max_tokens):
+                    buf.append(piece)
+                    yield ("data: " + json.dumps({"type": "token", "text": piece},
+                                                 ensure_ascii=False) + "\n\n")
+            raw = "".join(buf)
+            data = await guard_reply(raw)
+            reply = str(data.get("reply") or "").strip()
+            yield ("data: " + json.dumps({
+                "type": "done",
+                "reply": reply,
+                "rationale": str(data.get("rationale") or "")[:600],
+                "source": "colab", "fallback": False, "memory_used": used,
+                "duration_ms": int((time.time() - t0) * 1000),
+            }, ensure_ascii=False) + "\n\n")
+            await emit("final", f"[чат-поток] {reply[:200]}")
+            S.stats["chats"] += 1
+        except Exception as exc:             # noqa: BLE001
+            S.stats["errors"] += 1
+            yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
+                                         ensure_ascii=False) + "\n\n")
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/dev")
+async def dev(req: DevRequest, x_agent_token: str = Header(default=""),
+              token: str = ""):
+    """Режим «Разработка» (без потока): модель возвращает предложение
+    {action, filename, code, comment}. Файлы НЕ изменяются — применение
+    остаётся за человеком на ПК (контроль сохраняется)."""
+    _auth(x_agent_token, token)
+    t0 = time.time()
+    await emit("thought", f"Разработка: {req.message[:120]}")
+    max_tokens = int(os.environ.get("THINKING_DEV_MAX_TOKENS",
+                                    str(max(MAX_TOKENS, 1600))))
+    try:
+        raw, usage = await chat_json_usage(SYSTEM_DEV, build_dev_prompt(req),
+                                           max_tokens)
+        data = await dev_data(raw)
+    except HTTPException:
+        raise
+    except Exception as exc:             # noqa: BLE001
+        S.stats["errors"] += 1
+        await emit("error", f"разработка: {str(exc)[:200]}")
+        raise HTTPException(500, str(exc)[:300])
+    S.stats["chats"] += 1
+    await emit("final", f"[{data['action']}] {data['filename'] or 'без файла'}: "
+                        f"{data['comment'][:200]}")
+    data["tokens_in"] = int(usage.get("prompt_tokens") or 0)
+    data["tokens_out"] = int(usage.get("completion_tokens") or 0)
+    data["tokens_estimate"] = not bool(usage)
+    data["duration_ms"] = int((time.time() - t0) * 1000)
+    data["at"] = utcnow()
+    return data
+
+
+@app.post("/dev/stream")
+async def dev_stream(req: DevRequest, x_agent_token: str = Header(default=""),
+                     token: str = ""):
+    """Тот же запрос, но потоком: JSON приходит токенами, поэтому длинный
+    код не обрывается 120-секундным лимитом бесплатного туннеля."""
+    _auth(x_agent_token, token)
+    t0 = time.time()
+    await emit("thought", f"Разработка (поток): {req.message[:120]}")
+    max_tokens = int(os.environ.get("THINKING_DEV_MAX_TOKENS",
+                                    str(max(MAX_TOKENS, 1600))))
+
+    async def gen():
+        buf: list[str] = []
+        try:
+            async with S.sem:
+                async for piece in chat_stream(SYSTEM_DEV, build_dev_prompt(req),
+                                               max_tokens):
+                    buf.append(piece)
+                    yield ("data: " + json.dumps({"type": "token", "text": piece},
+                                                 ensure_ascii=False) + "\n\n")
+            data = await dev_data("".join(buf))
+            yield ("data: " + json.dumps({
+                "type": "done", **data,
+                "tokens_estimate": True,
+                "duration_ms": int((time.time() - t0) * 1000),
+                "at": utcnow(),
+            }, ensure_ascii=False) + "\n\n")
+            await emit("final", f"[{data['action']}] "
+                                f"{data['filename'] or 'без файла'}: "
+                                f"{data['comment'][:200]}")
+            S.stats["chats"] += 1
+        except Exception as exc:         # noqa: BLE001
+            S.stats["errors"] += 1
+            yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
+                                         ensure_ascii=False) + "\n\n")
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.get("/dump/{name}")
+async def dump(name: str, x_agent_token: str = Header(default=""), token: str = ""):
+    """Отдаёт серверный файл из белого списка — чтобы ПК мог снять логи
+    в архив без ручного копирования. Требует тот же токен, что и остальное."""
+    _auth(x_agent_token, token)
+    path = DUMP_FILES.get(name)
+    if not path:
+        raise HTTPException(404, f"файл «{name}» не в списке: {', '.join(DUMP_FILES)}")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise HTTPException(404, f"нет файла: {exc}")
+    await emit("thought", f"выгружен файл {name} ({len(data)} байт)")
+    return StreamingResponse(iter([data]), media_type="application/octet-stream",
+                             headers={"Content-Disposition":
+                                      f'attachment; filename="{name}"'})
+
+
+PANEL_HTML = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<title>Мышление</title><style>
+body{margin:0;background:#0d1117;color:#c9d1d9;font:13px/1.45 ui-monospace,Consolas,monospace}
+header{display:flex;gap:12px;align-items:center;padding:9px 13px;background:#161b22;border-bottom:1px solid #30363d}
+#b{padding:2px 9px;border-radius:11px;background:#3d1418;color:#ff7b72}
+#b.on{background:#12351f;color:#7ee787}
+main{display:grid;grid-template-columns:1fr 1fr;gap:11px;padding:11px 13px}
+section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:9px;height:84vh;overflow-y:auto}
+h2{font-size:11px;margin:0 0 7px;color:#8b949e;letter-spacing:.08em}
+.ev{padding:3px 0;border-bottom:1px dashed #21262d;font-size:12px;word-break:break-word}
+.t{color:#8b949e;margin-right:6px}
+.thought .x{color:#9ecbff}.rationale .x{color:#e6edf3}.plan_step .x{color:#7ee787}
+.contradiction .x{color:#ffa657}.final .x{color:#fff;font-weight:600}
+.error .x{color:#ff7b72}.token .x{color:#8b949e}
+</style></head><body>
+<header><b>Субагент «Мышление»</b><span id="b">…</span><span id="m" style="color:#8b949e"></span></header>
+<main><section><h2>МЫСЛИ (LIVE)</h2><div id="a"></div></section>
+<section><h2>ПОСЛЕДНИЕ СОБЫТИЯ</h2><div id="c"></div></section></main>
+<script>
+const TOK="__TOKEN__";
+function H(){return TOK?{"X-Agent-Token":TOK}:{}}
+function add(id,ev){const b=document.getElementById(id);if(b.children.length>300)b.removeChild(b.firstChild);
+const d=document.createElement('div');d.className='ev '+(ev.type||'');
+const s=document.createElement('span');s.className='t';s.textContent=(ev.ts||'').slice(11,19);
+const x=document.createElement('span');x.className='x';x.textContent=ev.text||'';
+d.append(s,x);b.appendChild(d);b.scrollTop=b.scrollHeight}
+let es=new EventSource("/events/stream?token="+encodeURIComponent(TOK));
+es.onopen=()=>{document.getElementById('b').className='on';document.getElementById('b').textContent='ПОДКЛЮЧЕНО'};
+es.onerror=()=>{document.getElementById('b').className='';document.getElementById('b').textContent='НЕТ СВЯЗИ'};
+es.onmessage=e=>{try{const ev=JSON.parse(e.data);add('c',ev);if(ev.type!=='final')add('a',ev)}catch(x){}};
+async function st(){try{const r=await fetch('/health?token='+encodeURIComponent(TOK),{headers:H()});
+const h=await r.json();document.getElementById('m').textContent=h.model+' · '+h.gpu+' · uptime '+h.uptime_s+' с'
++' · планов '+h.plans}catch(x){}}
+st();setInterval(st,4000);
+</script></body></html>"""

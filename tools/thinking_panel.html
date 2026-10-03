@@ -1,0 +1,1525 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Субагент «Мышление» — отчёты, диалог и выгода</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0d1117; color:#c9d1d9;
+         font:14px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  header { background:#161b22; border-bottom:1px solid #30363d;
+           position:sticky; top:0; z-index:5; }
+  .row1 { display:flex; gap:14px; align-items:center; padding:10px 16px 6px; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; color:#e6edf3; font-weight:600; }
+  #badge { padding:2px 10px; border-radius:11px; font-size:12px; border:1px solid transparent; }
+  .on  { background:#12351f; color:#7ee787; border-color:#2ea043; }
+  .off { background:#3d1418; color:#ff7b72; border-color:#da3633; }
+  .meta { color:#8b949e; font-size:12px; }
+  #tabs { display:flex; gap:6px; padding:0 16px 8px; flex-wrap:wrap; }
+  .tab { background:#21262d; border:1px solid #30363d; color:#8b949e;
+         border-radius:6px 6px 0 0; padding:6px 14px; font:inherit; cursor:pointer; }
+  .tab:hover { background:#30363d; color:#c9d1d9; }
+  .tab.on { background:#0d1117; color:#e6edf3; border-bottom-color:#0d1117; font-weight:600; }
+  .tab b { background:#30363d; border-radius:9px; padding:0 7px; font-size:12px; margin-left:5px; }
+  #tokenbox { display:flex; gap:6px; margin-left:auto; align-items:center; }
+  input { background:#0d1117; border:1px solid #30363d; color:#c9d1d9;
+          border-radius:6px; padding:5px 9px; font:inherit; width:230px; }
+  select { background:#0d1117; border:1px solid #30363d; color:#c9d1d9;
+           border-radius:6px; padding:5px 9px; font:inherit; }
+  button { background:#21262d; border:1px solid #30363d; color:#c9d1d9;
+           border-radius:6px; padding:5px 11px; font:inherit; cursor:pointer; }
+  button:hover { background:#30363d; }
+  button.del { color:#ff7b72; border-color:#3d1418; background:#2b1416; }
+  button.del:hover { background:#3d1418; }
+  button.mini { padding:2px 8px; font-size:11.5px; }
+  button.per.on { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+
+  /* подсказка про токен */
+  .helbox { display:none; background:#1c2431; border:1px solid #30363d;
+            border-radius:0 0 10px 10px; margin:0 16px 8px; padding:10px 14px;
+            font-size:12.5px; max-width:1150px; line-height:1.55; }
+  .helbox.on { display:block; }
+  .helbox h4 { margin:0 0 6px; color:#e6edf3; font-size:13px; }
+  .helbox ol { margin:0 6px 0 0; padding-left:18px; }
+  .helbox li { margin-bottom:5px; }
+  .helbox code { background:#0d1117; padding:1px 5px; border-radius:4px; color:#79c0ff; }
+  .warnbox { background:#3b2314; border:1px solid #f0883e; color:#ffd8b0;
+             border-radius:8px; padding:9px 12px; margin:0 16px 8px;
+             font-size:12.5px; display:none; }
+
+  main { padding:14px 16px 40px; max-width:1500px; }
+  .pane { display:none; }
+  .pane.on { display:block; }
+  .hint { color:#8b949e; font-size:12.5px; margin:0 0 12px; max-width:1100px; }
+  .empty { color:#484f58; font-style:italic; padding:14px 0; }
+
+  /* ---- карточки отчётов ---- */
+  .card { background:#161b22; border:1px solid #30363d; border-radius:8px;
+          padding:12px 14px; margin-bottom:12px; }
+  .cardhead { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+              font-size:12px; color:#8b949e; margin-bottom:8px; }
+  .chip { padding:1px 9px; border-radius:10px; font-weight:600; }
+  .chip-plan { background:#1f2a4a; color:#79c0ff; border:1px solid #388bfd; }
+  .chip-reflect { background:#12351f; color:#7ee787; border:1px solid #2ea043; }
+  .chip-fb { background:#3d1418; color:#ff7b72; border:1px solid #da3633; }
+  .card h3 { margin:0 0 6px; font-size:15px; color:#e6edf3; font-weight:600; line-height:1.4; }
+  .why { margin:0 0 8px; color:#9ecbff; }
+  .ask { margin:0 0 8px; color:#8b949e; font-size:12.5px;
+         border-left:3px solid #30363d; padding-left:8px; }
+  .steps { margin:6px 0 4px; padding-left:0; list-style:none; }
+  .steps li { display:flex; gap:8px; padding:5px 0; border-bottom:1px dashed #21262d; }
+  .steps .id { color:#8b949e; min-width:22px; }
+  .steps .a { color:#7ee787; min-width:96px; }
+  .steps .d { color:#c9d1d9; flex:1; }
+  .steps .exp { color:#8b949e; font-size:12px; }
+  .lst { margin:6px 0 0; padding-left:18px; font-size:13px; }
+  .lst.ok li { color:#7ee787; }
+  .lst.warn li { color:#ffa657; }
+  .lst.info li { color:#8b949e; }
+  .cardfoot { margin-top:8px; font-size:12px; color:#484f58; }
+
+  /* ---- диалог ---- */
+  .msg { background:#161b22; border:1px solid #30363d; border-radius:8px;
+         padding:10px 14px; margin-bottom:10px; }
+  .msghead { display:flex; gap:10px; align-items:center; font-size:12px;
+             color:#8b949e; margin-bottom:6px; flex-wrap:wrap; }
+  .who { font-weight:700; }
+  .who.me { color:#d2a8ff; }
+  .who.sub { color:#79c0ff; }
+  .st { padding:1px 8px; border-radius:9px; border:1px solid; }
+  .st.ok { color:#7ee787; border-color:#2ea043; background:#12351f; }
+  .st.bad { color:#ff7b72; border-color:#da3633; background:#3d1418; }
+  .st.fb { color:#ffa657; border-color:#f0883e; background:#3b2314; }
+  .bubble { border-radius:6px; padding:8px 11px; margin-bottom:7px;
+            white-space:pre-wrap; word-break:break-word; }
+  .bubble.ask { background:#1c1730; border:1px solid #3d2f63; color:#e6d9ff; }
+  .bubble.ans { background:#111a2b; border:1px solid #1f4370; color:#c9e4ff; }
+  .bubble .sub { color:#8b949e; font-size:12px; display:block; margin-bottom:4px; }
+
+  /* ---- выгода ---- */
+  .kpis { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; }
+  .kpi { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px 14px; }
+  .kpi .v { font-size:26px; font-weight:700; color:#e6edf3; line-height:1.1; }
+  .kpi .k { color:#8b949e; font-size:12px; margin-top:4px; }
+  .block { background:#161b22; border:1px solid #30363d; border-radius:8px;
+           padding:12px 16px; margin-top:14px; }
+  .block h2 { font-size:13px; margin:0 0 8px; color:#e6edf3; text-transform:none;
+              letter-spacing:0; }
+  .block li { margin-bottom:7px; }
+  .block .good { color:#7ee787; }
+  .block .caveat { color:#ffa657; }
+
+  /* ---- события: связь и журнал ---- */
+  .ev { padding:3px 0; border-bottom:1px dashed #21262d; font-size:13px;
+        word-break:break-word; }
+  .t { color:#8b949e; margin-right:7px; }
+  .thought .txt { color:#9ecbff; }
+  .token .txt { color:#484f58; }
+  .rationale .txt { color:#e6edf3; }
+  .plan_step .txt { color:#7ee787; }
+  .contradiction .txt { color:#ffa657; }
+  .final .txt { color:#fff; font-weight:600; }
+  .error .txt { color:#ff7b72; }
+  .plan .txt { color:#d2a8ff; white-space:pre-wrap; }
+  .reflect .txt { color:#79c0ff; white-space:pre-wrap; }
+  .interaction .txt { color:#f0b7ff; white-space:pre-wrap; }
+  .dev .txt { color:#ffd8b0; white-space:pre-wrap; }
+  .scroll { background:#161b22; border:1px solid #30363d; border-radius:8px;
+            padding:10px 12px; height:calc(100vh - 240px); overflow-y:auto; }
+
+  /* ---- чат с субагентом ---- */
+  #chatlog { height:calc(100vh - 330px); min-height:240px; }
+  .line { display:flex; margin-bottom:10px; }
+  .line.me { justify-content:flex-end; }
+  .line .bub { max-width:78%; padding:8px 12px; border-radius:10px;
+               white-space:pre-wrap; word-break:break-word; }
+  .line.me .bub { background:#1c1730; border:1px solid #3d2f63; color:#e6d9ff; }
+  .line.ai .bub { background:#111a2b; border:1px solid #1f4370; color:#c9e4ff; }
+  .line.ai.fb .bub { background:#2b1f14; border:1px solid #6b4423; color:#ffd8b0; }
+  .line .who { font-size:11px; color:#8b949e; margin:0 6px; align-self:center; }
+  .line .meta { font-size:11px; color:#8b949e; margin-top:4px; }
+  #chatbar { display:flex; gap:8px; margin-top:10px; align-items:center; }
+  #chatinput { flex:1; width:auto; min-height:42px; resize:vertical; }
+  .mem { display:flex; gap:6px; align-items:center; flex-wrap:wrap;
+         margin:0 0 10px; font-size:12px; color:#8b949e; }
+  .mem .fact { background:#1c2431; border:1px solid #30363d; border-radius:9px;
+               padding:1px 8px; color:#9ecbff; }
+
+  /* ---- токены ---- */
+  .tokbar { height:16px; background:#21262d; border-radius:4px; overflow:hidden;
+            display:flex; margin:8px 0 4px; }
+  .tokbar i { display:block; height:100%; }
+  .tokbar .in { background:#388bfd; }
+  .tokbar .out { background:#7ee787; }
+  .legend { display:flex; gap:14px; font-size:12px; color:#8b949e; }
+  .legend b { color:#e6edf3; }
+  .spark { display:flex; gap:2px; align-items:flex-end; height:60px; margin:10px 0 4px; }
+  .spark i { flex:1; background:#1f4370; border-radius:2px 2px 0 0; min-height:2px; }
+  table.tk { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:8px; }
+  table.tk th, table.tk td { text-align:left; padding:5px 8px;
+                             border-bottom:1px solid #21262d; }
+  table.tk th { color:#8b949e; font-weight:600; }
+  .warnbox.b { margin:0 0 10px; }
+
+  /* ---- режим разработчика ---- */
+  .devgrid { display:grid; grid-template-columns:1.5fr 1fr 1fr; gap:10px;
+             height:calc(100vh - 300px); min-height:430px; }
+  .devcol { background:#161b22; border:1px solid #30363d; border-radius:8px;
+            display:flex; flex-direction:column; overflow:hidden; }
+  .devhead { padding:7px 10px; border-bottom:1px solid #30363d; font-size:12.5px;
+             color:#e6edf3; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .devbody { flex:1; overflow:auto; padding:8px 10px; min-height:0; }
+  #devcode { width:100%; height:100%; min-height:220px; resize:none; border:none;
+             outline:none; background:#0d1117; color:#c9e4ff; padding:10px;
+             font:13px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  #devout { margin:0; padding:8px 10px; font-size:12.5px; white-space:pre-wrap;
+            word-break:break-word; flex:1; overflow:auto; min-height:0; }
+  #devout .out { color:#7ee787; }
+  #devout .err { color:#ff7b72; }
+  #devout .cmd { color:#79c0ff; }
+  #devout .ok { color:#7ee787; }
+  #devout .info { color:#8b949e; }
+  #devchat { flex:1; overflow:auto; padding:8px 10px; min-height:0; }
+  .devmsg { margin-bottom:8px; font-size:13px; white-space:pre-wrap;
+            word-break:break-word; }
+  .devmsg.me { color:#e6d9ff; }
+  .devmsg.ai { color:#c9e4ff; }
+  .devbar { display:flex; gap:6px; padding:7px 10px; border-top:1px solid #30363d;
+            flex-wrap:wrap; align-items:center; }
+  #devinput { flex:1; min-height:40px; width:auto; resize:vertical; }
+  .codesample { background:#0d1117; border:1px solid #30363d; border-radius:6px;
+                padding:8px 10px; max-height:260px; overflow:auto; font-size:12px;
+                white-space:pre-wrap; word-break:break-word; color:#7ee787; margin:8px 0 0; }
+  .overlay { position:fixed; inset:0; background:rgba(0,0,0,.62); display:none;
+             align-items:center; justify-content:center; z-index:50; }
+  .overlay.on { display:flex; }
+  .dialog { background:#161b22; border:1px solid #30363d; border-radius:10px;
+            padding:16px 18px; max-width:680px; width:92%; max-height:86vh;
+            overflow:auto; }
+  .dialog h3 { margin:0 0 8px; font-size:15px; color:#e6edf3; }
+  .devlogline { font-size:12px; color:#8b949e; padding:2px 0;
+                border-bottom:1px dashed #21262d; }
+  .note { background:#1c2431; border:1px solid #30363d; border-radius:6px;
+          padding:7px 10px; font-size:12.5px; color:#9ecbff; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row1">
+    <h1>Субагент «Мышление» — отчёты, диалог и выгода</h1>
+    <span id="badge" class="off">ПРОВЕРКА…</span>
+    <span class="meta">период:
+      <button class="mini per on" data-per="today" onclick="setPeriod('today')">за сегодня</button>
+      <button class="mini per" data-per="all" onclick="setPeriod('all')">за всё время</button>
+    </span>
+    <span class="meta" id="meta"></span>
+    <span id="tokenbox">
+      <input id="tok" placeholder="X-Agent-Token (заполняется сам)">
+      <button class="mini" onclick="saveTok()">Сохранить</button>
+      <button class="mini" id="tokbtn" title="зачем нужен токен и как он работает"
+              onclick="toggleTokHelp()">?</button>
+      <button onclick="exportMd()">Скачать отчёт .md</button>
+    </span>
+  </div>
+  <div id="tokhelp" class="helbox">
+    <h4>X-Agent-Token: зачем нужен и как работает</h4>
+    <ol>
+      <li><b>Что это.</b> Пароль к серверу на Colab. Адрес туннеля
+        (<code>https://…trycloudflare.com</code>) открытый и случайный: любой,
+        кто его узнает, сможет бесплатно пользоваться твоей моделью. Токен
+        доказывает, что запрос пришёл с твоего компьютера.</li>
+      <li><b>Как устроен путь.</b> Colab (ячейка D) печатает
+        <code>THINKING_TOKEN</code> → ты один раз выполняешь
+        <code>python tools/thinking_cli.py set-url &lt;URL&gt; &lt;TOKEN&gt;</code> →
+        значение лежит в <code>config/thinking.local.json</code> → панель сама
+        подставляет его в каждый запрос заголовком <code>X-Agent-Token</code>.
+        Сервер на Colab сверяет и отвечает 401 «неверный токен», если не совпал.</li>
+      <li><b>Автоматический режим (по умолчанию).</b> Поле заполняется само из
+        конфига при загрузке страницы — вводить ничего не нужно. Страница
+        слушает только <code>127.0.0.1</code>, поэтому токен виден только тебе.</li>
+      <li><b>Когда вводить руками.</b> Только после перезапуска Colab с новым
+        токеном: скопируй <code>THINKING_TOKEN</code> из вывода ячейки D, вставь
+        в поле и нажми «Сохранить» — значение запишется в конфиг (этот же
+        результат даёт команда <code>set-url</code>).</li>
+      <li><b>Если нет связи.</b> <code>python tools/thinking_cli.py doctor</code>
+        покажет <code>TOKEN: задан/НЕ задан</code> и причину обрыва; частая
+        причина «401» — устаревший токен после перезапуска Colab.</li>
+    </ol>
+  </div>
+  <div id="limitwarn" class="warnbox"></div>
+  <nav id="tabs">
+    <button class="tab on" data-pane="reports">Отчёты <b id="c-rep">0</b></button>
+    <button class="tab" data-pane="chat">Чат с субагентом</button>
+    <button class="tab" data-pane="dev">Разработка</button>
+    <button class="tab" data-pane="models">Модели <b id="c-model">—</b></button>
+    <button class="tab" data-pane="dialog">Диалог <b id="c-int">0</b></button>
+    <button class="tab" data-pane="tokens">Токены</button>
+    <button class="tab" data-pane="live">Связь агентов <b id="c-live">0</b></button>
+    <button class="tab" data-pane="benefit">Выгода и ускорение</button>
+    <button class="tab" data-pane="log">Журнал</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ============ ОТЧЁТЫ ============ -->
+  <section class="pane on" id="pane-reports">
+    <p class="hint">Подробные отчёты субагента: цель, обоснование, шаги с ожидаемыми
+      результатами, критерии успеха и найденные противоречия. Субагент не управляет
+      системой и не правит файлы — он только советует. Сюда же падают отчёты
+      рефлексии по метрикам (вкладка «Выгода»).</p>
+    <div class="mem">
+      <span>удалить:</span>
+      <button class="mini del" onclick="clearAll('report')">все отчёты</button>
+      <button class="mini del" onclick="clearOld('report')">старше суток</button>
+      <button class="mini del" onclick="clearFallback()">только заглушки</button>
+    </div>
+    <div id="reports"><div class="empty">отчётов пока нет — выполните
+      python tools/thinking_cli.py plan "задача"</div></div>
+  </section>
+
+  <!-- ============ МОДЕЛИ ============ -->
+  <section class="pane" id="pane-models">
+    <p class="hint">Модели скачаны в Colab заранее и переключаются здесь же.
+      Переключение перезапускает движок в рантайме: обычно 20–60 секунд,
+      во время переключения чат недоступен. У каждой модели есть подсказка
+      нужного режима (CPU / T4 GPU).</p>
+    <div class="warnbox b" id="gpuwarn"></div>
+    <div class="mem">
+      <button class="mini" onclick="loadModels()">Обновить список</button>
+      <span id="modelnote" class="meta"></span>
+    </div>
+    <div id="models"><div class="empty">загружаю список моделей…</div></div>
+  </section>
+
+  <!-- ============ ЧАТ С СУБАГЕНТОМ ============ -->
+  <section class="pane" id="pane-chat">
+    <p class="hint">Живой разговор с нейросетью на Colab: обычный текст, без
+      JSON-структур. Субагент помнит факты о проекте и последние реплики —
+      поэтому не приходится каждый раз объяснять контекст заново. Он советует,
+      но ничего не выполняет: для работы с кодом есть вкладка «Разработка».</p>
+    <div class="mem" id="membar"></div>
+    <div class="scroll" id="chatlog"><div class="empty">напишите первое сообщение</div></div>
+    <div id="chatbar">
+      <textarea id="chatinput" rows="2" placeholder="спроси субагента… (Ctrl+Enter — отправить)"></textarea>
+      <label class="meta" style="display:flex;gap:5px;align-items:center">
+        <input type="checkbox" id="chatmem" checked style="width:auto"> память</label>
+      <button id="chatsend" onclick="sendChat()">Отправить</button>
+      <button class="del" onclick="clearAll('chat')">Очистить чат</button>
+    </div>
+  </section>
+
+  <!-- ============ РАЗРАБОТКА ============ -->
+  <section class="pane" id="pane-dev">
+    <p class="hint">Режим разработчика: субагент выходит за рамки «мышления» и
+      работает с кодом в папке <b>dev_sandbox/</b> этой программы. Три окна —
+      код (правится руками), вывод интерпретатора и чат с выбором модели.
+      Контроль сохраняется: каждое изменение от модели подтверждается тобой,
+      перед правкой старая версия уходит в откат (20 последних), всё пишется
+      в журнал, кнопкой собирается дамп.</p>
+    <div class="devgrid">
+      <div class="devcol">
+        <div class="devhead">Код
+          <select id="devsel" onchange="devOpen(this.value)"></select>
+          <button class="mini" onclick="devRefresh()">⟳</button>
+          <button class="mini" onclick="devNew()">Новый файл</button>
+          <span class="meta" id="devfname">—</span>
+        </div>
+        <div class="devbody" style="padding:0">
+          <textarea id="devcode" spellcheck="false"
+                    placeholder="выберите файл или создайте новый — либо попросите модель в чат справа"></textarea>
+        </div>
+        <div class="devbar">
+          <button onclick="devSave('user')">Сохранить</button>
+          <button onclick="devRollback()">Откатить последнее</button>
+          <span class="meta">правки руками тоже сохраняются с откатом</span>
+        </div>
+      </div>
+      <div class="devcol">
+        <div class="devhead">Вывод интерпретатора
+          <button class="mini" onclick="devRun()">▶ Запустить</button>
+          <button class="mini" onclick="document.getElementById('devout').textContent='';document.getElementById('devout').dataset.empty='yes'">Очистить</button>
+        </div>
+        <pre id="devout" data-empty="yes">нажмите «Запустить» — здесь появится вывод выбранного .py-файла</pre>
+        <div class="devhead">Журнал разработки
+          <button class="mini" onclick="devDump()">Собрать дамп</button>
+          <button class="mini" onclick="devLog()">⟳</button>
+        </div>
+        <div class="devbody" id="devloglist"><div class="empty">журнал пуст</div></div>
+      </div>
+      <div class="devcol">
+        <div class="devhead">Чат и модели
+          <select id="devmodel" title="активная модель в Colab"
+                  onchange="devSwitchModel(this)"></select>
+        </div>
+        <div id="devchat"><div class="devmsg ai">Напишите, что сделать: «напиши
+          простой код на python», «сделай новую функцию в текущем файле» —
+          модель подготовит изменение, ты подтвердишь, и оно применится.</div></div>
+        <div class="devbar">
+          <textarea id="devinput" rows="2"
+                    placeholder="что сделать с кодом… (Ctrl+Enter)"></textarea>
+          <button id="devsend" onclick="devSend()">Отправить</button>
+        </div>
+      </div>
+    </div>
+    <div class="note">Файлы: <span id="devroot">dev_sandbox/</span> · откаты лежат
+      там же в <code>.rollback/</code> · журнал — <code>logs/thinking/devlog.jsonl</code> ·
+      зацикленная рефлексия по метрикам — <code>python tools/thinking_cli.py reflect-metrics --loop</code>.</div>
+  </section>
+
+  <!-- ============ ДИАЛОГ ============ -->
+  <section class="pane" id="pane-dialog">
+    <p class="hint">Наблюдение за JSON-обменом между мной и субагентом: планы и
+      рефлексии в том виде, в каком они реально приходят. Хронология показывает,
+      что я спрашивал, сколько ждал и что получил в ответ.</p>
+    <div class="mem">
+      <span>удалить:</span>
+      <button class="mini del" onclick="clearAll('dialog')">весь диалог</button>
+      <button class="mini del" onclick="clearOld('dialog')">старше суток</button>
+    </div>
+    <div id="dialog"><div class="empty">обращений пока не было</div></div>
+  </section>
+
+  <!-- ============ ТОКЕНЫ ============ -->
+  <section class="pane" id="pane-tokens">
+    <p class="hint">Сколько токенов ушло на общение с субагентом за выбранный
+      период (в шапке: «за сегодня» / «за всё время»). Точные цифры сервер
+      отдаёт не всегда — тогда считаем по длине текста и честно помечаем это
+      как оценку. Время указано в формате «сегодня / вчера / дата» (UTC).</p>
+    <div id="tok-body"></div>
+  </section>
+
+  <!-- ============ СВЯЗЬ АГЕНТОВ ============ -->
+  <section class="pane" id="pane-live">
+    <p class="hint">Что я отправляю субагенту: задачи на план, рефлексии,
+      реплики чата и запросы режима «Разработка» — лента обращений за выбранный
+      период, без вмешательства. Технические события и команды — во вкладке
+      «Журнал».</p>
+    <div class="scroll" id="live"><div class="empty">ожидание обращений…</div></div>
+  </section>
+
+  <!-- ============ ВЫГОДА ============ -->
+  <section class="pane" id="pane-benefit">
+    <div class="kpis" id="kpis"></div>
+    <div class="block">
+      <h2>Рефлексия по метрикам (работает по циклу)</h2>
+      <p class="hint" style="margin-bottom:8px">Смотрит на цифры выше за выбранный
+        период и приходит с советом, как их улучшить (меньше ошибок и ожидания,
+        больше успешных и фоновых обращений). Отчёт падает во вкладку «Отчёты»,
+        текст сохраняется в <code>logs/thinking/reflections.md</code>.
+        Цикл: <code>python tools/thinking_cli.py reflect-metrics --loop --interval 600</code>.</p>
+      <div class="mem">
+        <span>кто размышляет:</span>
+        <select id="refengine">
+          <option value="subagent">субагент (активная модель Colab)</option>
+          <option value="local">локально (правила, без Colab)</option>
+        </select>
+        <button onclick="runReflect()">Запустить рефлексию</button>
+        <span class="meta" id="refnote"></span>
+      </div>
+      <div id="refbox"></div>
+    </div>
+    <div class="block">
+      <h2>Что субагент даёт на практике</h2>
+      <ul id="benefit-notes"><li class="empty">данных пока нет</li></ul>
+    </div>
+    <div class="block">
+      <h2>Чего он <span class="caveat">не</span> делает</h2>
+      <ul>
+        <li class="caveat">Не запускает и не останавливает работу: при падении Colab
+          агент продолжает выполнять задачи по шаблону-заглушке.</li>
+        <li class="caveat">Не пишет файлы игры и не рисует картинки — у него нет
+          инструментов и доступа к API изображений. Файлы в dev_sandbox/
+          меняет только по кнопке «Применить» в режиме «Разработка».</li>
+        <li class="caveat">Не планирует за агента в офлайне: заглушка отдаёт общую
+          структуру, но решение принимаю я.</li>
+        <li class="caveat">Не видит секретов: токены и пароли вычищаются до
+          отправки (проверка has_secret).</li>
+      </ul>
+    </div>
+    <div class="block">
+      <h2>Когда ускорение реально</h2>
+      <ul>
+        <li class="good">Параллельная подготовка плана, пока я правлю другой файл:
+          вызов уходит в фон и не блокирует работу.</li>
+        <li class="good">Повторное использование готовой структуры: шаги, ожидаемые
+          артефакты и критерии уже сформулированы — не тратится контекст на
+          перечисление.</li>
+        <li class="good">Второе мнение после неудачи: рефлексия подсказывает, что
+          чинить дальше, вместо слепого повтора прогона.</li>
+        <li class="caveat">Синхронный запрос (без --async/--stream в фоне) — это
+          пауза, а не ускорение: средняя цифра видна в блоке выше.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ ЖУРНАЛ ============ -->
+  <section class="pane" id="pane-log">
+    <p class="hint">Только технические события и команды: мысли субагента,
+      переключения моделей, ошибки, итоги. Обращения — во вкладке
+      «Связь агентов», изменения файлов — в «Разработка».</p>
+    <div class="scroll" id="log"><div class="empty">журнал пуст</div></div>
+  </section>
+</main>
+
+<!-- ============ ПОДТВЕРЖДЕНИЕ ИЗМЕНЕНИЯ КОДА ============ -->
+<div class="overlay" id="devconfirm">
+  <div class="dialog">
+    <h3>Контроль: применить изменение к файлу?</h3>
+    <div id="devconfirmtxt"></div>
+    <div class="devbar" style="border-top:none;padding:12px 0 0">
+      <button onclick="devConfirmAnswer('run')">Применить и запустить</button>
+      <button onclick="devConfirmAnswer('apply')">Применить</button>
+      <button class="del" onclick="devConfirmAnswer('no')">Отмена</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("tk") || "";
+let es = null, lastSig = "", STATE = null, logCount = 0;
+let PERIOD = "today";                      // «за сегодня» — режим по умолчанию
+const STATE_URL = "/api/state";
+
+/* ---------- вкладки ---------- */
+document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
+  document.querySelectorAll(".pane").forEach(x => x.classList.remove("on"));
+  b.classList.add("on");
+  document.getElementById("pane-" + b.dataset.pane).classList.add("on");
+  if (b.dataset.pane === "models") loadModels();
+  if (b.dataset.pane === "dev") devRefresh();
+}));
+
+/* ---------- период: «за сегодня» / «за всё время» ---------- */
+function sinceIso() {
+  if (PERIOD !== "today") return "";
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+function setPeriod(p) {
+  PERIOD = p;
+  document.querySelectorAll(".per").forEach(b =>
+    b.classList.toggle("on", b.dataset.per === p));
+  lastSig = "";
+  state();
+}
+
+/* ---------- токен: авто-подстановка + инструкция ---------- */
+function toggleTokHelp() {
+  document.getElementById("tokhelp").classList.toggle("on");
+}
+async function saveTok() {
+  TOKEN = document.getElementById("tok").value.trim();
+  if (TOKEN) localStorage.setItem("tk", TOKEN);
+  try {
+    const res = await api("/api/token", {token: TOKEN});
+    if (res.error) { alert("не сохранилось: " + res.error); return; }
+    alert("Токен сохранён в config/thinking.local.json — панель подставит его сама.");
+  } catch (e) {
+    alert("панель не ответила: " + e);
+  }
+  lastSig = "";
+  state();
+}
+function H() { return TOKEN ? {"X-Agent-Token": TOKEN} : {}; }
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function clearBox(id) {
+  const box = document.getElementById(id);
+  const em = box.querySelector(".empty");
+  if (em) em.remove();
+  return box;
+}
+function hhmm(ts) {
+  const t = String(ts || "");
+  if (t.length >= 19) return t.slice(11, 19);
+  if (t.length >= 8) return t.slice(0, 8);
+  return t;
+}
+/* Дата + время: «сегодня 14:32», «вчера 09:15», иначе «02.10 14:32» (UTC). */
+function dttm(ts) {
+  const t = String(ts || "");
+  if (t.length < 16) return hhmm(ts);
+  const day = t.slice(0, 10), hm = t.slice(11, 16);
+  const nowIso = new Date().toISOString();
+  const today = nowIso.slice(0, 10);
+  const yest = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  if (day === today) return "сегодня " + hm;
+  if (day === yest) return "вчера " + hm;
+  return t.slice(8, 10) + "." + t.slice(5, 7) + " " + hm;
+}
+function sec(ms) { return (Number(ms || 0) / 1000).toFixed(1) + " с"; }
+function kindLabel(k) {
+  const m = {plan: "ПЛАН", reflect: "РЕФЛЕКСИЯ", chat: "ЧАТ", dev: "РАЗРАБОТКА"};
+  return m[k] || String(k || "?").toUpperCase();
+}
+
+/* ---------- отчёты ---------- */
+function renderReports(list) {
+  const box = document.getElementById("reports");
+  box.innerHTML = "";
+  document.getElementById("c-rep").textContent = list.length;
+  if (!list.length) {
+    box.appendChild(el("div", "empty",
+      "отчётов пока нет — выполните python tools/thinking_cli.py plan \"задача\""));
+    return;
+  }
+  list.slice().reverse().forEach(r => box.appendChild(reportCard(r)));
+}
+
+function reportCard(r) {
+  const isPlan = r.type === "plan";
+  const card = el("article", "card");
+  const head = el("div", "cardhead");
+  const chip = el("span", "chip " + (r.fallback ? "chip-fb" : (isPlan ? "chip-plan" : "chip-reflect")),
+                  r.fallback ? "заглушка (Colab недоступен)" : (isPlan ? "ПЛАН" : "РЕФЛЕКСИЯ"));
+  head.appendChild(chip);
+  head.appendChild(el("span", "", dttm(r.at)));
+  if (r.plan_id) head.appendChild(el("span", "", "id " + r.plan_id));
+  if (!isPlan) head.appendChild(el("span", "", "шаг " + (r.step_id ?? "-")));
+  if (isPlan && r.confidence != null) head.appendChild(el("span", "", "уверенность " + r.confidence));
+  if (r.status) head.appendChild(el("span", "", "статус: " + r.status));
+  if (r.source && !r.fallback) head.appendChild(el("span", "", "источник: " + r.source));
+  card.appendChild(head);
+
+  card.appendChild(el("h3", "", r.goal || r.task || "(без цели)"));
+  if (r.rationale) card.appendChild(el("p", "why", "Почему так: " + r.rationale));
+  if (r.advice) card.appendChild(el("p", "why", "Совет: " + r.advice));
+  if (r.task && r.goal) card.appendChild(el("p", "ask", "Мой запрос: " + r.task));
+
+  if (Array.isArray(r.sub_goals) && r.sub_goals.length) {
+    const u = el("ul", "lst info");
+    r.sub_goals.forEach(g => u.appendChild(el("li", "", "→ " + g)));
+    card.appendChild(u);
+  }
+
+  const steps = r.steps || [];
+  if (steps.length) {
+    const ol = el("ol", "steps");
+    steps.forEach(s => {
+      const li = el("li");
+      li.appendChild(el("span", "id", "[" + (s.id ?? "-") + "]"));
+      li.appendChild(el("span", "a", s.action_ru || "шаг"));
+      li.appendChild(el("span", "d", s.desc || ""));
+      if (s.expected) li.appendChild(el("span", "exp", "→ ожидаем: " + s.expected));
+      if (s.depends && s.depends.length) {
+        li.appendChild(el("span", "exp", " (ждёт: " + s.depends.join(", ") + ")"));
+      }
+      ol.appendChild(li);
+    });
+    card.appendChild(ol);
+  }
+
+  if (Array.isArray(r.success_criteria) && r.success_criteria.length) {
+    const u = el("ul", "lst ok");
+    r.success_criteria.forEach(c => u.appendChild(el("li", "", "✓ " + c)));
+    card.appendChild(u);
+  }
+  if (Array.isArray(r.contradictions) && r.contradictions.length) {
+    const u = el("ul", "lst warn");
+    r.contradictions.forEach(c => u.appendChild(el("li", "", "⚠ " + c)));
+    card.appendChild(u);
+  }
+  if (Array.isArray(r.unknown_files) && r.unknown_files.length) {
+    const u = el("ul", "lst warn");
+    r.unknown_files.forEach(c => u.appendChild(el("li", "", "? файл вне списка: " + c)));
+    card.appendChild(u);
+  }
+  if (Array.isArray(r.goal_stack) && r.goal_stack.length) {
+    card.appendChild(el("div", "cardfoot", "Цели: " + r.goal_stack.join(" → ")));
+  }
+  const foot = el("div", "cardfoot",
+    "получено " + (r.at || "").replace("T", " ").slice(0, 19) + " (UTC)");
+  if (r.n != null) {
+    const del = el("button", "mini del", "удалить");
+    del.onclick = () => delRecord("report", r);
+    foot.appendChild(document.createTextNode(" "));
+    foot.appendChild(del);
+  }
+  card.appendChild(foot);
+  return card;
+}
+
+/* ---------- удаление записей ---------- */
+async function api(path, data) {
+  const r = await fetch(path, {method: "POST", headers: Object.assign(
+    {"Content-Type": "application/json"}, H()), body: JSON.stringify(data || {})});
+  return r.json();
+}
+// Запрос, который возвращает поток событий SSE: on_token получает куски ответа.
+async function apiStream(path, data, onToken) {
+  const r = await fetch(path, {method: "POST", headers: Object.assign(
+    {"Content-Type": "application/json"}, H()), body: JSON.stringify(data || {})});
+  if (!r.body) return await r.json();
+  const reader = r.body.getReader();
+  const dec = new TextDecoder("utf-8");
+  let buf = "", last = null;
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let cut;
+    while ((cut = buf.indexOf("\n\n")) >= 0) {
+      const chunk = buf.slice(0, cut);
+      buf = buf.slice(cut + 2);
+      for (const line of chunk.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        try { last = JSON.parse(line.slice(5).trim()); } catch (e) {}
+        if (last && onToken) onToken(last);
+      }
+    }
+  }
+  return last || {};
+}
+async function apiGet(path) {
+  const r = await fetch(path, {headers: H()});
+  return r.json();
+}
+async function delRecord(kind, rec) {
+  const n = rec.n ?? "?";
+  if (!confirm(kind === "report" ? "Удалить отчёт №" + n + "?"
+                                  : "Удалить запись диалога №" + n + "?")) return;
+  // rid удаляет ровно одну запись: номер n у разных процессов совпадает
+  const res = await api("/api/delete", {kind: kind, rid: rec.rid || "", n: n,
+                                        at: rec.at || ""});
+  lastSig = "";
+  state();
+}
+async function clearAll(kind) {
+  const label = kind === "report" ? "все отчёты" :
+                (kind === "chat" ? "историю чата" : "весь диалог");
+  if (!confirm("Удалить " + label + "? Это необратимо.")) return;
+  const res = await api("/api/delete", {kind: kind});
+  lastSig = "";
+  state();
+}
+async function clearOld(kind) {
+  const day = new Date(Date.now() - 86400000).toISOString();
+  if (!confirm("Удалить записи старше суток?")) return;
+  await api("/api/delete", {kind: kind, before: day});
+  lastSig = "";
+  state();
+}
+async function clearFallback() {
+  const list = (STATE && STATE.reports) || [];
+  const ids = list.filter(r => r.fallback).map(r => r.n);
+  if (!ids.length) { alert("Заглушек нет — удалять нечего"); return; }
+  if (!confirm("Удалить " + ids.length + " отчёт(ов) из заглушки?")) return;
+  for (const n of ids) await api("/api/delete", {kind: "report", n: n});
+  lastSig = "";
+  state();
+}
+
+/* ---------- память ---------- */
+async function renderMemory(mem) {
+  const bar = clearBox("membar");
+  bar.innerHTML = "";
+  const m = mem || {};
+  bar.appendChild(el("span", "", "память:"));
+  const facts = m.facts || [];
+  if (m.profile) bar.appendChild(el("span", "fact", "профиль: " + m.profile.slice(0, 60)));
+  facts.forEach(f => {
+    const chip = el("span", "fact", f + " ✕");
+    chip.style.cursor = "pointer";
+    chip.title = "нажми, чтобы забыть";
+    chip.onclick = async () => { await api("/api/memory", {action: "remove", fact: f});
+                                state(); };
+    bar.appendChild(chip);
+  });
+  if (!facts.length && !m.profile) {
+    bar.appendChild(el("span", "", "пока пусто — субагент ничего не помнит"));
+  }
+  bar.appendChild(el("span", "", "· реплик в памяти: " + ((m.turns || []).length)));
+  const inp = el("input");
+  inp.placeholder = "запомнить факт о проекте…";
+  inp.style.width = "260px";
+  inp.onkeydown = e => { if (e.key === "Enter") addFact(inp); };
+  bar.appendChild(inp);
+  const btn = el("button", "mini", "Запомнить");
+  btn.onclick = () => addFact(inp);
+  bar.appendChild(btn);
+  if (facts.length || (m.turns || []).length) {
+    const f = el("button", "mini del", "Стереть память");
+    f.onclick = async () => { if (!confirm("Стереть память субагента?")) return;
+                              await api("/api/memory", {action: "forget"}); state(); };
+    bar.appendChild(f);
+  }
+}
+async function addFact(inp) {
+  const v = inp.value.trim();
+  if (!v) return;
+  inp.value = "";
+  await api("/api/memory", {fact: v});
+  state();
+}
+
+/* ---------- чат с субагентом ---------- */
+let chatBusy = false;
+function renderChat(list) {
+  const box = clearBox("chatlog");
+  box.innerHTML = "";
+  if (!list || !list.length) {
+    box.appendChild(el("div", "empty",
+      "напишите первое сообщение — субагент ответит обычным текстом, без JSON"));
+    return;
+  }
+  list.slice(-40).forEach(t => {
+    const me = el("div", "line me");
+    me.appendChild(el("span", "who", "я"));
+    me.appendChild(el("div", "bub", t.question || ""));
+    box.appendChild(me);
+    const ai = el("div", "line ai" + (t.fallback ? " fb" : ""));
+    ai.appendChild(el("span", "who", "субагент"));
+    const b = el("div", "bub");
+    b.appendChild(document.createTextNode(t.reply || "(пусто)"));
+    const meta = [dttm(t.at)];
+    if (t.duration_ms) meta.push("ждание " + sec(t.duration_ms));
+    if (t.tokens_in || t.tokens_out) {
+      meta.push("токены ≈" + (t.tokens_in + t.tokens_out)
+                + (t.tokens_estimate ? " (оценка)" : ""));
+    }
+    if (t.fallback) meta.push("заглушка: Colab недоступен");
+    b.appendChild(el("div", "meta", meta.join(" · ")));
+    ai.appendChild(b);
+    box.appendChild(ai);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+/* ------------------------------ модели: список и переключение ---------- */
+let modelBusy = false;
+function fillDevModels(list) {
+  // Список моделей дублируется в чат режима «Разработка» (третье окно)
+  const sel = document.getElementById("devmodel");
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = "";
+  list.forEach(m => {
+    const o = document.createElement("option");
+    o.value = m.path || "";
+    o.textContent = (m.label || "?") + (m.active ? " ✓" : "");
+    sel.appendChild(o);
+  });
+  const active = (list.filter(m => m.active)[0] || {}).path;
+  if (keep && list.some(m => m.path === keep)) sel.value = keep;
+  else if (active) sel.value = active;
+}
+async function switchModel(path, label, noteId) {
+  if (modelBusy) return;
+  const note = document.getElementById(noteId || "modelnote");
+  if (!confirm("Переключить субагента на " + label +
+               "? Это перезапустит движок в Colab (20–60 с).")) return;
+  modelBusy = true;
+  if (note) note.textContent = "Переключение на " + label + ", обычно 20–60 с…";
+  try {
+    const res = await api("/api/model", {model: path});
+    if (note) {
+      if (res.error) note.textContent = "не вышло: " + res.error;
+      else note.textContent = "Готово: активна " + (res.label || label);
+    }
+  } catch (e) {
+    if (note) note.textContent = "панель не ответила: " + e;
+  } finally {
+    modelBusy = false;
+    loadModels();
+  }
+}
+async function loadModels() {
+  const box = document.getElementById("models");
+  const note = document.getElementById("modelnote");
+  try {
+    const data = await apiGet("/api/models");
+    const list = (data && data.models) || [];
+    document.getElementById("c-model").textContent =
+      data && data.active_label ? data.active_label : "—";
+    box.textContent = "";
+    // Без GPU: честно предупреждаем и предлагаем путь CPU / смена аккаунта
+    const gw = document.getElementById("gpuwarn");
+    if (data && data.gpu === false) {
+      gw.style.display = "block";
+      gw.textContent = "GPU сейчас недоступен (бесплатные GPU-часы, видимо, "
+        + "исчерпаны). Путь: продолжить на CPU с 1.5B/3B (медленно) либо "
+        + "сменить Google-аккаунт — лимит бесплатного Colab обычно даётся "
+        + "на сутки. Проверить состояние: в Colab Сессия → Лимиты.";
+    } else {
+      gw.style.display = "none";
+    }
+    if (!list.length) {
+      box.appendChild(el("div", "empty",
+        "сервер не знает про /models — перезапусти ноутбук Colab"));
+      return;
+    }
+    list.forEach(m => {
+      const row = el("div", "card");
+      const head = el("div", "row between");
+      head.appendChild(el("div", "t",
+        (m.label || "?") + (m.active ? " · активна" : "") + " · " + m.size_gb + " ГБ"));
+      const b = el("button", m.active ? "" : "mini",
+        m.active ? "работает" : "переключить");
+      if (!m.active) b.onclick = () => switchModel(m.path, m.label);
+      head.appendChild(b);
+      row.appendChild(head);
+      row.appendChild(el("div", "mono small", m.path));
+      if (m.hint) row.appendChild(el("div", "hint", "▸ " + m.hint));
+      box.appendChild(row);
+    });
+    fillDevModels(list);
+    if (data && data.switching) note.textContent = "модель переключается…";
+  } catch (e) {
+    box.textContent = "";
+    box.appendChild(el("div", "empty", "не удалось получить модели: " + e));
+  }
+}
+function devSwitchModel(sel) {
+  const opt = sel.options[sel.selectedIndex];
+  const label = (opt && opt.textContent || "").replace(" ✓", "");
+  switchModel(sel.value, label, "modelnote");
+}
+async function sendChat() {
+  if (chatBusy) return;
+  const inp = document.getElementById("chatinput");
+  const msg = inp.value.trim();
+  if (!msg) return;
+  chatBusy = true;
+  inp.value = "";
+  const btn = document.getElementById("chatsend");
+  btn.disabled = true;
+  btn.textContent = "Жду…";
+  const box = clearBox("chatlog");
+  const me = el("div", "line me");
+  me.appendChild(el("span", "who", "я"));
+  me.appendChild(el("div", "bub", msg));
+  box.appendChild(me);
+  const ai = el("div", "line ai");
+  ai.appendChild(el("span", "who", "субагент"));
+  const b = el("div", "bub", "…");
+  ai.appendChild(b);
+  box.appendChild(ai);
+  box.scrollTop = box.scrollHeight;
+  try {
+    // Потоком: текст идёт по мере генерации, поэтому длинный ответ не обрывается
+    // 120-секундным лимитом туннеля, а человек видит текст сразу.
+    const res = await apiStream("/api/chat/stream", {
+      message: msg,
+      memory: document.getElementById("chatmem").checked
+    }, (ev) => {
+      if (ev.type === "token") {
+        b.textContent += ev.text;
+        box.scrollTop = box.scrollHeight;
+      }
+    });
+    if (res.error) {
+      b.textContent = "Ошибка: " + res.error;
+    } else {
+      const r = res.reply || res;
+      b.textContent = r.reply || b.textContent || "(пусто)";
+      const meta = [dttm(r.at)];
+      if (r.duration_ms) meta.push("ждание " + sec(r.duration_ms));
+      if (r.tokens_in || r.tokens_out)
+        meta.push("токены " + (r.tokens_in || 0) + "+" + (r.tokens_out || 0));
+      if (r.memory_used) meta.push("использовал память");
+      if (r.fallback) meta.push("заглушка");
+      b.appendChild(el("div", "meta", meta.join(" · ")));
+    }
+  } catch (e) {
+    b.textContent = "Панель не ответила: " + e;
+  } finally {
+    chatBusy = false;
+    btn.disabled = false;
+    btn.textContent = "Отправить";
+    lastSig = "";
+    state();
+  }
+}
+
+/* ---------- токены ---------- */
+function renderTokens(t) {
+  const box = clearBox("tok-body");
+  box.innerHTML = "";
+  if (!t) { box.appendChild(el("div", "empty", "данных пока нет")); return; }
+  const tin = t.tokens_in || 0, tout = t.tokens_out || 0;
+  const total = tin + tout || 1;
+  if (t.estimate_only && (tin || tout)) {
+    const w = el("div", "warnbox",
+      "Сервер не отдал usage (usage) — цифры ниже посчитаны по длине текста, " +
+      "это оценка. После перезапуска Colab с сегодняшним сервером часть " +
+      "вызовов станет точной.");
+    w.style.display = "block";
+    w.style.margin = "0 0 10px";
+    box.appendChild(w);
+  }
+  const bar = el("div", "tokbar");
+  const i = el("i", "in"); i.style.width = (100 * tin / total) + "%";
+  const o = el("i", "out"); o.style.width = (100 * tout / total) + "%";
+  bar.appendChild(i); bar.appendChild(o);
+  box.appendChild(bar);
+  const lg = el("div", "legend");
+  lg.appendChild(el("span", "", "в промт: "));
+  lg.appendChild(el("b", "", tin));
+  lg.appendChild(el("span", "", " · из ответа: "));
+  lg.appendChild(el("b", "", tout));
+  lg.appendChild(el("span", "", " · всего: "));
+  lg.appendChild(el("b", "", tin + tout));
+  lg.appendChild(el("span", "", " · вызовов: " + (t.calls || 0)));
+  box.appendChild(lg);
+
+  const hist = (t.history || []).slice(-30);
+  if (hist.length) {
+    const sp = el("div", "spark");
+    const mx = Math.max.apply(null, hist.map(h => (h.in || 0) + (h.out || 0)).concat([1]));
+    hist.forEach(h => {
+      const b = el("i");
+      b.style.height = Math.max(2, 58 * ((h.in || 0) + (h.out || 0)) / mx) + "px";
+      b.title = dttm(h.at) + " " + (h.kind || "") + ": " + (h.in || 0) + "+" + (h.out || 0);
+      sp.appendChild(b);
+    });
+    box.appendChild(sp);
+    box.appendChild(el("div", "legend", "столбики — токены по вызовам (слева старее)"));
+  }
+
+  const rows = [["когда", "тип", "в промт", "из ответа", "всего", "точность"]];
+  hist.slice().reverse().slice(0, 20).forEach(h => {
+    rows.push([dttm(h.at), h.kind || "—", h.in || 0, h.out || 0,
+               (h.in || 0) + (h.out || 0), h.estimate ? "оценка" : "точно"]);
+  });
+  const tbl = el("table", "tk");
+  rows.forEach((r, idx) => {
+    const tr = el("tr");
+    r.forEach(cell => {
+      const tag = idx === 0 ? "th" : "td";
+      tr.appendChild(el(tag, "", String(cell)));
+    });
+    tbl.appendChild(tr);
+  });
+  box.appendChild(tbl);
+  if (t.note) box.appendChild(el("div", "meta", t.note));
+}
+
+/* ---------- диалог ---------- */
+function renderDialog(list) {
+  const box = document.getElementById("dialog");
+  box.innerHTML = "";
+  document.getElementById("c-int").textContent = list.length;
+  if (!list.length) {
+    box.appendChild(el("div", "empty", "обращений пока не было"));
+    return;
+  }
+  list.slice().reverse().forEach(m => {
+    const card = el("div", "msg");
+    const h1 = el("div", "msghead");
+    h1.appendChild(el("span", "who me", "Я запросил"));
+    h1.appendChild(el("span", "", dttm(m.at)));
+    h1.appendChild(el("span", "", "ждание " + sec(m.duration_ms)));
+    const st = el("span", "st " + (m.fallback ? "fb" : (m.ok ? "ok" : "bad")),
+                  m.fallback ? "Colab недоступен → заглушка"
+                             : (m.ok ? "ответ получен" : "ошибка"));
+    h1.appendChild(st);
+    if (m.source) h1.appendChild(el("span", "", "источник: " + m.source));
+    if (m.plan_id) h1.appendChild(el("span", "", "plan " + m.plan_id));
+    card.appendChild(h1);
+
+    const ask = el("div", "bubble ask");
+    ask.appendChild(el("span", "sub",
+      (m.kind === "reflect" ? "Сообщение субагенту (рефлексия шага)" :
+       m.kind === "chat" ? "Сообщение в чате (человек)" :
+       m.kind === "dev" ? "Запрос режима «Разработка»" :
+       "Задача для планирования")));
+    ask.appendChild(document.createTextNode(m.request || ""));
+    card.appendChild(ask);
+
+    const h2 = el("div", "msghead");
+    h2.appendChild(el("span", "who sub", "Субагент ответил"));
+    if (m.n != null) {
+      const del = el("button", "mini del", "удалить");
+      del.onclick = () => delRecord("dialog", m);
+      h2.appendChild(document.createTextNode(" "));
+      h2.appendChild(del);
+    }
+    card.appendChild(h2);
+    const ans = el("div", "bubble ans", m.summary || "—");
+    card.appendChild(ans);
+    box.appendChild(card);
+  });
+}
+
+/* ---------- выгода ---------- */
+function renderBenefit(b) {
+  if (!b) return;
+  const kpis = [
+    [b.calls_total, "обращений всего (" + (b.period || "за период") + ")"],
+    [b.calls_agent, "обращений агента (CLI: план/рефлексия/код)"],
+    [b.calls_chat, "обращений через чат (человек)"],
+    [b.plans, "планов составлено"],
+    [b.reflects, "рефлексий"],
+    [b.steps_generated, "шагов плана готово"],
+    [b.reports, "отчётов в журнале"],
+    [(b.avg_answer_ms / 1000).toFixed(1) + " с", "среднее время ответа"],
+    [(b.max_answer_ms / 1000).toFixed(1) + " с", "самый долгий ответ"],
+    [(b.blocked_ms / 1000).toFixed(1) + " с", "ожидание (блокировало работу)"],
+    [(b.background_ms / 1000).toFixed(1) + " с", "выполнено в фоне"],
+    [b.fallbacks, "срабатываний заглушки"],
+    [b.errors, "ошибок"],
+    [b.calls_total ? Math.round(100 * b.calls_ok / b.calls_total) + "%" : "—",
+     "доля успешных ответов"],
+  ];
+  const box = document.getElementById("kpis");
+  box.innerHTML = "";
+  kpis.forEach(([v, k]) => {
+    const c = el("div", "kpi");
+    c.appendChild(el("div", "v", String(v)));
+    c.appendChild(el("div", "k", k));
+    box.appendChild(c);
+  });
+  const ul = document.getElementById("benefit-notes");
+  ul.innerHTML = "";
+  (b.notes || []).forEach(n => ul.appendChild(el("li", "", n)));
+}
+
+/* ---------- рефлексия по метрикам ---------- */
+async function runReflect() {
+  const note = document.getElementById("refnote");
+  const btn = note.previousElementSibling;
+  if (btn) btn.disabled = true;
+  note.textContent = "размышляю над метриками…";
+  try {
+    const res = await api("/api/reflect-metrics", {
+      engine: document.getElementById("refengine").value,
+      since: sinceIso()
+    });
+    if (res.error) { note.textContent = "ошибка: " + res.error; return; }
+    const r = res.result || {};
+    const box = document.getElementById("refbox");
+    box.innerHTML = "";
+    const card = el("div", "card");
+    const head = el("div", "cardhead");
+    head.appendChild(el("span", "chip chip-reflect",
+      "РЕФЛЕКСИЯ МЕТРИК · " + (r.status || "?")));
+    head.appendChild(el("span", "", dttm(new Date().toISOString())));
+    head.appendChild(el("span", "", "период: " + (r.period || "")));
+    head.appendChild(el("span", "", "движок: " + (r.engine || "")));
+    card.appendChild(head);
+    card.appendChild(el("h3", "", r.advice || "(без совета)"));
+    if (r.rationale) card.appendChild(el("p", "why", "Почему так: " + r.rationale));
+    if (r.metrics) card.appendChild(el("p", "ask", "Метрики: " + r.metrics));
+    box.appendChild(card);
+    note.textContent = "готово за " + sec(r.duration_ms) + " · совет сохранён в "
+      + (r.saved_to || "logs/thinking/reflections.md") + " · отчёт — во вкладке «Отчёты»";
+    lastSig = "";
+    state();
+  } catch (e) {
+    note.textContent = "панель не ответила: " + e;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ---------- режим разработчика ---------- */
+let devCurrent = "", devBusy = false, devPending = null;
+
+async function devRefresh(keep) {
+  try {
+    const data = await apiGet("/api/dev/files");
+    if (data.error) { devOut("dev: " + data.error, "err"); return; }
+    const files = data.files || [];
+    if (data.root) document.getElementById("devroot").textContent = data.root;
+    const sel = document.getElementById("devsel");
+    const cur = keep || devCurrent || sel.value;
+    sel.innerHTML = "";
+    files.forEach(f => {
+      const o = document.createElement("option");
+      o.value = f.name;
+      o.textContent = f.name;
+      sel.appendChild(o);
+    });
+    const pick = files.some(f => f.name === cur) ? cur : (files[0] || {}).name || "";
+    if (pick) {
+      sel.value = pick;
+      await devOpen(pick, true);
+    } else {
+      devCurrent = "";
+      document.getElementById("devfname").textContent = "—";
+    }
+    devLog();
+  } catch (e) {
+    devOut("не удалось получить файлы: " + e, "err");
+  }
+}
+async function devOpen(name, silent) {
+  if (!name) return;
+  try {
+    const d = await apiGet("/api/dev/file?name=" + encodeURIComponent(name));
+    if (d.error) { devOut(d.error, "err"); return; }
+    document.getElementById("devcode").value = d.content || "";
+    devCurrent = d.name;
+    document.getElementById("devfname").textContent = d.name;
+    document.getElementById("devsel").value = d.name;
+    if (!silent) devOut("открыт " + d.name, "info");
+  } catch (e) {
+    devOut("не открылся " + name + ": " + e, "err");
+  }
+}
+function devOut(text, cls) {
+  const box = document.getElementById("devout");
+  if (box.dataset.empty !== "no") { box.textContent = ""; box.dataset.empty = "no"; }
+  const line = document.createElement("div");
+  line.className = cls || "";
+  line.textContent = text;
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+}
+function devNew() {
+  const name = (prompt("Имя нового файла в dev_sandbox/ (например myscript.py):",
+                       "myscript.py") || "").trim();
+  if (!name) return;
+  devCurrent = name;
+  document.getElementById("devfname").textContent = name + " (новый)";
+  document.getElementById("devsel").value = "";
+  document.getElementById("devcode").value = "";
+  devOut("новый файл: " + name + " — напишите код и «Сохранить» "
+         + "(или попросите модель справа)", "info");
+}
+async function devSave(source) {
+  const name = devCurrent || document.getElementById("devsel").value;
+  if (!name) { alert("сначала выберите или создайте файл"); return ""; }
+  try {
+    const r = await api("/api/dev/file", {
+      name: name,
+      content: document.getElementById("devcode").value,
+      source: source || "user"
+    });
+    if (r.error) { devOut("не записалось: " + r.error, "err"); return ""; }
+    devOut((r.existed ? "сохранено (откат доступен): " : "создано: ") + r.name, "ok");
+    devRefresh(r.name);
+    return r.name;
+  } catch (e) {
+    devOut("панель не ответила: " + e, "err");
+    return "";
+  }
+}
+async function devRollback() {
+  const name = devCurrent || document.getElementById("devsel").value;
+  if (!name) return;
+  try {
+    const r = await api("/api/dev/rollback", {name: name});
+    if (r.error) { devOut("откат не удался: " + r.error, "err"); return; }
+    devOut("откат: " + r.name + " ← " + r.restored + " (осталось откатов: "
+           + r.left + ")", "ok");
+    devRefresh(r.name);
+  } catch (e) {
+    devOut("панель не ответила: " + e, "err");
+  }
+}
+async function devRun(name) {
+  name = name || devCurrent || document.getElementById("devsel").value;
+  if (!name) { devOut("нет файла для запуска", "err"); return; }
+  devOut("$ python " + name, "cmd");
+  try {
+    const r = await api("/api/dev/run", {name: name});
+    if (r.error) { devOut("ошибка запуска: " + r.error, "err"); return; }
+    if (r.stdout) devOut(r.stdout, "out");
+    if (r.stderr) devOut(r.stderr, "err");
+    devOut("[код выхода: " + r.code + "]", r.code === 0 ? "ok" : "err");
+  } catch (e) {
+    devOut("панель не ответила: " + e, "err");
+  }
+}
+async function devLog() {
+  try {
+    const d = await apiGet("/api/dev/log");
+    const box = document.getElementById("devloglist");
+    box.innerHTML = "";
+    const rows = (d.log || []).slice(-40);
+    if (!rows.length) {
+      box.appendChild(el("div", "empty", "журнал пуст"));
+      return;
+    }
+    rows.forEach(r => {
+      box.appendChild(el("div", "devlogline",
+        hhmm(r.ts) + "  " + r.who + " · " + r.action
+        + (r.file ? " · " + r.file : "") + (r.ok === false ? " · ОШИБКА" : "")));
+    });
+    box.scrollTop = box.scrollHeight;
+  } catch (e) { /* журнал не критичен */ }
+}
+async function devDump() {
+  try {
+    const r = await api("/api/devump", {});
+    if (r.error) { devOut("дамп не собрался: " + r.error, "err"); return; }
+    devOut("дамп собран: " + r.path, "ok");
+  } catch (e) {
+    devOut("дамп: " + e, "err");
+  }
+}
+function devChatAdd(who, text) {
+  const box = document.getElementById("devchat");
+  const d = el("div", "devmsg " + (who === "me" ? "me" : "ai"),
+               (who === "me" ? "я: " : "модель: ") + text);
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+async function devSend() {
+  if (devBusy) return;
+  const inp = document.getElementById("devinput");
+  const msg = inp.value.trim();
+  if (!msg) return;
+  devBusy = true;
+  inp.value = "";
+  const btn = document.getElementById("devsend");
+  btn.disabled = true;
+  btn.textContent = "Жду…";
+  devChatAdd("me", msg);
+  try {
+    const res = await api("/api/dev/chat",
+      {message: msg, active: devCurrent || document.getElementById("devsel").value});
+    if (res.error) { devChatAdd("ai", "Ошибка: " + res.error); return; }
+    const p = res.proposal || {};
+    if (p.action === "none" || !p.code) {
+      devChatAdd("ai", p.comment || "(модель не стала менять файлы)");
+    } else {
+      devChatAdd("ai", (p.action === "create" ? "Предлагаю создать файл "
+                                               : "Предлагаю изменить файл ")
+                 + p.filename + ". " + (p.comment || ""));
+      showDevConfirm(p);
+    }
+  } catch (e) {
+    devChatAdd("ai", "Панель не ответила: " + e);
+  } finally {
+    devBusy = false;
+    btn.disabled = false;
+    btn.textContent = "Отправить";
+  }
+}
+/* Контрольное окно: ничего не применяется без решения человека */
+function showDevConfirm(p) {
+  devPending = p;
+  const box = document.getElementById("devconfirmtxt");
+  box.innerHTML = "";
+  box.appendChild(el("div", "",
+    "Файл: " + (p.filename || "?") + " — "
+    + (p.action === "create" ? "создать новый" : "заменить существующий")));
+  if (p.comment) box.appendChild(el("p", "meta", "Комментарий модели: " + p.comment));
+  const full = String(p.code || "");
+  const pre = el("pre", "codesample",
+    full.slice(0, 2000) + (full.length > 2000
+      ? "\n… (ещё " + (full.length - 2000) + " символов — применятся целиком)" : ""));
+  box.appendChild(pre);
+  document.getElementById("devconfirm").classList.add("on");
+}
+async function devConfirmAnswer(kind) {
+  document.getElementById("devconfirm").classList.remove("on");
+  const p = devPending;
+  devPending = null;
+  if (!p) return;
+  if (kind === "no") {
+    devChatAdd("ai", "Применение отменено человеком.");
+    return;
+  }
+  const name = await devSave("model");
+  if (!name) {
+    devChatAdd("ai", "Изменение НЕ применено: файл не записался (см. вывод).");
+    return;
+  }
+  devChatAdd("ai", "Применено: " + name + ". Старая версия сохранена для отката.");
+  if (kind === "run") devRun(name);
+}
+
+/* ---------- живые события: связь и журнал ---------- */
+function addSviz(ev) {
+  const box = clearBox("live");
+  const d = el("div", "ev " + (ev.type || "interaction"));
+  d.appendChild(el("span", "t", hhmm(ev.ts)));
+  d.appendChild(el("span", "txt", String(ev.text || "")));
+  box.appendChild(d);
+  while (box.children.length > 500) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+  document.getElementById("c-live").textContent = box.children.length;
+}
+function renderSviz(list) {
+  const box = document.getElementById("live");
+  box.innerHTML = "";
+  document.getElementById("c-live").textContent = (list || []).length;
+  if (!list || !list.length) {
+    box.appendChild(el("div", "empty",
+      "обращений за период нет: планы, рефлексии, чат и запросы «Разработки» "
+      + "появятся здесь"));
+    return;
+  }
+  list.slice().reverse().forEach(m => {
+    const d = el("div", "ev interaction");
+    d.appendChild(el("span", "t", dttm(m.at)));
+    const tail = (m.ok ? "" : " — ошибка")
+               + (m.fallback ? " (заглушка)" : "");
+    d.appendChild(el("span", "txt",
+      kindLabel(m.kind) + ": " + String(m.request || "").slice(0, 300) + tail));
+    box.appendChild(d);
+  });
+}
+function addLog(ev) {
+  const box = clearBox("log");
+  const d = el("div", "ev " + (ev.type || "thought"));
+  d.appendChild(el("span", "t", hhmm(ev.ts)));
+  d.appendChild(el("span", "txt", String(ev.text || "")));
+  box.appendChild(d);
+  while (box.children.length > 800) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+function handle(ev) {
+  if (!ev || !ev.type) return;
+  if (ev.type === "token") return;
+  // Обращения — в «Связь агентов», всё остальное — технический «Журнал»
+  if (ev.type === "interaction" || ev.type === "dev") { addSviz(ev); return; }
+  addLog(ev);
+  if (ev.type === "final" || ev.type === "plan") { lastSig = ""; state(); }
+}
+
+/* ---------- состояние ---------- */
+async function state() {
+  try {
+    const r = await fetch(STATE_URL + "?since=" + encodeURIComponent(sinceIso()),
+                          {headers: H()});
+    const s = await r.json();
+    STATE = s;
+    setBadge(!!s.online);
+    // Токен: авто-режим — поле заполняется из config, если человек не ввёл сам
+    if (!TOKEN && s.token) {
+      TOKEN = s.token;
+      const ti = document.getElementById("tok");
+      ti.value = TOKEN;
+      ti.title = "автоматически из config/thinking.local.json";
+      ti.style.color = "#7ee787";
+    }
+    const h = s.health || {};
+    document.getElementById("meta").textContent =
+      (s.base ? s.base.replace(/^https?:\/\//, "") : "URL не задан")
+      + (h.model ? " · " + h.model : "")
+      + (h.gpu ? " · " + h.gpu : "")
+      + (h.uptime_s != null ? " · поднят " + h.uptime_s + " с назад" : "")
+      + (s.last_seq ? " · seq " + s.last_seq : "")
+      + (s.last_error ? " · " + s.last_error : "");
+    showLimitWarn(h);
+    const sig = JSON.stringify([s.interactions, s.reports, s.benefits,
+                                s.chat, s.tokens]);
+    if (sig !== lastSig) {
+      lastSig = sig;
+      renderReports(s.reports || []);
+      renderDialog(s.interactions || []);
+      renderSviz(s.interactions || []);
+      renderBenefit(s.benefits);
+      renderChat(s.chat || []);
+      renderTokens(s.tokens);
+    }
+    renderMemory(s.memory);
+  } catch (e) { setBadge(false); }
+}
+/* Лимиты бесплатного Colab: чётких квот нет, цифры в сообщениях — ориентир.
+   GPU-сессии обычно 2–4 ч; остаток CPU (бывает и ~28 ч) не гарантия. Если
+   встало — смотри в Colab: Сессия → Лимиты; лимиты часто возвращаются
+   примерно через сутки (или смена аккаунта). Путь: дотянуть на GPU → CPU →
+   сменить аккаунт. */
+function showLimitWarn(h) {
+  const w = document.getElementById("limitwarn");
+  const up = Number(h.uptime_s || 0);
+  const gpu = h.gpu != null && String(h.gpu) !== "cpu";
+  const noGpu = h.gpu != null && String(h.gpu) === "cpu";
+  const parts = [];
+  if (gpu && up >= 7200) {
+    parts.push("GPU-сессия идёт уже " + Math.round(up / 60) + " мин: бесплатный "
+      + "GPU в Colab обычно живёт 2–4 часа (это не баг, а особенность). "
+      + "Сохрани ноутбук заранее: дальше — CPU с 1.5B/3B, либо пауза ~сутки "
+      + "(лимиты часто возвращаются через 24 ч), либо другой аккаунт.");
+  }
+  if (gpu && up >= 13500) {
+    parts.push("Сессия подолгу на GPU — если работа встала, проверь Colab: "
+      + "Сессия → Лимиты; время бывает разным и не гарантировано.");
+  }
+  if (!gpu && up >= 93600) {
+    parts.push("CPU-сессия работает уже " + Math.round(up / 3600) + " ч: Colab "
+      + "показывал остаток в десятки часов, но это лишь ориентир — при "
+      + "остановке проверь Сессия → Лимиты (обычно возвращаются через сутки).");
+  }
+  if (noGpu && up >= 600) {
+    parts.push("GPU сейчас недоступен (бесплатные GPU-часы, видимо, исчерпаны): "
+      + "работаем на CPU с 1.5B/3B; восстановить GPU — подождать ~сутки или "
+      + "сменить Google-аккаунт. Альтернатива на будущее: Kaggle (~30 ч GPU "
+      + "в неделю), Paperspace Gradient, локальный runtime.");
+  }
+  if (parts.length) {
+    w.textContent = parts.join(" ");
+    w.style.display = "block";
+  } else {
+    w.style.display = "none";
+  }
+}
+function setBadge(on) {
+  const b = document.getElementById("badge");
+  b.className = on ? "on" : "off";
+  b.textContent = on ? "СУБАГЕНТ НА СВЯЗИ" : "НЕТ СВЯЗИ (реконнект…)";
+}
+
+/* ---------- экспорт ---------- */
+function exportMd() {
+  const s = STATE || {};
+  const L = ["# Отчёт субагента «Мышление»", ""];
+  L.push("Дата выгрузки: " + new Date().toISOString().slice(0, 19).replace("T", " "));
+  L.push("Период: " + (PERIOD === "today" ? "за сегодня" : "за всё время"));
+  L.push("Связь: " + (s.online ? "на связи" : "нет связи") + " (" + (s.base || "—") + ")", "");
+  L.push("## Диалог", "");
+  (s.interactions || []).slice().reverse().forEach(m => {
+    L.push("### " + (m.at || "") + " — " + kindLabel(m.kind));
+    L.push("- ожидание: " + sec(m.duration_ms) +
+           (m.fallback ? " (заглушка)" : m.ok ? "" : " (ошибка)"));
+    L.push("- запрос: " + String(m.request || "").replace(/\n/g, " "));
+    L.push("- ответ: " + String(m.summary || "").replace(/\n/g, " "), "");
+  });
+  L.push("## Отчёты", "");
+  (s.reports || []).slice().reverse().forEach(r => {
+    L.push("### " + (r.goal || r.task || r.type));
+    if (r.rationale) L.push("- почему: " + r.rationale);
+    if (r.advice) L.push("- совет: " + r.advice);
+    (r.steps || []).forEach(st => L.push("- [" + st.id + "] " + (st.action_ru || "шаг") +
+      ": " + st.desc + (st.expected ? " (ожидаем: " + st.expected + ")" : "")));
+    (r.success_criteria || []).forEach(c => L.push("- ✓ " + c));
+    (r.contradictions || []).forEach(c => L.push("- ⚠ " + c));
+    L.push("");
+  });
+  const b = s.benefits || {};
+  L.push("## Выгода", "");
+  (b.notes || []).forEach(n => L.push("- " + n));
+  const blob = new Blob([L.join("\n")], {type: "text/markdown;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "thinking_report.md";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------- запуск ---------- */
+function connect() {
+  if (es) { es.close(); es = null; }
+  es = new EventSource("/events");
+  es.onopen = () => setBadge(true);
+  es.onerror = () => setBadge(false);
+  es.onmessage = e => { try { handle(JSON.parse(e.data)); } catch (err) {} };
+}
+document.getElementById("tok").value = TOKEN;
+document.getElementById("chatinput").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendChat(); }
+});
+document.getElementById("devinput").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); devSend(); }
+});
+connect();
+state();
+setInterval(state, 2500);
+setInterval(() => { if (es && es.readyState === 2) connect(); }, 5000);
+loadModels();
+</script>
+</body>
+</html>

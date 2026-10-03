@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "base_url": "",
+  "timeout": 45,
+  "connect_timeout": 5,
+  "retry": {
+    "max_attempts": 3,
+    "backoff_base": 1.5,
+    "max_backoff": 15
+  },
+  "stream": true,
+  "stream_timeout": 40,
+  "fallback_on_error": true,
+  "reconnect_delay": 5,
+  "panel_poll": 5,
+  "plan_timeout": 180,
+  "reflect_timeout": 180,
+  "log_path": "logs/thinking/thoughts.jsonl",
+  "log_max_bytes": 5242880,
+  "interactions_path": "logs/thinking/interactions.jsonl",
+  "reports_path": "logs/thinking/reports.jsonl",
+  "panel_host": "127.0.0.1",
+  "panel_port": 8765,
+  "source": "colab",
+  "comment": "Секреты сюда НЕ пишутся: base_url/token берутся из config/thinking.local.json либо из переменных THINKING_URL / THINKING_TOKEN. plan_timeout/reflect_timeout большие из-за CPU-инференса в Colab без GPU-ускорения. stream_timeout обязан быть больше интервала ping сервера (25 с), иначе поток событий рвётся по таймауту."
+}

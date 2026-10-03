@@ -1,0 +1,18 @@
+# === Секреты: НИКОГДА не попадают в git ===
+# base_url + токен Colab пишет команда set-url; шаблон — config/thinking.local.json.example
+config/thinking.local.json
+
+# === Локальная история (переписка, события, отчёты) — только на ПК ===
+logs/
+
+# === Артефакты Python ===
+__pycache__/
+*.py[cod]
+
+# === Рабочие артефакты подсистемы ===
+dumps/
+colab_downloads/
+dev_sandbox/
+_thinking_colab.zip
+*.bak
+.ipynb_checkpoints/
