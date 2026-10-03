@@ -797,6 +797,10 @@ def test_quickwins() -> None:
           "CI: GitHub Actions гоняет офлайн-тесты")
     check((ROOT / "CHANGELOG.md").read_text(encoding="utf-8").count("##") >= 2,
           "CHANGELOG.md: есть разделы по датам")
+    check("PYTHONUTF8" in wf_text,
+          "CI: PYTHONUTF8=1 — русский stdout на windows-раннере")
+    check("reconfigure" in Path(__file__).read_text(encoding="utf-8"),
+          "тесты: stdout переконфигурируются в utf-8 (cp1252-раннеры)")
 
     # --- тайминги под медленную модель и «окна» туннеля ---
     check('"chat_json_timeout", 300' in client_src,
@@ -810,6 +814,14 @@ def test_quickwins() -> None:
 
 
 def main() -> int:
+    # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
+    # по-русски — без переконфигурации финальный счётчик роняет процесс
+    # UnicodeEncodeError. Локально (cp1251/utf-8) и на Linux этого не видно.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     test_schemas()
     test_fallback()
     test_client()

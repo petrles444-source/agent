@@ -63,17 +63,18 @@ MODELS = [m for m in (open(models_file, encoding="utf-8").read().split("\n")
 print("MODEL:", MODEL, "| запасные:", [os.path.basename(m) for m in MODELS[1:]])
 
 # Длина ответа подбирается под скорость модели на этом рантайме.
-# Замерено на Colab CPU (2 ядра): Qwen2.5-1.5B ≈ 6 ток/с, 3B ≈ 2.5 ток/с.
-# Бесплатный туннель Cloudflare обрывает запрос на 120-й секунде (HTTP 524),
-# поэтому лимит такой, чтобы ответ уходил за один раз: 400 токенов ≈ 70–90 с.
-# С видеокартой можно поставить больше: THINKING_MAX_TOKENS = "700".
-MAX_TOKENS_BY_MODEL = {"1.5b": "400", "3b": "260", "7b": "240"}
+# Замерено на Colab CPU (2 ядра): Qwen2.5-1.5B ≈ 6 ток/с, 3B ≈ 2.5 ток/с,
+# 7B ≈ 1.3 ток/с. Режим «сильнее и дольше» (выбор пользователя): под 7B
+# бюджеты подняты 500/800; не-потоковый ответ на 124.8 с через туннель
+# прошёл (живая проба 03.10), старый страх обрыва на 120-й секунде
+# себя не оправдал. С видеокартой можно больше: THINKING_MAX_TOKENS = "700".
+MAX_TOKENS_BY_MODEL = {"1.5b": "400", "3b": "260", "7b": "500"}
 _key = next((k for k in MAX_TOKENS_BY_MODEL
              if k in os.path.basename(MODEL).lower()), "3b")
 os.environ.setdefault("THINKING_MAX_TOKENS", MAX_TOKENS_BY_MODEL[_key])
 # Для потокового чата (/chat/stream) можно больше: токены идут по мере генерации,
 # туннель Cloudflare не рвёт соединение, а человек видит текст сразу.
-CHAT_TOKENS_BY_MODEL = {"1.5b": "700", "3b": "500", "7b": "500"}
+CHAT_TOKENS_BY_MODEL = {"1.5b": "700", "3b": "500", "7b": "800"}
 os.environ.setdefault("THINKING_CHAT_MAX_TOKENS",
                       CHAT_TOKENS_BY_MODEL[_key])
 # Активная модель — в файле: его читает и сервер (вкладка «Модели» в панели),

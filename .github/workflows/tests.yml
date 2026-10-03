@@ -13,6 +13,9 @@ jobs:
   offline:
     name: офлайн-проверки (Python ${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Русские строки в stdout: на windows-latest локаль cp1252 роняет print
+      PYTHONUTF8: "1"
     strategy:
       fail-fast: false
       matrix:
