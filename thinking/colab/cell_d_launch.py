@@ -108,10 +108,11 @@ subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
 time.sleep(2)
 
 
-def wait_http(url, tries=150, gap=2, payload=None):
+def wait_http(url, tries=150, gap=2, payload=None, headers=None):
     for _ in range(tries):
         try:
-            r = requests.get(url, timeout=4) if payload is None else None
+            r = (requests.get(url, timeout=4, headers=headers)
+                 if payload is None else None)
             if r is not None and r.status_code == 200:
                 return r
         except Exception:
@@ -341,7 +342,10 @@ except Exception as _smoke_exc:
 assert os.path.exists("/content/thinking_server.py"), "сначала ячейка C (сервер)"
 os.environ["THINKING_UPSTREAM"] = "http://127.0.0.1:8001/v1/chat/completions"
 api_cmd = [sys.executable, "-m", "uvicorn", "thinking_server:app",
-           "--host", "127.0.0.1", "--port", "8000", "--app-dir", "/content"]
+           "--host", "127.0.0.1", "--port", "8000", "--app-dir", "/content",
+           # токен уезжает в query (/health?token=…) и оседал бы в api.log,
+           # а api.log уходит в GET /dump/api.log наружу (аудит B)
+           "--no-access-log"]
 with open(LOG_API, "a", encoding="utf-8") as _fh:
     _fh.write(f"\n--- {time.strftime('%H:%M:%S')} {api_cmd}\n")
 # with закрывает родительскую копию хендлера (процессу достаётся своя) —
@@ -352,17 +356,11 @@ with open(LOG_API, "a", encoding="utf-8") as _fh:
 print("api pid", api_proc.pid)
 
 hdr = {"X-Agent-Token": TOKEN}
-health_api = wait_http("http://127.0.0.1:8000/health", tries=60, gap=1)
-# /health требует токен, поэтому просто бьём до тех пор, пока не получим 200
-for _ in range(60):
-    try:
-        r = requests.get("http://127.0.0.1:8000/health", headers=hdr, timeout=4)
-        if r.status_code == 200:
-            health_api = r
-            break
-    except Exception:
-        pass
-    time.sleep(1)
+# /health требует токен: без заголовка wait_http получал 401 на каждой из
+# 60 попыток и крутить их впустую — ровно 60 с мёртвого времени на каждый
+# запуск ячейки D, после чего всё равно выполнялся отдельный цикл с hdr
+# (аудит B, 03-colab)
+health_api = wait_http("http://127.0.0.1:8000/health", tries=60, gap=1, headers=hdr)
 if health_api is None:
     print("\n".join(open(LOG_API, encoding="utf-8", errors="replace").readlines()[-40:]))
     raise RuntimeError("uvicorn thinking_server не стартовал")

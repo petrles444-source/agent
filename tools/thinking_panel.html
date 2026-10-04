@@ -1892,7 +1892,7 @@ async function state() {
     }
     const h = s.health || {};
     document.getElementById("meta").textContent =
-      (s.base ? s.base.replace(/^https?:\/\//, "") : "URL не задан")
+      (s.base_host ? s.base_host : "URL не задан")
       + (h.model ? " · " + h.model : "")
       + (h.gpu ? " · " + h.gpu : "")
       + (h.uptime_s != null ? " · поднят " + h.uptime_s + " с назад" : "")
@@ -1967,7 +1967,7 @@ function exportMd() {
   const L = ["# Отчёт субагента «Мышление»", ""];
   L.push("Дата выгрузки: " + new Date().toISOString().slice(0, 19).replace("T", " "));
   L.push("Период: " + (PERIOD === "today" ? "за сегодня" : "за всё время"));
-  L.push("Связь: " + (s.online ? "на связи" : "нет связи") + " (" + (s.base || "—") + ")", "");
+  L.push("Связь: " + (s.online ? "на связи" : "нет связи") + " (" + (s.base_host || "—") + ")", "");
   L.push("## Диалог", "");
   (s.interactions || []).slice().reverse().forEach(m => {
     L.push("### " + (m.at || "") + " — " + kindLabel(m.kind));

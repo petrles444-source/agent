@@ -248,13 +248,23 @@ class MockState:
             "tokens_in": 0, "tokens_out": 0,
         }
         self.llm_ms: list[int] = []
+        # «Манифест» дополнительных движков — как его пишет ячейка D
+        # (cell_c:1279-1293). Держим в состоянии, чтобы /parallel и
+        # /ask/multi считали одно и то же: у настоящего сервера
+        # targets = [(основная, UPSTREAM)] + _parallel_models()
+        # (cell_c:1322-1324), и оба маршрута обязаны сходиться.
+        self.parallel: list[dict] = [
+            {"label": "MOCK-7B", "path": "mock://7b", "url": "local-mock"}]
 
     # -------------------------------------------------------------- события --
     def emit(self, etype: str, text: str, **extra: Any) -> dict:
         with self.lock:
             self.seq += 1
             ev = {"seq": self.seq, "type": etype, "text": str(text)[:800],
-                  "at": utcnow(), **extra}
+                  # ключ ts, как у настоящего сервера (cell_c:245): панель
+                  # читает ev.ts, и на ключе «at» лента мыслей показывала
+                  # бы пустое время (аудит A-4, 04-tests-mock)
+                  "ts": utcnow(), **extra}
             self.events.append(ev)
             if len(self.events) > 500:
                 del self.events[:-500]
@@ -468,8 +478,15 @@ def make_handler(state: MockState) -> type:
 
         # ------------------------------------------------------------ ответы
         def _bad_json(self) -> None:
+            """Прокси отдал HTML вместо JSON.
+
+            Сам сервер так не умеет: `plan_data`/`guard_reply`/`reflect_data`
+            мягко деградируют в валидный ответ (cell_c:586-680). Этот режим
+            воспроизводит ошибку уже на стороне доставки — Cloudflare/captive
+            portal отдаёт 200 с HTML, и клиент обязан это пережить.
+            """
             state.count("bad_json")
-            state.emit("error", "заглушка: режим badjson отдал не-JSON")
+            state.emit("error", "заглушка: прокси отдал HTML вместо JSON")
             self._send(200, "<html>это не JSON</html>".encode("utf-8"),
                        "text/html; charset=utf-8")
 
@@ -503,9 +520,11 @@ def make_handler(state: MockState) -> type:
             # /v1/* открыт — это upstream для llama.cpp, у него своих нет.
             if not self._authorized():
                 return
-            if state.mode == "error":
-                self._fail()
-                return
+            # Режим error НЕ гасит /health: у настоящего сервера /health от
+            # LLM не зависит и всегда 200 (cell_c:716-728), поэтому сценарий
+            # «health жив, контентные маршруты 503» должен быть воспроизводим
+            # (аудит A-4, 04-tests-mock: раньше заглушка гасила всё, и тест
+            # закреплял «сервер упал» вместо «LLM упала»).
             if route == "/health":
                 self._send(200, _health(state))
             elif route == "/metrics":
@@ -542,9 +561,10 @@ def make_handler(state: MockState) -> type:
                 self._send(200, {
                     "active": "MOCK",
                     "url": "local-mock",
-                    "extra": [{"label": "MOCK-7B", "path": "mock://7b",
-                               "url": "local-mock"}],
-                    "count": 1,
+                    "extra": list(state.parallel),
+                    # count = len(extra), как cell_c:1300-1304: это число
+                    # ДОПОЛНИТЕЛЬНЫХ движков, а не всех отвечающих
+                    "count": len(state.parallel),
                 })
             elif route.startswith("/dump/"):
                 name = route.split("/dump/", 1)[1]
@@ -762,22 +782,29 @@ def make_handler(state: MockState) -> type:
         def _ask_multi(self, body: dict) -> None:
             t0 = time.time()
             _mode, msg = strip_hints(str(body.get("message") or ""))
-            state.emit("thought", f"Параллельный вопрос 2 моделям: {msg[:100]}")
+            # цель та же, что у cell_c:1322-1324: основная модель + манифест
+            targets = ["MOCK"] + [str(d.get("label") or d.get("path"))
+                                  for d in state.parallel]
+            state.emit("thought", f"Параллельный вопрос {len(targets)} моделям: "
+                                  f"{msg[:100]}")
             if not self._wait_first():
                 return
             base = build_chat_reply(body, state.max_tokens)["reply"]
             answers = [
-                {"model": "MOCK", "ok": True, "answer": base,
-                 "seconds": round(time.time() - t0, 2)},
-                {"model": "MOCK-7B", "ok": True,
-                 "answer": clip("Заглушка (другая модель): " + base, 400),
-                 "seconds": round(time.time() - t0, 2)},
+                {"model": label, "ok": True,
+                 "answer": base if label == "MOCK"
+                 else clip("Заглушка (другая модель): " + base, 400),
+                 "seconds": round(time.time() - t0, 1)}   # 1 знак, как cell_c:1339
+                for label in targets
             ]
             state.count("chats")
             self._send(200, {
                 "answers": answers, "count": len(answers),
-                "wall_seconds": round(time.time() - t0, 3),
-                "note": "заглушка: ответы собраны из шаблона, не из моделей",
+                "wall_seconds": round(time.time() - t0, 1),
+                # текст note и округление — как у настоящего сервера
+                # (cell_c:1348-1350), иначе тест защищал форму заглушки
+                "note": "суммарная скорость не растёт: ядра те же, "
+                        "ответы идут параллельно",
             })
 
         # --------------------------------------------------- спец-режимы

@@ -26,18 +26,41 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------- конфиг ---
+_ENV_CACHE: dict = {"mt": None, "text": ""}
+
+
+def _env_text() -> str:
+    """Содержимое /content/thinking_env.sh, кэшированное по mtime.
+
+    Раньше файл открывался на КАЖДЫЙ вызов `_env_export`, а тот зовётся из
+    `_ctx_limit`, который есть в каждом контентном маршруте: постоянный
+    фоновый I/O посреди генерации (аудит B, 03-colab).
+    """
+    try:
+        mt = os.path.getmtime("/content/thinking_env.sh")
+    except OSError:
+        _ENV_CACHE["mt"], _ENV_CACHE["text"] = None, ""
+        return ""
+    if _ENV_CACHE["mt"] != mt:
+        try:
+            with open("/content/thinking_env.sh", encoding="utf-8") as fh:
+                _ENV_CACHE["text"] = fh.read()
+        except OSError:
+            _ENV_CACHE["text"] = ""
+        _ENV_CACHE["mt"] = mt
+    return _ENV_CACHE["text"]
+
+
 def _env_export(key: str, default: str = "") -> str:
     """Последнее значение `export KEY=...` из /content/thinking_env.sh.
 
     Туда ячейка D пишет THINKING_CTX — сервер и сторож должны брать одно и то же
     значение окна (AUD-08), и бюджет ответа тоже прижимается к нему.
     """
-    try:
-        for line in open("/content/thinking_env.sh", encoding="utf-8"):
-            if line.startswith(f"export {key}="):
-                default = line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
+    tail = f"export {key}="
+    for line in _env_text().splitlines():
+        if line.startswith(tail):
+            default = line.split("=", 1)[1].strip().strip('"').strip("'")
     return default
 
 
@@ -686,33 +709,82 @@ PLAN_LIST_FIELDS = ("sub_goals", "constraints", "contradictions",
 
 
 def coerce_plan(data: dict) -> dict:
-    """Мягко приводит план к схеме.
+    """Мягко приводит план к серверной схеме — ДО `Plan(**data)`.
 
-    Маленькие модели часто ошибаются в типах: список пишут строкой, а id шага
-    — словом вроде "s1". Раньше это was 500; теперь такое просто чинится.
+    Раньше приводило только типы списков и id, а дубли id, пустой список
+    шагов, `desc` длиннее 400 и не-списки в `depends_on`/`inputs` всё равно
+    роняли валидацию в HTTP 500 — хотя слабая 3B отдаёт именно такие
+    варианты. Теперь любую задачу обязан пережить тут, а не падением
+    (аудит B, 03-colab: «coerce_plan не гарантирует валидность»).
     """
     out = dict(data or {})
+
+    # --- текстовые поля: длина и тип -------------------------------------
+    goal = str(out.get("goal") or "").strip() or "(задача не названа)"
+    out["goal"] = goal[:500]
+    out["rationale"] = str(out.get("rationale") or "")[:800]
+    for key, limit in (("fallback", 500), ("source", 40), ("plan_id", 80),
+                       ("created_at", 40)):
+        if key in out and out[key] is not None:
+            out[key] = str(out[key])[:limit]
+    try:
+        conf = float(out.get("confidence", 0.7))
+    except (TypeError, ValueError):
+        conf = 0.7
+    out["confidence"] = max(0.0, min(1.0, conf))
+
+    # --- списки строк -----------------------------------------------------
     for key in PLAN_LIST_FIELDS:
         v = out.get(key)
         if v is None:
-            continue
-        if isinstance(v, str):
-            out[key] = [v] if v.strip() else []
-        elif not isinstance(v, list):
+            out[key] = []
+        elif isinstance(v, str):
+            out[key] = [v[:500]] if v.strip() else []
+        elif isinstance(v, list):
+            out[key] = [str(x)[:500] for x in v if str(x).strip()][:50]
+        else:
             out[key] = [str(v)]
+
+    # --- шаги -------------------------------------------------------------
     steps = out.get("steps")
-    if isinstance(steps, list):
-        norm = []
-        for i, s in enumerate(steps, 1):
-            if isinstance(s, dict):
+    if not isinstance(steps, list):
+        steps = [steps] if steps else []
+    norm: list[dict] = []
+    used: set[int] = set()
+    for s in steps:
+        item = dict(s) if isinstance(s, dict) else {"desc": str(s)}
+        try:
+            sid = int(item.get("id"))
+        except (TypeError, ValueError):
+            sid = len(norm) + 1
+        while sid in used:                     # дубликат id → ValidationError
+            sid += 1
+        used.add(sid)
+        item["id"] = sid
+        desc = str(item.get("desc") or "").strip() or f"шаг {len(norm) + 1}"
+        item["desc"] = desc[:400]
+        if not isinstance(item.get("inputs"), dict):
+            item["inputs"] = {}
+        dep = item.get("depends_on")
+        if isinstance(dep, list):
+            clean: list[int] = []
+            for d in dep:
                 try:
-                    sid = int(s.get("id"))
+                    clean.append(int(d))
                 except (TypeError, ValueError):
-                    sid = i
-                norm.append({**s, "id": sid})
-            else:
-                norm.append({"id": i, "desc": str(s)[:300]})
-        out["steps"] = norm
+                    continue
+            item["depends_on"] = [d for d in clean if d != sid]
+        else:
+            item["depends_on"] = []
+        norm.append(item)
+    if not norm:                               # «план без шагов» → 500
+        norm = [{"id": 1, "action": "verify", "desc": "выполнить задачу напрямую"}]
+    norm = norm[:30]                           # больше 30 → ValidationError
+    ids = {it["id"] for it in norm}
+    for it in norm:                            # ссылки только на живые шаги
+        it["depends_on"] = [d for d in it.get("depends_on", [])
+                            if d in ids and d != it["id"]]
+    out["steps"] = norm
     return out
 
 

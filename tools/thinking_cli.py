@@ -339,7 +339,10 @@ def cmd_reflect(client: ThinkingClient, args: argparse.Namespace) -> int:
         # (баг аудита AUD-03). Дочерний процесс сам дописывает журнал и
         # отчёт, родитель сразу освобождает терминал.
         cmd = [sys.executable, os.path.abspath(__file__), "reflect",
-               args.plan_id, "--step", str(args.step), "--result", args.result]
+               args.plan_id, "--step", str(args.step), "--result", args.result,
+               # дочерний процесс должен пометить запись фоновой — иначе
+               # метрика background_ms остаётся нулевой навсегда (аудит B)
+               "--background"]
         if args.observation:
             cmd += ["--observation", args.observation]
         if args.error:
@@ -361,7 +364,11 @@ def cmd_reflect(client: ThinkingClient, args: argparse.Namespace) -> int:
 def _do_reflect(client: ThinkingClient, args: argparse.Namespace, echo: bool = True) -> int:
     try:
         out = client.reflect(args.plan_id, args.step, args.result,
-                             observation=args.observation, error=args.error)
+                             observation=args.observation, error=args.error,
+                             # дочерний процесс от reflect --async помечает
+                             # запись фоновой, иначе метрика background_ms
+                             # не заполняется никогда (аудит B)
+                             background=bool(getattr(args, "background", False)))
     except SchemaError as exc:
         _out(f"! контракт: {exc}")
         return 3
@@ -1494,6 +1501,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--observation")
     s.add_argument("--error")
     s.add_argument("--async", dest="async_mode", action="store_true")
+    s.add_argument("--background", action="store_true",
+                   help="рефлексия выполнена отсоединённым процессом "
+                        "(ставится командой --async автоматически)")
 
     s = add("tail")
     s.add_argument("--n", type=int, default=30)

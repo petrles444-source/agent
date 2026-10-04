@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -139,6 +140,23 @@ def new_rid() -> str:
     совпадает. Для удаления по одной записи нужен настоящий идентификатор.
     """
     return uuid.uuid4().hex[:8]
+
+
+def _host_of(url: str) -> str:
+    """Хост из URL — без схемы, порта-по-умолчанию снаружи не вычищаем.
+
+    Всё, что панели нужно для строки меты: полный адрес туннеля в `/api/state`
+    не отдаём, потому что требование «адрес не выдаётся из API» закрывает и
+    случайную утечку через лог браузера/скриншот (аудит B, 02-cli-panel).
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(text if "//" in text else "//" + text)
+        return parts.netloc or parts.path.split("/")[0]
+    except ValueError:
+        return ""
 
 
 def _read_jsonl(path: Path, limit: int = 200) -> list[dict]:
@@ -563,7 +581,13 @@ class ThinkingClient:
 
     def reflect(self, plan_id: str, step_id: int, result: str,
                 observation: Optional[str] = None, error: Optional[str] = None,
-                timeout: Optional[float] = None, author: str = "agent") -> dict:
+                timeout: Optional[float] = None, author: str = "agent",
+                background: bool = False) -> dict:
+        # background: рефлексия, запущенная отсоединённым процессом
+        # (reflect --async). Без флага её длительность считалась бы
+        # «блокировкой главного потока» — метрика background_ms всегда
+        # оставалась нулевой, а правило «медленно из-за блокировки»
+        # срабатывало на рефлексии в фоне (аудит B).
         self._check_secrets(result, observation or "", error or "")
         if timeout is None:
             timeout = max(self.timeout, float(self.cfg.get("reflect_timeout", 180)))
@@ -603,7 +627,7 @@ class ThinkingClient:
             self.stats["errors"] += 1
             self._record("reflect", f"шаг {step_id}: {result[:300]}", t0,
                          ok=False, summary=f"не ответил: {exc}"[:400],
-                         plan_id=plan_id, author=author)
+                         plan_id=plan_id, author=author, background=background)
             raise exc
         if isinstance(out, dict):
             self._remember_json("reflect", out)
@@ -611,7 +635,7 @@ class ThinkingClient:
             self.stats["reflects"] += 1
             self._record("reflect", f"шаг {step_id}: {result[:300]}", t0, ok=True,
                          summary=f"[{out.get('status')}] {out.get('advice', '')}"[:400],
-                         plan_id=plan_id, author=author)
+                         plan_id=plan_id, author=author, background=background)
         return out
 
     # ------------------------------------------------------------------ #
@@ -1303,7 +1327,12 @@ class ThinkingClient:
                         if not isinstance(ev, dict):
                             continue
                         etype = ev.get("type")
-                        if remember and etype not in ("error", terminal):
+                        if remember and etype not in ("error", terminal, "token"):
+                            # Токены не запоминаем: сервер шлёт их без seq,
+                            # дедуп по ним не работает, и одна строка плана
+                            # (сотни токенов) давала сотни строк журнала и
+                            # сотни open/append посреди стрима (аудит B).
+                            # Рацио и шаги события приходят отдельно.
                             self._remember_ev(ev)
                         if etype == "token":
                             piece = str(ev.get("text") or "")
@@ -1959,12 +1988,27 @@ class ThinkingClient:
         if since:
             inter = [i for i in inter if self._after(i, since)]
             reps = [r for r in reps if self._after(r, since)]
-        chat = _read_jsonl(self._chat_path, 60)
+        # Хвост чата тоже кэшируем по mtime (как _load_history): панель
+        # дёргает /api/state каждые 2,5 с, а _read_jsonl парсит файл целиком
+        # до хвоста — на живом chat.jsonl это постоянный фоновый CPU-шум (аудит B)
+        try:
+            cmt = self._chat_path.stat().st_mtime if self._chat_path.exists() else 0.0
+        except OSError:
+            cmt = 0.0
+        if getattr(self, "_chat_cache", (None, []))[0] == cmt:
+            chat = list(self._chat_cache[1])
+        else:
+            chat = _read_jsonl(self._chat_path, 60)
+            self._chat_cache = (cmt, chat)
         if since:
             chat = [c for c in chat if self._after(c, since)]
         return {
             "online": bool(self.online),
-            "base": self.base,
+            # URL туннеля наружу не отдаём (требование «адрес не в API»):
+            # панели хватает имени хоста для строки меты, а полный адрес —
+            # это то, что держит только сервер панели (аудит B)
+            "base_host": _host_of(self.base),
+            "has_base": bool(self.base),
             "has_token": bool(self.token),
             # сам токен наружу не отдаём (аудит B-8): панели он не нужен —
             # её запросы идут через сервер панели, который токен держит сам.
@@ -1977,7 +2021,9 @@ class ThinkingClient:
             "stream_error": self.stream_error,
             "last_seq": self.last_seq,
             "buffered": len(self._events),
-            "log_path": str(self._log_path),
+            # абсолютный путь к журналу наружу не отдаём: он раскрывает
+            # имя пользователя/структуру диска, а панели нужна лишь метка
+            "log_name": self._log_path.name,
             "health": getattr(self, "health_data", {}) or {},
             "interactions": inter[-80:],
             "reports": reps[-40:],

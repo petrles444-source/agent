@@ -382,8 +382,12 @@ def test_chat_memory_tokens() -> None:
 
     # --- память ---
     c = make_client()
-    check(c.memory()["facts"] == [] or isinstance(c.memory()["facts"], list),
-          "память: читается списком фактов")
+    # Аудит A-4: тут была тавтология «пусто ИЛИ список» — пустой список
+    # тоже list, проверка падала только на не-списке
+    facts0 = c.memory()["facts"]
+    check(isinstance(facts0, list)
+          and all(isinstance(f, str) and f.strip() for f in facts0),
+          "память: факты — только непустые строки")
     c.remember("факт один")
     c.remember("факт два")
     mem = c.memory()
@@ -1160,6 +1164,10 @@ def test_mock_llm_stub() -> None:
         check(any(e.get("type") == "plan_step" for e in ev["events"]),
               "заглушка: шаги уходят в журнал событий")
         check(ev["last_seq"] > 0, "заглушка: у событий есть порядковый номер")
+        # ключ ts, а не at: панель читает ev.ts, и на «at» лента мыслей
+        # рисовала бы пустое время (аудит A-4: заглушка расходилась с cell_c)
+        check(ev["events"] and all("ts" in e for e in ev["events"]),
+              "заглушка: у событий метка времени под ключом ts (как cell_c)")
 
         # --- /chat + память ---------------------------------------------
         c.remember("предпочитает короткие ответы")
@@ -1195,8 +1203,13 @@ def test_mock_llm_stub() -> None:
         chats_before = c.stats["chats"]
         inter_before = len([i for i in c.interactions if i.get("kind") == "chat"])
         mm = c.multi_chat("сравни ответы")
-        check(mm["count"] == 2 and all(a.get("ok") for a in mm["answers"]),
-              "заглушка: /ask/multi отдаёт ответы нескольких «моделей»")
+        # ожидаемое число ответов считаем из /parallel, а не пишем руками:
+        # у настоящего сервера targets = основная модель + манифест движков
+        # (cell_c:1322-1324), и оба маршрута обязаны сходиться
+        expect_n = 1 + len((c.parallel_models() or {}).get("extra") or [])
+        check(mm["count"] == expect_n and all(a.get("ok") for a in mm["answers"]),
+              f"заглушка: /ask/multi отвечает основная + дополнительные "
+              f"({expect_n} шт), как cell_c:1322")
         # учёт параллельного вопроса: он жжёт токены N моделей (аудит B-3)
         check(c.stats["chats"] == chats_before + 1,
               "заглушка: ask-multi увеличил счётчик обращений (B-3)")
@@ -1236,10 +1249,16 @@ def test_mock_llm_stub() -> None:
         check(bool(c.plan("обычная задача")),
               "заглушка: после метки следующий запрос снова проходит")
 
-        # --- режим error --------------------------------------------------
+        # --- режим error: LLM упала, сервер жив ---------------------------
         ce = make_client(**fast)
         ce.base = serve(mode="error")
-        check(not ce.health(), "режим error: /health не проходит — сервер «упал»")
+        # настоящий /health от LLM не зависит (cell_c:716-728) — раньше
+        # заглушка гасила его вместе со всем, и тест закреплял «сервер упал»
+        # вместо нужного сценария «health 200, контент 503» (аудит A-4)
+        check(ce.health() is True,
+              "режим error: /health отвечает 200 — сервер-то жив")
+        check(raises(lambda: ce.plan("задача при упавшей LLM"), ThinkingError),
+              "режим error: контентные маршруты отвечают 503")
 
         # --- режим drop: поток рвётся, короткий маршрут спасает -----------
         cd = make_client(**fast, chat_path=str(TMP / "drop_chat.jsonl"))
@@ -1253,12 +1272,14 @@ def test_mock_llm_stub() -> None:
               "режим drop: фолбэк не теряет автора — реплика человека не "
               "пишется как агентская (B-2)")
 
-        # --- режим badjson: контракт ловит мусор --------------------------
+        # --- badjson: прокси отдал HTML вместо JSON ------------------------
+        # сам сервер так не умеет (plan_data/guard_reply/reflect_data
+        # деградируют мягко) — режим воспроизводит ошибку доставки
         cb = make_client(**fast)
         cb.base = serve(mode="badjson")
         plan4, used_fb = cb.plan_with_fallback("сломай JSON")
         check(used_fb and bool(plan4.get("steps")),
-              "режим badjson: мусорный ответ уводит в локальный фолбэк")
+              "режим badjson: HTML от прокси уводит в локальный фолбэк")
 
         # --- режим slow: пинги держат поток живым -------------------------
         cs = make_client(**fast, stream_stall=1.0)
@@ -1590,11 +1611,21 @@ def test_colab_cells() -> None:
             "coder-14b": "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
             "qwen2.5-32b-instruct": "qwen2.5-32b-instruct-q4_k_m.gguf",
             "coder-32b": "qwen2.5-coder-32b-instruct-q4_k_m.gguf"}
-    check(all(t in n for t, n in tags.items()),
-          "ячейка A: каждый тег находит свой файл")
+    # Аудит A-4: раньше сверялся словарём внутри самого теста —
+    # `all(t in n for t, n in tags.items())` проверяет, что подстрока входит
+    # в собственное же значение, и всегда истинна. Ожидания теперь привязаны
+    # к CATALOG ячейки A: опечатка в нём ломала бы загрузку моделей в Colab.
+    cat_src = setup[setup.index("CATALOG"):setup.index("PROFILES")]
+    catalog_tags = set(re.findall(r'"([^"]+)":\s*\(', cat_src))
+    check(set(tags) <= catalog_tags,
+          f"ячейка A: все теги есть в CATALOG ({sorted(set(tags) - catalog_tags)})")
     clash = [(t, n) for t, own in tags.items()
              for n in tags.values() if n != own and t in n]
     check(not clash, f"ячейка A: теги моделей не пересекаются ({clash})")
+    nested = [(a, b) for a in tags for b in tags if a != b and a in b]
+    check(not nested,
+          f"ячейка A: ни один тег не вложен в другой — иначе два файла "
+          f"опознаются одним тегом ({nested})")
 
     # выбор моделей: качать не всё, а профиль
     check("THINKING_PROFILE" in setup, "ячейка A: профиль моделей задаётся переменной")
@@ -2340,6 +2371,69 @@ def test_audit_wave_a() -> None:
           "A-3: last_error заполнен — предохранитель видит обрыв тела")
 
 
+def test_coerce_plan_hardening() -> None:
+    """Волна B: `coerce_plan` обязан выдать валидный план из любого мусора.
+
+    Раньше он чинил только типы списков и id, а дубли id, пустой список шагов,
+    `desc` > 400 и не-списки в `depends_on` роняли `Plan(**data)` в 500 —
+    хотя слабая 3B отдаёт именно такие варианты. Проверяем поведение, а не
+    наличие строки: редьюсер и сама функция вырезаются из ячейки.
+    """
+    import ast as _ast
+
+    src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    src_py = "\n".join(ln for ln in src.splitlines() if not ln.startswith("%%"))
+    tree = _ast.parse(src_py)
+    keep = []
+    for node in tree.body:
+        if isinstance(node, _ast.Assign):
+            names = {t.id for t in node.targets if isinstance(t, _ast.Name)}
+            if "PLAN_LIST_FIELDS" in names:
+                keep.append(node)
+        elif isinstance(node, _ast.FunctionDef) and node.name == "coerce_plan":
+            keep.append(node)
+    ns: dict = {}
+    exec(compile(_ast.Module(body=keep, type_ignores=[]), "<cell_c>", "exec"), ns)
+    coerce_plan = ns["coerce_plan"]
+
+    cases = [
+        ("дубли id", {"goal": "g", "steps": [{"id": 1, "desc": "a"},
+                                             {"id": 1, "desc": "b"}]}),
+        ("desc длиннее 400", {"goal": "g",
+                             "steps": [{"id": 1, "desc": "х" * 900}]}),
+        ("пустой список шагов", {"goal": "g", "steps": []}),
+        ("шаг не-словарь", {"goal": "g", "steps": ["просто строка"]}),
+        ("depends_on не-список", {"goal": "g",
+                                  "steps": [{"id": 1, "desc": "a",
+                                             "depends_on": "нет"}]}),
+        ("depends_on на несуществующий шаг",
+         {"goal": "g", "steps": [{"id": 1, "desc": "a", "depends_on": [99]}]}),
+        ("goal числом", {"goal": 12345, "steps": [{"id": 1, "desc": "a"}]}),
+        ("confidence — мусор", {"goal": "g", "confidence": "abc",
+                                "steps": [{"id": 1, "desc": "a"}]}),
+        ("constraints строкой", {"goal": "g", "constraints": "без спешки",
+                                 "steps": [{"id": 1, "desc": "a"}]}),
+        ("нет ничего", {}),
+    ]
+    for name, data in cases:
+        out = coerce_plan(data)
+        ids = [s["id"] for s in out["steps"]]
+        ok = (1 <= len(out["steps"]) <= 30
+              and len(ids) == len(set(ids))
+              and all(0 < len(str(s["desc"])) <= 400 for s in out["steps"])
+              and all(set(s.get("depends_on") or []) <= set(ids)
+                      for s in out["steps"])
+              and isinstance(out["goal"], str) and out["goal"])
+        check(ok, f"coerce_plan: план валиден на входе «{name}»")
+    check(len(coerce_plan({"goal": "g", "steps": [
+        {"id": i, "desc": "x"} for i in range(50)]})["steps"]) == 30,
+          "coerce_plan: больше 30 шагов обрезается, а не падает")
+
+    # и сам якорь: валидация действительно ожидает ровно это
+    check("дублирующиеся id шагов" in src and "план без шагов" in src,
+          "coerce_plan: ограничения Plan._steps учтены")
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2364,6 +2458,7 @@ def main() -> int:
     test_audit_round2_fixes()
     test_panel_host_and_models()
     test_audit_wave_a()
+    test_coerce_plan_hardening()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()
