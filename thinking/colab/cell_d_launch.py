@@ -62,28 +62,41 @@ MODELS = [m for m in (open(models_file, encoding="utf-8").read().split("\n")
                       if os.path.exists(models_file) else []) if m] or [MODEL]
 print("MODEL:", MODEL, "| запасные:", [os.path.basename(m) for m in MODELS[1:]])
 
-# Длина ответа подбирается под скорость модели на этом рантайме.
-# Замерено на Colab CPU (2 ядра): Qwen2.5-1.5B ≈ 6 ток/с, 3B ≈ 2.5 ток/с,
-# 7B ≈ 1.3 ток/с. Режим «сильнее и дольше» (выбор пользователя): под 7B
-# бюджеты подняты 500/800; не-потоковый ответ на 124.8 с через туннель
-# прошёл (живая проба 03.10), старый страх обрыва на 120-й секунде
-# себя не оправдал. С видеокартой можно больше: THINKING_MAX_TOKENS = "700".
-MAX_TOKENS_BY_MODEL = {"1.5b": "400", "3b": "260", "7b": "500"}
-_key = next((k for k in MAX_TOKENS_BY_MODEL
-             if k in os.path.basename(MODEL).lower()), "3b")
-os.environ.setdefault("THINKING_MAX_TOKENS", MAX_TOKENS_BY_MODEL[_key])
+# Длина ответа — единственное, для чего нужны бюджеты: рантайм бесплатный,
+# экономить нечего, а короткий ответ ломает контракт (обрезанный JSON не
+# разбирается и план превращается в мусор — такое и случилось на 3B с
+# бюджетом 260). Поэтому бюджет задаёт ДЛИЗИНУ, а не «боязнь долгого
+# ответа»: сервер всё равно прижимает его к n_ctx (THINKING_CTX).
+# Проверка идёт СВЕРХУ ВНИЗ, от самого длинного признака к короткому: иначе
+# «a3b» внутри Qwen3-30B-A3B поймал бы трёхбайтовый бюджет, а «7b» внутри
+# «27b» — семёрку.
+MODEL_BUDGETS = [
+    # (признак в имени, ответ, поток чата, поток разработки)
+    ("30b-a3b", "1200", "2400", "3000"),
+    ("32b", "1200", "2400", "3000"),
+    ("27b", "1200", "2400", "3000"),
+    ("14b", "1000", "2000", "2600"),
+    ("7b", "900", "1800", "2400"),
+    ("3b", "700", "1400", "2000"),
+    ("1.5b", "500", "1000", "1600"),
+]
+_name = os.path.basename(MODEL).lower()
+_match = next((b for b in MODEL_BUDGETS if b[0] in _name),
+              ("3b", "700", "1400", "2000"))      # запасной вариант
+os.environ.setdefault("THINKING_MAX_TOKENS", _match[1])
 # Для потокового чата (/chat/stream) можно больше: токены идут по мере генерации,
 # туннель Cloudflare не рвёт соединение, а человек видит текст сразу.
-CHAT_TOKENS_BY_MODEL = {"1.5b": "700", "3b": "500", "7b": "800"}
-os.environ.setdefault("THINKING_CHAT_MAX_TOKENS",
-                      CHAT_TOKENS_BY_MODEL[_key])
+os.environ.setdefault("THINKING_CHAT_MAX_TOKENS", _match[2])
+# Режим разработчика возвращает код целиком — тут обрезать нельзя.
+os.environ.setdefault("THINKING_DEV_MAX_TOKENS", _match[3])
 # Активная модель — в файле: его читает и сервер (вкладка «Модели» в панели),
 # и сторож, чтобы переключение не слетело после перезапуска движка.
 with open(ACTIVE_FILE, "w", encoding="utf-8") as fh:
     fh.write(MODEL)
 print("ЛИМИТ ОТВЕТА:", os.environ["THINKING_MAX_TOKENS"],
       "токенов / чат-поток:", os.environ["THINKING_CHAT_MAX_TOKENS"],
-      "(модель", _key + ")")
+      "/ разработка:", os.environ["THINKING_DEV_MAX_TOKENS"],
+      "(признак модели:", _match[0] + ")")
 
 # ---- 1) остановка прошлых экземпляров -------------------------------------
 subprocess.run(["pkill", "-f", "llama_cpp.server"], capture_output=True)

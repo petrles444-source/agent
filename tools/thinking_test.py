@@ -960,13 +960,20 @@ def test_colab_cells() -> None:
     check("build-cuda" not in setup and "ollama" not in setup,
           "ячейка A: быстрый путь — без компиляции и без ollama")
 
-    # лёгкие модели без цензуры: репозитории на месте, а теги — точные
-    # подстроки имён файлов, которые не перехватывают чужой файл
+    # модели: репозитории на месте, а теги — точные подстроки имён файлов,
+    # которые не перехватывают чужой файл (проверено на РЕАЛЬНЫХ именах)
     for s in ("mradermacher/Qwen2.5-3B-Instruct-Uncensored-GGUF",
               "mradermacher/Qwen2.5-1.5B-Instruct-uncensored-GGUF",
+              "Qwen/Qwen3-30B-A3B-GGUF",
+              "bartowski/Qwen2.5-14B-Instruct-GGUF",
+              "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF",
+              "bartowski/Qwen2.5-32B-Instruct-GGUF",
+              "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF",
               "3b-instruct-q4", "1.5b-instruct-q4", "7b-instruct-q4",
               "7b-instruct-uncensored", "3b-instruct-uncensored",
-              "1.5b-instruct-uncensored"):
+              "1.5b-instruct-uncensored",
+              "30b-a3b-q4", "qwen2.5-14b-instruct", "coder-14b",
+              "qwen2.5-32b-instruct", "coder-32b"):
         check(s in setup, f"ячейка A: {s} на месте")
     tags = {"1.5b-instruct-q4": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
             "1.5b-instruct-uncensored":
@@ -976,14 +983,39 @@ def test_colab_cells() -> None:
                 "qwen2.5-3b-instruct-uncensored.q4_k_m.gguf",
             "7b-instruct-q4": "qwen2.5-7b-instruct-q4_k_m.gguf",
             "7b-instruct-uncensored":
-                "qwen2.5-7b-instruct-uncensored.q4_k_m.gguf"}
+                "qwen2.5-7b-instruct-uncensored.q4_k_m.gguf",
+            "30b-a3b-q4": "qwen3-30b-a3b-q4_k_m.gguf",
+            "qwen2.5-14b-instruct": "qwen2.5-14b-instruct-q4_k_m.gguf",
+            "coder-14b": "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+            "qwen2.5-32b-instruct": "qwen2.5-32b-instruct-q4_k_m.gguf",
+            "coder-32b": "qwen2.5-coder-32b-instruct-q4_k_m.gguf"}
     check(all(t in n for t, n in tags.items()),
           "ячейка A: каждый тег находит свой файл")
     clash = [(t, n) for t, own in tags.items()
              for n in tags.values() if n != own and t in n]
     check(not clash, f"ячейка A: теги моделей не пересекаются ({clash})")
 
+    # выбор моделей: качать не всё, а профиль
+    check("THINKING_PROFILE" in setup, "ячейка A: профиль моделей задаётся переменной")
+    for prof in ("light", "gpu", "strong", "big", "coder", "uncensored", "all"):
+        check(f'"{prof}"' in setup, f"ячейка A: профиль {prof} доступен")
+    check("WANTED_TAGS" in setup and "PROFILES" in setup,
+          "ячейка A: профиль выбирает, что именно качать")
+
+    # бюджеты задают длину ответа и не переполняют окно
     launch = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    setup_c = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    check("MODEL_BUDGETS" in launch, "ячейка D: бюджеты по моделям одной таблицей")
+    check("THINKING_DEV_MAX_TOKENS" in launch,
+          "ячейка D: у режима разработки свой бюджет")
+    check('("30b-a3b"' in launch and launch.index('("30b-a3b"')
+          < launch.index('("3b"'),
+          "ячейка D: признаки моделей проверяются от длинного к короткому")
+    check("_ctx_limit" in setup_c, "ячейка C: бюджет прижимается к окну модели")
+    check("THINKING_CTX" in setup_c, "ячейка C: окно берётся из thinking_env.sh")
+    check(launch.count("_ctx_limit") == 0 and setup_c.count("_ctx_limit()") >= 4,
+          "ячейка C: окно прижимает все точки вызова LLM")
+
     check("THINKING_URL=" in launch, "ячейка D: печатает THINKING_URL")
     check("THINKING_TOKEN=" in launch, "ячейка D: печатает THINKING_TOKEN")
     check("thinking_models.txt" in launch, "ячейка D: читает список моделей")
@@ -1057,7 +1089,14 @@ def test_dev_metrics_limits() -> None:
     check("bartowski/Qwen2.5-7B-Instruct-GGUF" in setup,
           "ячейка A: 7B Instruct в списке желаемых")
     check("_hint(p)" in setup, "ячейка A: для модели печатается подсказка CPU/T4")
-    check("dict.fromkeys" in setup, "ячейка A: дубликаты моделей не качаются дважды")
+    # каталог моделей — словарь, поэтому один тег не может повториться, а цикл
+    # качания идёт по тегам профиля (раньше здесь был dict.fromkeys)
+    check("CATALOG: dict[str, tuple[str, int, str, int]]" in setup,
+          "ячейка A: каталог моделей — словарь, теги уникальны по построению")
+    check("for tag in WANTED_TAGS:" in setup,
+          "ячейка A: качаем теги выбранного профиля, без дублей")
+    check('"coder-14b":' in setup and '"coder-32b":' in setup,
+          "ячейка A: кодерские модели помечены отдельно от обычных")
 
     # --- клиент: dev + токен + рефлексия + периоды ---
     src = (ROOT / "thinking" / "client.py").read_text(encoding="utf-8")

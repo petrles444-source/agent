@@ -1,9 +1,11 @@
-# === Субагент «Мышление», ячейка A (окружение + модель) — БЫСТРАЯ ВЕРСИЯ ===
-# Основа — та ячейка, с которой субагент впервые поднялся за ~3 минуты.
-# Отличия от оригинала (только ускорение и страховка, ничего лишнего):
+# === Субагент «Мышление», ячейка A (окружение + модель) ===
+# Отличия от оригинала (только ускорение, страховка и выбор моделей):
 #   * если модель уже лежит на диске — загрузка пропускается целиком;
-#   * без GPU берём лёгкую модель (3B), иначе 7B — так быстрее;
-#   * три модели-кандидата: если первая не скачалась, берём следующую;
+#   * качаем НЕ всё, а выбранный профиль (THINKING_PROFILE): «light»,
+#     «gpu», «strong» (14B), «big» (Qwen3-30B-A3B, 17 ГБ, MoE),
+#     «coder» (32B для разработки), «uncensored», «all»;
+#   * профиль задаётся переменной окружения — её ставит ячейка ноутбука
+#     (одна строка PROFILE = "…" прямо перед запуском);
 #   * при провале импорта CUDA-колеса чиним это одной командой с PyPI,
 #     но только если в системе есть видеокарта (иначе не тратим время).
 import glob
@@ -103,39 +105,67 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 have = [p for p in glob.glob(os.path.join(MODEL_DIR, "**", "*.gguf"), recursive=True)
         if os.path.getsize(p) > 600_000_000]
 
-# Качаем ВСЕ нужные модели (их переключают прямо в панели), но не качаем заново
-# то, что уже лежит: повторный запуск остаётся быстрым. Порядок важен: на GPU
-# активной становится первая (7B), без GPU — обычная 3B (см. ниже).
-# Тег (3-й элемент) — точная подстрока имени уже скачанного файла: по нему
-# узнаём свою модель. Чужой тег не должен подходить чужому файлу, иначе при
-# повторном запуске uncensored-модель принялась бы за обычную (старые теги
-# «3b»/«1.5b»/«uncensored» так и делали — теперь они конкретные).
+# Каталог: тег → (репозиторий, минимальный размер, подпись, ранг).
+# Тег — точная подстрока имени файла: по нему узнаём свою модель и никогда
+# не путаем соседние по имени (старые широкие теги «3b»/«uncensored» приняли
+# uncensored-модель за обычную). Ранг — чем выше, тем сильнее модель.
 from huggingface_hub import hf_hub_download, list_repo_files     # noqa: E402
 
-WANTED = [("bartowski/Qwen2.5-3B-Instruct-GGUF", 1_000_000_000,
-           "3b-instruct-q4"),                    # обычная 3B
-          ("Qwen/Qwen2.5-1.5B-Instruct-GGUF", 600_000_000,
-           "1.5b-instruct-q4"),                  # обычная 1.5B
-          ("bartowski/Qwen2.5-7B-Instruct-GGUF", 3_000_000_000,
-           "7b-instruct-q4"),                    # обычная 7B
-          ("QuantFactory/Qwen2.5-7B-Instruct-Uncensored-GGUF", 3_000_000_000,
-           "7b-instruct-uncensored"),            # 7B без цензуры
-          ("mradermacher/Qwen2.5-3B-Instruct-Uncensored-GGUF", 1_000_000_000,
-           "3b-instruct-uncensored"),            # лёгкая 3B без цензуры
-          ("mradermacher/Qwen2.5-1.5B-Instruct-uncensored-GGUF", 600_000_000,
-           "1.5b-instruct-uncensored")]          # самая быстрая без цензуры
-if GPU:                                   # с видеокартой 7B — первая (активна)
-    WANTED.insert(0, ("bartowski/Qwen2.5-7B-Instruct-GGUF", 3_000_000_000,
-                      "7b-instruct-q4"))
-    WANTED = list(dict.fromkeys(WANTED))   # дубликат строки не нужен
+CATALOG: dict[str, tuple[str, int, str, int]] = {
+    "1.5b-instruct-q4": ("Qwen/Qwen2.5-1.5B-Instruct-GGUF", 600_000_000, "1.5B", 10),
+    "3b-instruct-q4": ("bartowski/Qwen2.5-3B-Instruct-GGUF", 1_000_000_000, "3B", 20),
+    "7b-instruct-q4": ("bartowski/Qwen2.5-7B-Instruct-GGUF", 3_000_000_000, "7B", 30),
+    # Теги у больших моделей — строго те, что реально лежат в имени файла.
+    # «14b-instruct-q4» не годится: он есть и в имени Coder-14B
+    # (qwen2.5-coder-14b-instruct-q4_k_m.gguf) — и обычная 14B приняла бы
+    # файл кодера. Поэтому «qwen2.5-14b-instruct» против «coder-14b».
+    "qwen2.5-14b-instruct": ("bartowski/Qwen2.5-14B-Instruct-GGUF", 5_000_000_000,
+                             "14B", 40),
+    "coder-14b": ("bartowski/Qwen2.5-Coder-14B-Instruct-GGUF", 5_000_000_000,
+                  "14B-CODE", 45),
+    # MoE: 30B параметров, но активных только 3B — качество большой модели
+    # при скорости небольшой. Единственный «сильный» вариант, который
+    # осмысленно работает на бесплатном Colab (17.3 ГБ, RAM 12.6 ГБ — по
+    # умолчанию mmap с диска, поэтому медленнее, но отвечает).
+    "30b-a3b-q4": ("Qwen/Qwen3-30B-A3B-GGUF", 10_000_000_000, "30B-A3B", 60),
+    "qwen2.5-32b-instruct": ("bartowski/Qwen2.5-32B-Instruct-GGUF", 10_000_000_000,
+                             "32B", 70),
+    "coder-32b": ("bartowski/Qwen2.5-Coder-32B-Instruct-GGUF", 10_000_000_000,
+                  "32B-CODE", 80),
+    "7b-instruct-uncensored": ("QuantFactory/Qwen2.5-7B-Instruct-Uncensored-GGUF",
+                               3_000_000_000, "7B-UNC", 31),
+    "3b-instruct-uncensored": ("mradermacher/Qwen2.5-3B-Instruct-Uncensored-GGUF",
+                               1_000_000_000, "3B-UNC", 21),
+    "1.5b-instruct-uncensored": ("mradermacher/Qwen2.5-1.5B-Instruct-uncensored-GGUF",
+                                 600_000_000, "1.5B-UNC", 11),
+}
+
+# Профили: что качать. Первый элемент — активная модель профиля.
+PROFILES: dict[str, list[str]] = {
+    "light": ["3b-instruct-q4", "1.5b-instruct-q4"],
+    "gpu": ["7b-instruct-q4", "3b-instruct-q4", "1.5b-instruct-q4"],
+    "strong": ["qwen2.5-14b-instruct", "coder-14b", "3b-instruct-q4"],
+    "big": ["30b-a3b-q4", "3b-instruct-q4"],
+    "coder": ["coder-32b", "coder-14b", "3b-instruct-q4"],
+    "uncensored": ["3b-instruct-uncensored", "3b-instruct-q4", "1.5b-instruct-q4"],
+    "all": sorted(CATALOG, key=lambda t: -CATALOG[t][3]),
+}
+PROFILE = (os.environ.get("THINKING_PROFILE") or "auto").strip().lower()
+if PROFILE in ("", "auto"):
+    PROFILE = "gpu" if GPU else "light"
+WANTED_TAGS = PROFILES.get(PROFILE) or PROFILES["light"]
+say(f"профиль моделей: {PROFILE} → {', '.join(WANTED_TAGS)}")
+if PROFILE not in PROFILES:
+    say(f"  ⚠ неизвестный профиль, взят light (доступно: {', '.join(PROFILES)})")
 
 
 def _has(tag: str) -> str:
     """Путь к уже скачанной модели по точному тегу (3b-instruct-q4, …)."""
     low = tag.lower()
+    floor = CATALOG[tag][1]
     for p in have:
         name = os.path.basename(p).lower()
-        if low in name and os.path.getsize(p) > 800_000_000:
+        if low in name and os.path.getsize(p) >= floor:
             return p
     return ""
 
@@ -154,46 +184,59 @@ def _fetch(repo: str, min_size: int) -> str:
     return got if size >= min_size else ""
 
 
-MODELS: list[str] = []                       # 3b, 1.5b, 7b и те же три без
-                                              # цензуры — в этом порядке
-for repo, min_size, tag in WANTED:
+MODELS: list[str] = []
+tag_of: dict[str, str] = {}                  # путь → тег (для выбора активной)
+for tag in WANTED_TAGS:
+    repo, min_size, label, _rank = CATALOG[tag]
     path = _has(tag)
     if path:
         say(f"{tag}: уже на диске ({os.path.getsize(path) / 2**30:.2f} ГБ) — пропускаем")
         MODELS.append(path)
+        tag_of[path] = tag
         continue
+    say(f"{tag}: качаю {repo}…")
     try:
         path = _fetch(repo, min_size)
-    except Exception as exc:                # сеть отвалилась — не молчим
+    except Exception as exc:                 # сеть отвалилась — не молчим
         say(f"  {repo}: {type(exc).__name__} {str(exc)[:100]}")
         path = ""
     if path:
         MODELS.append(path)
+        tag_of[path] = tag
     else:
         say(f"  {tag}: не скачалась, пропускаем (работаем на остальных)")
 
-if not MODELS:                              # аварийный план: что уже есть
+if not MODELS:                               # аварийный план: что уже есть
     MODELS = have
+    tag_of = {}
 assert MODELS, "ни одна модель не нашлась"
 
-# Без видеокарты активной делаем обычную 3B (она идёт первой) — на CPU 7B
-# считается ~1 ток/с и мешает работать; 1.5B остаётся запасной (быстрее, но
-# отвечает короче и проще). Сборки без цензуры — по желанию, их выбирают
-# во вкладке «Модели» (подписи 1.5B-UNC / 3B-UNC / 7B-UNC).
-if GPU:
-    MODEL = MODELS[0]
+# Активная — первая из профиля, что реально скачалась; если профиль не дал
+# ничего, берём самую сильную из того, что лежит на диске.
+active_tag = next((t for t in WANTED_TAGS if t in tag_of), "")
+if active_tag:
+    MODEL = tag_of[active_tag]
 else:
-    MODEL = next((p for p in MODELS
-                  if "3b" in os.path.basename(p).lower()), MODELS[0])
+    MODEL = max(MODELS, key=lambda p: os.path.getsize(p))
+    say("  профиль пуст — взял самую большую модель с диска")
 
 
 def _hint(p: str) -> str:
     """Подсказка режима (CPU/T4) — печатается при сборке и идёт в панель."""
     name = os.path.basename(p).lower()
     unc = " (без цензуры)" if "uncensored" in name else ""
-    if any(t in name for t in ("7b", "8b", "14b")):
-        return (f"7B{unc}: для лучшей работы смени Runtime → Change runtime "
-                f"type → T4 GPU (на CPU ~1 ток/с)")
+    code = " · для кода" if "coder" in name else ""
+    if "a3b" in name or "30b" in name:
+        return (f"30B-A3B{code}{unc}: MoE — 30B параметров, активны 3B, "
+                f"поэтому на CPU считает почти как 3B, а отвечает как большая")
+    if "32b" in name:
+        return (f"32B{code}{unc}: очень сильная, но на CPU медленная — "
+                f"смени Runtime на T4 GPU")
+    if "14b" in name:
+        return (f"14B{code}{unc}: влезает в RAM целиком, на CPU ~2–4 ток/с")
+    if "7b" in name:
+        return (f"7B{unc}: смени Runtime → Change runtime type → T4 GPU "
+                f"(на CPU ~1 ток/с)")
     if "3b" in name:
         return f"3B{unc}: работает на CPU (~2–3 ток/с), на T4 — быстрее"
     return f"1.5B{unc}: самая быстрая на CPU (~6 ток/с)"
@@ -205,9 +248,10 @@ say(f"ГОТОВО за {time.time()-START:.0f}с. Модели: "
 for p in MODELS:
     say(f"  · {_hint(p)}")
 if not GPU:
-    say("  ⚠ Рантайм на CPU: 7B качается заранее, но считается медленно — "
-        "для неё переключи Runtime на T4 GPU.")
-say(f"активная: {MODEL}  ·  переключение — в панели (вкладка «Модели»)")
+    say("  ⚠ Рантайм на CPU: большие модели качаются заранее, но считаются "
+        "медленно — переключи Runtime на T4 GPU, если нужна скорость.")
+say(f"активная: {MODEL}  ·  профиль: {PROFILE}  ·  "
+    "переключение — в панели (вкладка «Модели»)")
 with open("/content/thinking_model_path.txt", "w", encoding="utf-8") as fh:
     fh.write(MODEL)
 with open("/content/thinking_models.txt", "w", encoding="utf-8") as fh:

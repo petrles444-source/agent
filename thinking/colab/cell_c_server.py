@@ -25,12 +25,46 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------- конфиг ---
+def _env_export(key: str, default: str = "") -> str:
+    """Последнее значение `export KEY=...` из /content/thinking_env.sh.
+
+    Туда ячейка D пишет THINKING_CTX — сервер и сторож должны брать одно и то же
+    значение окна (AUD-08), и бюджет ответа тоже прижимается к нему.
+    """
+    try:
+        for line in open("/content/thinking_env.sh", encoding="utf-8"):
+            if line.startswith(f"export {key}="):
+                default = line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+
 UPSTREAM = os.environ.get("THINKING_UPSTREAM",
                           "http://127.0.0.1:8001/v1/chat/completions")
 MODEL_NAME = os.environ.get("THINKING_MODEL", "thinking")
 TOKEN = os.environ.get("THINKING_TOKEN", "")
 LLM_TIMEOUT = float(os.environ.get("THINKING_TIMEOUT", "300"))
 MAX_TOKENS = int(os.environ.get("THINKING_MAX_TOKENS", "700"))
+
+
+def _ctx_limit() -> int:
+    """Сколько токенов ответа влезает в окно движка.
+
+    Бюджеты в ячейке D задают длину ответа, а не «боязнь долгого ответа».
+    Но окно модели (n_ctx) — жёсткий предел: промт плюс ответ должны в него
+    уместиться, иначе llama.cpp обрезает промт или отказывает. Резервируем
+    ~1200 токенов под системный промт, память и код активного файла.
+    """
+    try:
+        gpu = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
+    except Exception:
+        gpu = False
+    ctx = int(_env_export("THINKING_CTX", "8192" if gpu else "4096") or 4096)
+    return max(256, ctx - 1200)
+
+
+MAX_TOKENS = min(MAX_TOKENS, _ctx_limit())
 RPS = int(os.environ.get("THINKING_RPS", "5"))
 CONCURRENCY = int(os.environ.get("THINKING_CONCURRENCY", "1"))
 MAX_EVENTS, MAX_PLANS, PLAN_TTL_S = 1000, 64, 3600
@@ -769,7 +803,7 @@ async def reflect(req: ReflectRequest, x_agent_token: str = Header(default=""), 
                               f"РЕЗУЛЬТАТ: {req.result[:2000]}\n"
                               f"НАБЛЮДЕНИЕ: {req.observation or '-'}\n"
                               f"ОШИБКА: {req.error or '-'}",
-                              max_tokens=500)
+                              max_tokens=min(500, _ctx_limit()))
         data = await reflect_data(raw)
         status = data.get("status")
         if status not in ("ok", "adjust", "abort"):
@@ -941,21 +975,6 @@ def _model_hint(path: str, gpu: Optional[bool] = None) -> str:
     return f"{here}; на T4 любая модель считается заметно быстрее.{unc}"
 
 
-def _env_export(key: str, default: str = "") -> str:
-    """Последнее значение `export KEY=...` из /content/thinking_env.sh.
-
-    Ячейка D пишет туда THINKING_CTX — сторожевый перезапуск через _llm_cmd
-    должен использовать тот же контекст, что и первый запуск (AUD-08).
-    """
-    try:
-        for line in open("/content/thinking_env.sh", encoding="utf-8"):
-            if line.startswith(f"export {key}="):
-                default = line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return default
-
-
 def _llm_cmd(model_path: str) -> list[str]:
     """Та же строка запуска, что и в ячейке D, но с нужной моделью."""
     gpu = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
@@ -1077,8 +1096,9 @@ async def chat_stream_ep(req: ChatRequest, x_agent_token: str = Header(default="
     facts = [str(f) for f in (memory.get("facts") or []) if str(f).strip()]
     used = bool(facts or req.profile or req.history)
     await emit("thought", f"Чат (поток): {req.message[:120]}")
-    max_tokens = int(os.environ.get("THINKING_CHAT_MAX_TOKENS",
-                                    str(max(MAX_TOKENS, 700))))
+    max_tokens = min(int(os.environ.get("THINKING_CHAT_MAX_TOKENS",
+                                      str(max(MAX_TOKENS, 700)))),
+                      _ctx_limit())      # бюджет не должен превышать окно
 
     async def gen():
         buf: list[str] = []
@@ -1119,8 +1139,9 @@ async def dev(req: DevRequest, x_agent_token: str = Header(default=""),
     _auth(x_agent_token, token)
     t0 = time.time()
     await emit("thought", f"Разработка: {req.message[:120]}")
-    max_tokens = int(os.environ.get("THINKING_DEV_MAX_TOKENS",
-                                    str(max(MAX_TOKENS, 1600))))
+    max_tokens = min(int(os.environ.get("THINKING_DEV_MAX_TOKENS",
+                                      str(max(MAX_TOKENS, 1600)))),
+                      _ctx_limit())
     try:
         raw, usage = await chat_json_usage(SYSTEM_DEV, build_dev_prompt(req),
                                            max_tokens)

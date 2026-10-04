@@ -240,7 +240,19 @@ def make_notebook(url: str, inline: bool = True, ver: str = "") -> dict:
             write("/content/tc/cell_e_background.py", "cell_e_background.py"),
             write("/content/tc/cell_f_stop.py", "cell_f_stop.py"),
             _nb_cell("code", "#@title 2/7 · Ячейка A — окружение, сборка, модель\n"
-                             "import runpy; runpy.run_path('/content/tc/cell_a_setup.py', run_name='__main__')"),
+                             "import os, runpy\n"
+                             "# ── Что скачивать (поменяй строку и перезапуни) ──\n"
+                             "# light      — 3B + 1.5B (~2 ГБ), быстро, для CPU\n"
+                             "# gpu        — 7B + 3B + 1.5B (~6 ГБ), для T4\n"
+                             "# big        — Qwen3-30B-A3B (17 ГБ) + 3B: MoE, активны 3B,\n"
+                             "#               отвечает как большая, считает почти как 3B\n"
+                             "# strong     — Qwen2.5-14B + Coder-14B (17 ГБ), влезают в RAM\n"
+                             "# coder      — Qwen2.5-Coder-32B (18 ГБ), лучший для кода\n"
+                             "# uncensored — сборки без цензуры + обычная 3B\n"
+                             "# all        — всё сразу (~60 ГБ, НЕ советуем)\n"
+                             "PROFILE = \"big\"\n"
+                             "os.environ[\"THINKING_PROFILE\"] = PROFILE\n"
+                             "runpy.run_path('/content/tc/cell_a_setup.py', run_name='__main__')"),
             _nb_cell("code", "#@title 3/7 · Ячейка C — сборка API-сервера\n"
                              "import pathlib\n"
                              "src = pathlib.Path('/content/thinking_server.py')\n"
