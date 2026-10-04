@@ -473,6 +473,50 @@ async def chat_json_usage(system: str, user: str,
     return data["choices"][0]["message"]["content"], (usage if isinstance(usage, dict) else {})
 
 
+async def with_heartbeat(src, gap: float = 15.0):
+    """Отдаёт SSE-комментарии, пока модель молчит.
+
+    Cloudflare рвёт соединение по 524, если не получил первые байты ТЕЛА
+    ответа дольше ~120 с. Заголовки приходят мгновенно, а тело — только
+    когда модель выдаст первый токен, и на 14B на CPU это больше минуты
+    (04.10: `ask` и обычный `/chat` оба падали в 524, хотя модель жива).
+    Поэтому шлём `: ping` сразу и далее каждые `gap` секунд: это валидный
+    SSE-комментарий, который прокси пропускает, а клиент игнорирует.
+
+    Наполнение идёт отдельной задачей: иначе таймаут отменял бы чтение
+    модели на полуслове и поток вёлся бы в никуда.
+    """
+    q: asyncio.Queue = asyncio.Queue()
+    done = object()
+
+    async def _pump() -> None:
+        try:
+            async for item in src:
+                await q.put(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await q.put(exc)
+        await q.put(done)
+
+    task = asyncio.create_task(_pump())
+    try:
+        yield ": open\n\n"                     # первый байт тела — сразу
+        while True:
+            try:
+                item = await asyncio.wait_for(q.get(), timeout=gap)
+            except asyncio.TimeoutError:
+                yield f": ping {int(time.time())}\n\n"
+                continue
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        task.cancel()
+
+
 async def chat_stream(system: str, user: str, max_tokens: int = MAX_TOKENS):
     async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as c:
         async with c.stream("POST", UPSTREAM, json={
@@ -784,7 +828,7 @@ async def plan_stream(req: PlanRequest, x_agent_token: str = Header(default=""),
             yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
                                          ensure_ascii=False) + "\n\n")
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
+    return StreamingResponse(with_heartbeat(gen()), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
 
@@ -1125,7 +1169,7 @@ async def chat_stream_ep(req: ChatRequest, x_agent_token: str = Header(default="
             S.stats["errors"] += 1
             yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
                                          ensure_ascii=False) + "\n\n")
-    return StreamingResponse(gen(), media_type="text/event-stream",
+    return StreamingResponse(with_heartbeat(gen()), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
 
@@ -1198,7 +1242,7 @@ async def dev_stream(req: DevRequest, x_agent_token: str = Header(default=""),
             S.stats["errors"] += 1
             yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
                                          ensure_ascii=False) + "\n\n")
-    return StreamingResponse(gen(), media_type="text/event-stream",
+    return StreamingResponse(with_heartbeat(gen()), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
 

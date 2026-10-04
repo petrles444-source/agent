@@ -67,8 +67,33 @@ DUMP_FILES = ("llm.log", "api.log", "tunnel.log", "server.py",
 
 
 def _out(text: str) -> None:
-    sys.stdout.write(text + "\n")
-    sys.stdout.flush()
+    """Печать в консоль, которая не умеет в unicode.
+
+    На Windows консоль по умолчанию cp1251, и любой символ вне неё (стрелка,
+    галочка, значок) ронял команду с UnicodeEncodeError — пользователь видел
+    трейсбек вместо результата (04.10: `models` падал на стрелке «→»).
+    Раньше каждая команда должна была обойти это вручную; теперь печать
+    безопасна везде, а символы, которые консоль не тянет, заменяются на
+    похожие: → ⇒ >, ✓ v, ✗ x, ⚠ !
+    """
+    text = text.translate(_ASCII_FALLBACK)
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "ascii"
+        sys.stdout.write(text.encode(enc, "replace").decode(enc, "replace") + "\n")
+        sys.stdout.flush()
+
+
+# Символы, которых нет в cp1251, но которые мы печатаем регулярно.
+# str.translate оставляет на месте всё, чего в таблице нет, — добирает
+# try/except выше на случай экзотики.
+_ASCII_FALLBACK = str.maketrans({
+    "→": "=>", "⇒": "=>", "←": "<-", "✓": "v", "✔": "v", "✗": "x", "✘": "x",
+    "⚠": "!", "★": "*", "•": "-", "—": "-", "–": "-", "…": "...",
+    "«": '"', "»": '"', "№": "N", "≈": "~", "≥": ">=", "≤": "<=",
+})
 
 
 def _port_busy(host: str, port: int) -> bool:

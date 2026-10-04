@@ -840,6 +840,75 @@ def test_failure_diagnostics() -> None:
           "ячейка F: остановка по-прежнему требует явного разрешения")
 
 
+def test_sse_heartbeat() -> None:
+    """Поток «дышит», пока модель молчит — иначе Cloudflare даёт 524.
+
+    Найдено на живом прогоне 04.10 с моделью 14B на CPU: первый токен не
+    приходил дольше минуты, и Cloudflare рвал соединение, хотя модель была
+    жива. Сервер шлёт `: ping` сразу и каждые 15 с.
+
+    Это первый тест, который исполняет серверный код (остальные проверки
+    cell_c — сверка текста), потому что тут важно поведение, а не наличие
+    строки: пинг должен идти при молчании, данные — проходить насквозь, а
+    ошибка модели — подниматься до вызывающего.
+    """
+    import asyncio
+    src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    start = src.index("async def with_heartbeat")
+    rest = src[start + 10:]
+    end = min((rest.find("\nasync def ") if rest.find("\nasync def ") >= 0 else len(rest)),
+              (rest.find("\ndef ") if rest.find("\ndef ") >= 0 else len(rest)))
+    ns: dict = {"asyncio": asyncio, "time": __import__("time")}
+    exec("import asyncio, time\n" + src[start:start + 10 + end], ns)
+    hb = ns["with_heartbeat"]
+
+    async def slow():
+        await asyncio.sleep(0.35)          # модель думает дольше, чем gap
+        yield "data: {\"type\":\"token\"}\n\n"
+
+    async def boom():
+        yield "data: A\n\n"
+        raise RuntimeError("upstream упал")
+
+    async def collect(srcgen, gap):
+        out = []
+        async for chunk in hb(srcgen, gap=gap):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio.run(collect(slow(), 0.1))
+    check(chunks and chunks[0].startswith(":"),
+          "SSE: первый байт тела уходит сразу, не дожидаясь модели")
+    pings = [c for c in chunks if c.startswith(": ping")]
+    check(len(pings) >= 2,
+          f"SSE: пока модель молчит, идут пинги (получено {len(pings)})")
+    check(any(c.startswith("data:") for c in chunks),
+          "SSE: данные модели проходят насквозь")
+    check(chunks[-1].startswith("data:"),
+          "SSE: поток заканчивается данными, а не пингом")
+
+    async def collect_err():
+        out = []
+        try:
+            async for chunk in hb(boom(), gap=0.1):
+                out.append(chunk)
+        except RuntimeError as exc:
+            return ("raised", str(exc))
+        return ("no-raise", out)
+    kind, val = asyncio.run(collect_err())
+    check(kind == "raised" and "upstream упал" in val,
+          "SSE: ошибка модели поднимается до вызывающего, а не теряется")
+
+    # пинги должны быть на маршрутах, которые ходят через туннель
+    for route in ("/plan/stream", "/chat/stream", "/dev/stream"):
+        i = src.index(f'@app.post("{route}")')
+        j = src.index("\n@app.", i + 1) if src.find("\n@app.", i + 1) >= 0 else len(src)
+        check("with_heartbeat(gen())" in src[i:j],
+              f"SSE: маршрут {route} отдаёт поток с пингами")
+    check("stream_stall" in (ROOT / "thinking" / "client.py").read_text(encoding="utf-8"),
+          "клиент: сторож молчания есть и не сработает на пингах")
+
+
 def test_instructions_present() -> None:
     """Инструкция «как поднять» есть в ноутбуке, README и быстром старте.
 
@@ -1463,6 +1532,7 @@ def main() -> int:
     test_chat_author()
     test_budget_matches_running_model()
     test_failure_diagnostics()
+    test_sse_heartbeat()
     test_instructions_present()
     test_dev_layout_vertical()
     test_dev_run_stdin()
