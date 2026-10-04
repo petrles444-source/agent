@@ -517,9 +517,10 @@ async def with_heartbeat(src, gap: float = 15.0):
         task.cancel()
 
 
-async def chat_stream(system: str, user: str, max_tokens: int = MAX_TOKENS):
+async def chat_stream(system: str, user: str, max_tokens: int = MAX_TOKENS,
+                      url: str = ""):
     async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as c:
-        async with c.stream("POST", UPSTREAM, json={
+        async with c.stream("POST", url or UPSTREAM, json={
             "model": MODEL_NAME, "stream": True, "temperature": 0.2,
             "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system},
@@ -1122,6 +1123,80 @@ async def set_model(req: ModelRequest, x_agent_token: str = Header(default=""),
         S.stats["errors"] += 1
         await emit("error", f"переключение не удалось: {exc}")
         raise HTTPException(500, str(exc)[:300])
+
+
+PARALLEL_FILE = "/content/parallel_models.json"
+
+
+def _parallel_models() -> list[dict]:
+    """Дополнительные движки, поднятые ячейкой D (по одному на модель).
+
+    Читаются из манифеста, а не из памяти: манифест пишет ячейка D, а сервер
+    может перезапускаться сторожем и должен подхватить список заново.
+    """
+    try:
+        with open(PARALLEL_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return []
+    return [d for d in data if isinstance(d, dict) and d.get("url")]
+
+
+@app.get("/parallel")
+async def parallel(x_agent_token: str = Header(default=""), token: str = ""):
+    """Какие модели держатся параллельно и отвечают прямо сейчас."""
+    _auth(x_agent_token, token)
+    items = _parallel_models()
+    return {"active": _model_label(_active_model()),
+            "url": UPSTREAM,
+            "extra": items,
+            "count": len(items)}
+
+
+@app.post("/ask/multi")
+async def ask_multi(req: ChatRequest, x_agent_token: str = Header(default=""),
+                    token: str = ""):
+    """Один вопрос — несколько моделей одновременно, ответы рядом.
+
+    Честно о цене: ядра у рантайма те же самые, поэтому СУММАРНАЯ скорость
+    не растёт — каждый ответ просто становится в N раз дольше. Польза не в
+    скорости, а в сравнении: видно, где сильная модель ошибается, а где
+    слабая справляется, и ответ можно выбрать руками.
+
+    Дополнительные движки поднимает ячейка D (THINKING_PARALLEL) и пишет
+    манифест; если его нет — отвечает только основная модель.
+    """
+    _auth(x_agent_token, token)
+    t0 = time.time()
+    targets: list[tuple[str, str]] = [(_model_label(_active_model()), UPSTREAM)]
+    targets += [(str(d.get("label") or d.get("path")), str(d["url"]))
+                for d in _parallel_models()]
+    max_tokens = min(int(os.environ.get("THINKING_CHAT_MAX_TOKENS",
+                                      str(max(MAX_TOKENS, 700)))), _ctx_limit())
+    await emit("thought", f"Параллельный вопрос {len(targets)} моделям: "
+                          f"{req.message[:100]}")
+
+    async def one(label: str, url: str) -> dict:
+        started = time.time()
+        buf: list[str] = []
+        try:
+            async for piece in chat_stream(SYSTEM_CHAT, build_chat_prompt(req),
+                                           max_tokens, url=url):
+                buf.append(piece)
+            return {"model": label, "ok": True,
+                    "answer": "".join(buf).strip()[:4000],
+                    "seconds": round(time.time() - started, 1)}
+        except Exception as exc:             # noqa: BLE001
+            S.stats["errors"] += 1
+            return {"model": label, "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                    "seconds": round(time.time() - started, 1)}
+
+    answers = await asyncio.gather(*(one(lbl, u) for lbl, u in targets))
+    S.stats["chats"] += 1
+    return {"answers": list(answers), "count": len(answers),
+            "wall_seconds": round(time.time() - t0, 1),
+            "note": "суммарная скорость не растёт: ядра те же, ответы идут параллельно"}
 
 
 @app.post("/chat/stream")

@@ -162,7 +162,16 @@ PROFILES: dict[str, list[str]] = {
     "big": ["30b-a3b-q4", "3b-instruct-q4"],
     "coder": ["coder-32b", "coder-14b", "3b-instruct-q4"],
     "uncensored": ["3b-instruct-uncensored", "3b-instruct-q4", "1.5b-instruct-q4"],
+    # Рабочий профиль для CPU: быстрая основная модель, рядом лежат
+    # запасная (меньше основной) и 7B для переключения на лету.
+    "dev": ["3b-instruct-q4", "1.5b-instruct-q4"],
     "all": sorted(CATALOG, key=lambda t: -CATALOG[t][3]),
+}
+# Модели, которые докачиваем, но НЕ ставим в цепочку отката: откат на CPU
+# обязан вести к меньшей модели, иначе он не спасает. А эти — для ручного
+# переключения во вкладке «Модели», когда нужна проверка качества подольше.
+ALSO: dict[str, list[str]] = {
+    "dev": ["7b-instruct-q4"],
 }
 PROFILE = (os.environ.get("THINKING_PROFILE") or "auto").strip().lower()
 if PROFILE in ("", "auto"):
@@ -200,13 +209,17 @@ def _fetch(repo: str, min_size: int) -> str:
 
 MODELS: list[str] = []
 tag_of: dict[str, str] = {}                  # путь → тег (для выбора активной)
-for tag in WANTED_TAGS:
+# Качаем и цепочку отката, и дополнительные (ALSO), но в цепочку попадают
+# только модели профиля — дополнительные лежат на диске для переключения.
+for tag in list(WANTED_TAGS) + [t for t in ALSO.get(PROFILE, [])
+                                if t not in WANTED_TAGS]:
     repo, min_size, label, _rank = CATALOG[tag]
     path = _has(tag)
     if path:
         say(f"{tag}: уже на диске ({os.path.getsize(path) / 2**30:.2f} ГБ) — пропускаем")
-        MODELS.append(path)
-        tag_of[path] = tag
+        if tag in WANTED_TAGS:
+            MODELS.append(path)
+            tag_of[path] = tag
         continue
     say(f"{tag}: качаю {repo}…")
     try:
@@ -215,8 +228,11 @@ for tag in WANTED_TAGS:
         say(f"  {repo}: {type(exc).__name__} {str(exc)[:100]}")
         path = ""
     if path:
-        MODELS.append(path)
-        tag_of[path] = tag
+        if tag in WANTED_TAGS:
+            MODELS.append(path)
+            tag_of[path] = tag
+        else:
+            say("  (вне цепочки отката — только для переключения во вкладке «Модели»)")
     else:
         say(f"  {tag}: не скачалась, пропускаем (работаем на остальных)")
 
@@ -247,7 +263,8 @@ def _hint(p: str) -> str:
         return (f"32B{code}{unc}: очень сильная, но на CPU медленная — "
                 f"смени Runtime на T4 GPU")
     if "14b" in name:
-        return (f"14B{code}{unc}: влезает в RAM целиком, на CPU ~2–4 ток/с")
+        return (f"14B{code}{unc}: 8.4 ГБ весов. На Colab (12.6 ГБ RAM) впритык — "
+                "замерено 0.05 ток/с из-за подкачки страниц. Нужен RAM от 16 ГБ")
     if "7b" in name:
         return (f"7B{unc}: смени Runtime → Change runtime type → T4 GPU "
                 f"(на CPU ~1 ток/с)")

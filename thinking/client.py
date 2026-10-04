@@ -872,6 +872,51 @@ class ThinkingClient:
     # ------------------------------------------------------------------ #
     #  ЧАТ: человек ↔ субагент, с памятью и учётом токенов
     # ------------------------------------------------------------------ #
+    def multi_chat(self, message: str, use_memory: bool = False,
+                   timeout: Optional[float] = None) -> dict:
+        """Один вопрос — всем моделям сразу, ответы рядом.
+
+        Дополнительные движки поднимает ячейка D (THINKING_PARALLEL) и
+        описывает в манифесте; сервер опрашивает их параллельно через
+        asyncio.gather. Если дополнительных моделей нет, отвечает только
+        основная — маршрут не ломается, а просто возвращает один ответ.
+
+        Скорость не растёт: ядра те же, поэтому каждый ответ дольше примерно
+        в N раз. Ценность в сравнении, а не в темпе.
+        """
+        text = str(message or "").strip()
+        if not text:
+            raise SchemaError("пустое сообщение")
+        self._check_secrets(text)
+        body: dict[str, Any] = {"message": text[:2000]}
+        if use_memory:
+            mem = self.memory()
+            body["profile"] = str(mem.get("profile") or "")[:800]
+            body["context"] = {"memory": {"facts": mem.get("facts", [])[-12:]}}
+        read_to = timeout or max(self.timeout,
+                                 float(self.cfg.get("chat_json_timeout", 300)),
+                                 # N моделей делят ядра: ждать дольше
+                                 float(self.cfg.get("multi_timeout", 900)))
+        out = self._json("POST", "/ask/multi", body, timeout=read_to)
+        answers = out.get("answers") or []
+        if not isinstance(answers, list):
+            raise SchemaError(f"/ask/multi: answers — не список: {type(answers).__name__}")
+        return {"answers": answers,
+                "count": int(out.get("count") or len(answers)),
+                "wall_seconds": float(out.get("wall_seconds") or 0.0),
+                "note": str(out.get("note") or "")}
+
+    def parallel_models(self) -> dict:
+        """Какие модели держатся параллельно прямо сейчас."""
+        try:
+            out = self._json("GET", "/parallel", None, timeout=30)
+        except ThinkingError:
+            return {"active": "", "extra": [], "count": 0}
+        extra = out.get("extra")
+        return {"active": str(out.get("active") or ""),
+                "extra": extra if isinstance(extra, list) else [],
+                "count": int(out.get("count") or 0)}
+
     def chat(self, message: str, use_memory: bool = True,
              max_steps: int = 4, timeout: Optional[float] = None,
              author: str = "agent") -> dict:

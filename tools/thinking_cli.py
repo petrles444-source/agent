@@ -235,6 +235,45 @@ def _plan_streamed(client: ThinkingClient, task: str, context: dict,
     return plan
 
 
+def cmd_ask_multi(client: ThinkingClient, args: argparse.Namespace) -> int:
+    """Один вопрос — всем моделям сразу, ответы рядом.
+
+    Честно о смысле: ядра у рантайма одни, поэтому СУММАРНАЯ скорость не
+    растёт — каждый ответ дольше примерно в N раз. Польза в сравнении: видно,
+    где сильная модель спотыкается, а где справляется слабая, и ответ можно
+    выбрать руками.
+    """
+    try:
+        out = client.multi_chat(args.task)
+    except ThinkingError as exc:
+        _out(f"! параллельный вопрос не прошёл: {exc}")
+        return 1
+    if getattr(args, "json", False):
+        _out(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    answers = out.get("answers") or []
+    if not answers:
+        _out("! ни одна модель не ответила")
+        return 1
+    _out(f"моделей: {out.get('count')}  ·  стены: {out.get('wall_seconds')} с")
+    if out.get("note"):
+        _out(f"({out['note']})")
+    ok = [a for a in answers if a.get("ok")]
+    for i, a in enumerate(answers, 1):
+        mark = "v" if a.get("ok") else "x"
+        _out("")
+        _out(f"--- {mark} {i}. {a.get('model')}  ({a.get('seconds')} с) ---")
+        if a.get("ok"):
+            _out(str(a.get("answer") or "").strip() or "(пусто)")
+        else:
+            _out(f"ошибка: {a.get('error')}")
+    if len(ok) > 1:
+        _out("")
+        _out(f"ответов пришло: {len(ok)} из {len(answers)} · "
+              f"самый быстрый: {min(ok, key=lambda a: float(a.get('seconds') or 0)).get('model')}")
+    return 0
+
+
 def cmd_ask(client: ThinkingClient, args: argparse.Namespace) -> int:
     args.files = ""
     args.constraint = []
@@ -1235,6 +1274,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--stream", action="store_true")
 
+    s = sub.add_parser("ask-multi")
+    s.add_argument("task")
+    s.add_argument("--json", action="store_true")
+
     s = sub.add_parser("reflect")
     s.add_argument("plan_id")
     s.add_argument("--step", type=int, required=True)
@@ -1294,6 +1337,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_plan(client, args)
         if args.cmd == "ask":
             return cmd_ask(client, args)
+        if args.cmd == "ask-multi":
+            return cmd_ask_multi(client, args)
         if args.cmd == "reflect":
             return cmd_reflect(client, args)
         if args.cmd == "tail":

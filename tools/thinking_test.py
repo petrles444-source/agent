@@ -804,6 +804,35 @@ def test_budget_matches_running_model() -> None:
           "ячейка D: большая модель ждёт подъёма дольше (17 ГБ не успевает за 90 с)")
 
 
+def test_dev_profile_and_honest_hints() -> None:
+    """Профиль для CPU и честные подсказки о моделях.
+
+    Замер 04.10: 14B (8.4 ГБ весов) при свободных 3.0 ГБ дала 0.05 ток/с —
+    подкачка страниц. Подсказка обещала «влезает в RAM целиком, ~2–4 ток/с»,
+    то есть врала ровно в том, на чём человек и принимает решение.
+
+    Профиль `dev`: быстрая основная модель, запасная меньше неё, и 7B
+    отдельно — на диске для переключения во вкладке «Модели», но вне цепочки
+    отката (откат на CPU обязан вести к меньшей модели).
+    """
+    setup = (ROOT / "thinking" / "colab" / "cell_a_setup.py").read_text(encoding="utf-8")
+    check('"dev": ["3b-instruct-q4", "1.5b-instruct-q4"]' in setup,
+          "ячейка A: профиль dev — 3B основная, 1.5B запасная")
+    check('"dev": ["7b-instruct-q4"]' in setup,
+          "ячейка A: профиль dev докачивает 7B вне цепочки отката")
+    check("if tag in WANTED_TAGS:" in setup,
+          "ячейка A: в цепочку отката попадают только модели профиля")
+    check("вне цепочки отката" in setup,
+          "ячейка A: говорит, зачем докачана модель вне цепочки")
+    check("0.05 ток/с" in setup and "подкачки страниц" in setup,
+          "ячейка A: подсказка про 14B называет замеренную скорость и причину")
+    check("влезает в RAM целиком" not in setup,
+          "ячейка A: подсказка про 14B больше не обещает несуществующую скорость")
+    # окно для будущего платного Colab не закрываем
+    check("Нужен RAM от 16 ГБ" in setup,
+          "ячейка A: 14B помечена как вариант для рантайма с RAM от 16 ГБ")
+
+
 def test_failure_diagnostics() -> None:
     """Причину отказа модели видно по коду возврата, а отказ от остановки
     в ячейке F не выглядит аварией.
@@ -937,6 +966,55 @@ def test_watchdog_and_ram_guard() -> None:
           "ячейка D: предупреждает о подкачке страниц и называет замеренную скорость")
     check("Профиль gpu (7B" in warn,
           "ячейка D: при нехватке памяти советует профиль, который влезет")
+
+
+def test_parallel_models() -> None:
+    """Параллельные модели: поднимаются по запросу, отвечают все сразу,
+    и честно сказано, что скорость от этого не растёт.
+
+    Требование пользователя: несколько моделей должны работать одновременно.
+    Считаем честно — ядра у рантайма те же, поэтому СУММАРНАЯ скорость не
+    растёт (каждый ответ дольше примерно в N раз). Польза в сравнении и в
+    доступности без переключения, и об этом сказано и в коде, и в выводе.
+    """
+    setup_d = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    check("THINKING_PARALLEL" in setup_d,
+          "ячейка D: дополнительные модели задаются переменной THINKING_PARALLEL")
+    check("PARALLEL_FILE" in setup_d and "json.dump(_manifest" in setup_d,
+          "ячейка D: поднятые дополнительные модели пишутся в манифест")
+    check("_cmd[_cmd.index(\"--port\") + 1]" in setup_d,
+          "ячейка D: у каждой дополнительной модели свой порт")
+    check("не поместится, будет подкачка страниц" in setup_d,
+          "ячейка D: модель, не влезающая в свободную память, не поднимается")
+    check("по умолчанию\n# работает одна модель" in setup_d
+          or "работает одна модель, как раньше" in setup_d,
+          "ячейка D: без явного списка всё работает как раньше — одна модель")
+
+    srv = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    check('@app.post("/ask/multi")' in srv, "сервер: маршрут параллельного вопроса")
+    check("asyncio.gather" in srv,
+          "сервер: модели опрашиваются одновременно, а не по очереди")
+    check("суммарная скорость не растёт" in srv,
+          "сервер: честно говорит, что суммарная скорость не растёт")
+    check("url: str = \"\"" in srv and "url or UPSTREAM" in srv,
+          "сервер: чат-стрим умеет говорить с конкретным движком")
+    check('@app.get("/parallel")' in srv, "сервер: список параллельных моделей")
+
+    cli = (ROOT / "thinking" / "client.py").read_text(encoding="utf-8")
+    check("def multi_chat(" in cli and '"/ask/multi"' in cli,
+          "клиент: метод параллельного вопроса")
+    check("def parallel_models(" in cli and '"/parallel"' in cli,
+          "клиент: узнать, какие модели держатся параллельно")
+    check("multi_timeout" in cli,
+          "клиент: на N моделей увеличено ожидание (ядра делятся)")
+
+    tools = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    check("def cmd_ask_multi(" in tools and 'sub.add_parser("ask-multi")' in tools,
+          "CLI: команда ask-multi")
+    check("самый быстрый:" in tools,
+          "CLI: показывает, какая модель ответила быстрее всего")
+    check("суммарная скорость не растёт" in " ".join(tools.split()).lower(),
+          "CLI: повторяет честное предупреждение о скорости")
 
 
 def test_instructions_present() -> None:
@@ -1284,8 +1362,9 @@ def test_dev_metrics_limits() -> None:
     # качания идёт по тегам профиля (раньше здесь был dict.fromkeys)
     check("CATALOG: dict[str, tuple[str, int, str, int]]" in setup,
           "ячейка A: каталог моделей — словарь, теги уникальны по построению")
-    check("for tag in WANTED_TAGS:" in setup,
-          "ячейка A: качаем теги выбранного профиля, без дублей")
+    check("for tag in list(WANTED_TAGS) + [t for t in ALSO.get(PROFILE, [])" in setup
+          and "if t not in WANTED_TAGS]:" in setup,
+          "ячейка A: качаем теги профиля плюс ALSO, без дублей")
     # Запасная модель профиля обязана быть заметно меньше основной.
     # Иначе откат бесполезен: если основная не влезла в RAM по памяти,
     # модель того же размера тоже не влезет, и мы просто потратим на неё
@@ -1564,6 +1643,8 @@ def main() -> int:
     test_failure_diagnostics()
     test_sse_heartbeat()
     test_watchdog_and_ram_guard()
+    test_dev_profile_and_honest_hints()
+    test_parallel_models()
     test_instructions_present()
     test_dev_layout_vertical()
     test_dev_run_stdin()

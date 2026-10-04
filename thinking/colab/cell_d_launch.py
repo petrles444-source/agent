@@ -252,6 +252,62 @@ llm_cmd[llm_cmd.index("--model") + 1] = MODEL
 PROCS: dict = {"llm": llm_proc}
 print("LLM ready:", health.text[:200])
 
+# ---- 2b) дополнительные движки: несколько моделей одновременно -------------
+# Смысл: держать несколько моделей поднятыми, чтобы один вопрос получить сразу
+# от нескольких (сверка качества) и не тратить время на переключение.
+#
+# Честно о цене. Ядра у рантайма одни и те же, поэтому СУММАРНАЯ скорость не
+# растёт: каждый из N ответов идёт примерно в N раз дольше. Выигрыш здесь не в
+# скорости, а в сравнении ответов и в доступности без перезапуска. Включается
+# только если явно задан список путей в THINKING_PARALLEL — по умолчанию
+# работает одна модель, как раньше.
+#
+# Память: сумма весов всех дополнительных моделей должна помещаться в RAM
+# вместе с основной, иначе начнётся подкачка страниц и всё встанет колом.
+PARALLEL_FILE = "/content/parallel_models.json"
+_extra = [p.strip() for p in os.environ.get("THINKING_PARALLEL", "").split(",")
+          if p.strip()]
+_manifest: list[dict] = []
+if _extra:
+    print(f"дополнительных моделей: {len(_extra)} (каждой — свой порт)")
+for _i, _path in enumerate(_extra, start=2):
+    _name = os.path.basename(_path)
+    if not os.path.exists(_path):
+        print(f"  {_name}: файла нет — пропускаю")
+        continue
+    _gb = os.path.getsize(_path) / 1024 ** 3
+    _avail = _avail_gb()
+    if _avail and _gb > _avail * 0.8:
+        print(f"  {_name}: {_gb:.1f} ГБ при свободных {_avail:.1f} ГБ — "
+              "не поместится, будет подкачка страниц. Пропускаю.")
+        continue
+    _cmd = list(llm_cmd)
+    _cmd[_cmd.index("--model") + 1] = _path
+    _cmd[_cmd.index("--port") + 1] = str(8000 + _i)
+    _cmd[_cmd.index("--model_alias") + 1] = f"thinking{_i}"
+    _proc = subprocess.Popen(_cmd, stdout=open(LOG_LLM, "a", encoding="utf-8"),
+                             stderr=subprocess.STDOUT)
+    print(f"  {_name} ({_gb:.1f} ГБ) на порту {8000 + _i}, pid {_proc.pid}")
+    if wait_http(f"http://127.0.0.1:{8000 + _i}/v1/models",
+                 tries=45 + int(_gb * 12), gap=2) is None:
+        print(f"  {_name}: не поднялась — пропускаю")
+        try:
+            _proc.kill()
+        except Exception:
+            pass
+        continue
+    PROCS[f"llm{_i}"] = _proc
+    _manifest.append({"path": _path, "label": _name,
+                      "url": f"http://127.0.0.1:{8000 + _i}",
+                      "size_gb": round(_gb, 2), "pid": _proc.pid})
+with open(PARALLEL_FILE, "w", encoding="utf-8") as _fh:
+    json.dump(_manifest, _fh, ensure_ascii=False, indent=1)
+if _manifest:
+    print(f"параллельных моделей поднято: {len(_manifest)} → "
+          + ", ".join(m["label"] for m in _manifest))
+else:
+    print("параллельные модели не запрошены (THINKING_PARALLEL пуст) — работает одна")
+
 # ---- 3) смоук-тест генерации ----------------------------------------------
 # На CPU модель может отвечать дольше 180 с или упасть на старте — это не
 # повод ронять ячейку целиком: API и туннель поднимаются дальше, а проверить
