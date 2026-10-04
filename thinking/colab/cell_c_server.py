@@ -912,7 +912,12 @@ async def metrics(x_agent_token: str = Header(default=""), token: str = ""):
             "stream_aborted": S.stats["stream_aborted"],
             "stream_first_ms_avg": _avg(S.stats["stream_first_ms"]),
             "sem_wait_ms_avg": _avg(S.stats["sem_wait_ms"]),
-            "sem_timeouts": S.stats["sem_timeouts"]}
+            "sem_timeouts": S.stats["sem_timeouts"],
+            # счётчики, которые считались, но не отдавались — мёртвая
+            # телеметрия (аудит B, 03-colab)
+            "plain_text": S.stats.get("plain_text", 0),
+            "model_switches": S.stats.get("model_switches", 0),
+            "subscriber_limit": 200}
 
 
 @app.get("/events")
@@ -1004,6 +1009,17 @@ async def plan_stream(req: PlanRequest, x_agent_token: str = Header(default=""),
             p = Plan(**data)
             _store(p)
             S.stats["plans"] += 1
+            # Поток — основной путь, а события в шину клал только /plan:
+            # из-за этого встроенная панель Colab, /events?tail= и снапшоты
+            # cell E на плане видели пустую ленту (аудит B, 03-colab).
+            # Токены не эмитим — их и не должно быть в S.events.
+            await emit("rationale", p.rationale or "(без объяснения)",
+                       plan_id=p.plan_id)
+            for c in p.contradictions:
+                await emit("contradiction", c, plan_id=p.plan_id)
+            for s in p.steps:
+                await emit("plan_step", f"[{s.id}] {s.desc}",
+                           plan_id=p.plan_id, step_id=s.id)
             yield f"data: {json.dumps({'type': 'rationale', 'text': p.rationale}, ensure_ascii=False)}\n\n"
             for s in p.steps:
                 yield ("data: " + json.dumps({"type": "plan_step",
@@ -1014,10 +1030,13 @@ async def plan_stream(req: PlanRequest, x_agent_token: str = Header(default=""),
             yield ("data: " + json.dumps({"type": "final", "text": final,
                                           "plan_id": p.plan_id},
                                          ensure_ascii=False) + "\n\n")
+            await emit("final", f"План {p.plan_id[:8]} готов: {len(p.steps)} шагов",
+                       plan_id=p.plan_id)
         except Exception as exc:
             S.stats["errors"] += 1
             yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
                                          ensure_ascii=False) + "\n\n")
+            await emit("error", f"план-поток не удался: {str(exc)[:200]}")
 
     return StreamingResponse(with_heartbeat(gen()), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -1641,11 +1660,14 @@ const d=document.createElement('div');d.className='ev '+(ev.type||'');
 const s=document.createElement('span');s.className='t';s.textContent=(ev.ts||'').slice(11,19);
 const x=document.createElement('span');x.className='x';x.textContent=ev.text||'';
 d.append(s,x);b.appendChild(d);b.scrollTop=b.scrollHeight}
+/* EventSource не умеет заголовки, поэтому токен остаётся в query — но
+   uvicorn запущен с --no-access-log, иначе он осел бы в api.log, а тот
+   выгружается наружу через /dump (аудит B, 03-colab) */
 let es=new EventSource("/events/stream?token="+encodeURIComponent(TOK));
 es.onopen=()=>{document.getElementById('b').className='on';document.getElementById('b').textContent='ПОДКЛЮЧЕНО'};
 es.onerror=()=>{document.getElementById('b').className='';document.getElementById('b').textContent='НЕТ СВЯЗИ'};
 es.onmessage=e=>{try{const ev=JSON.parse(e.data);add('c',ev);if(ev.type!=='final')add('a',ev)}catch(x){}};
-async function st(){try{const r=await fetch('/health?token='+encodeURIComponent(TOK),{headers:H()});
+async function st(){try{const r=await fetch('/health',{headers:H()});
 const h=await r.json();document.getElementById('m').textContent=h.model+' · '+h.gpu+' · uptime '+h.uptime_s+' с'
 +' · планов '+h.plans}catch(x){}}
 st();setInterval(st,4000);

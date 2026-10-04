@@ -357,6 +357,9 @@ with open(LOG_API, "a", encoding="utf-8") as _fh:
 with open(LOG_API, "a", encoding="utf-8") as _fh:
     api_proc = subprocess.Popen(api_cmd, cwd="/content",
                                 stdout=_fh, stderr=subprocess.STDOUT)
+# сторож должен знать pid прежнего API, иначе перезапуск не сможет его
+# убить и новый процесс упадёт на занятом :8000 (аудит B, 03-colab)
+PROCS["api"] = api_proc
 print("api pid", api_proc.pid)
 
 hdr = {"X-Agent-Token": TOKEN}
@@ -539,6 +542,58 @@ def _restart_extra() -> None:
                   f"{key}: не поднялся: {type(exc).__name__} {exc}")
 
 
+def _port_free(port: int) -> bool:
+    import socket as _socket
+    with _socket.socket() as s:
+        s.settimeout(1)
+        return s.connect_ex(("127.0.0.1", port)) != 0
+
+
+def _restart_api() -> None:
+    """Перезапускает API, сначала убив прежний процесс.
+
+    Раньше просто Popen: зависший, но живой uvicorn держит :8000, новый
+    падает с bind-ошибкой, а печать «API перезапущен» врёт — и цикл
+    повторялся каждые 3 минуты бесконечно (аудит B, 03-colab, AUD-10
+    закрыт был только для LLM).
+    """
+    old = PROCS.get("api")
+    if old is not None and old.poll() is None:
+        print(time.strftime("%H:%M:%S"), "api: убиваю прежний процесс",
+              old.pid)
+        try:
+            old.terminate()
+            old.wait(timeout=10)
+        except Exception:
+            try:
+                old.kill()
+                old.wait(timeout=5)
+            except Exception:
+                pass
+        # порт мог остаться в TIME_WAIT — ждём освобождения
+        for _ in range(20):
+            if _port_free(8000):
+                break
+            time.sleep(1)
+    with open(LOG_API, "a", encoding="utf-8") as _fh:
+        proc = subprocess.Popen(api_cmd, cwd="/content",
+                                stdout=_fh, stderr=subprocess.STDOUT)
+    PROCS["api"] = proc
+    time.sleep(3)
+    if proc.poll() is not None:
+        # не выдаём успех, которого нет: новый процесс уже умер
+        print(time.strftime("%H:%M:%S"),
+              "API не поднялся, последние строки лога:")
+        try:
+            for line in open(LOG_API, encoding="utf-8",
+                             errors="replace").readlines()[-20:]:
+                print("   |", line.rstrip())
+        except OSError:
+            pass
+        return
+    print(time.strftime("%H:%M:%S"), "API перезапущен", proc.pid)
+
+
 def _watch() -> None:
     api_fail = llm_fail = 0
     while True:
@@ -595,10 +650,7 @@ def _watch() -> None:
                     time.sleep(90)
                     # доп. движки могли упасть вместе с основным
                     _restart_extra()
-                with open(LOG_API, "a", encoding="utf-8") as _fh:
-                    subprocess.Popen(api_cmd, cwd="/content",
-                                     stdout=_fh, stderr=subprocess.STDOUT)
-                print(time.strftime("%H:%M:%S"), "API перезапущен")
+                _restart_api()
                 api_fail = llm_fail = 0
         except Exception as exc:
             # текст ошибки обязателен: «watchdog: RuntimeError» ничего не

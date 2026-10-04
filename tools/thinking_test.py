@@ -2482,6 +2482,18 @@ def test_server_resource_fixes() -> None:
           "Colab: семафор генерации с таймаутом (волна 2)")
     check("stream_aborted" in src and "stream_first_ms" in src,
           "Colab: телеметрия потоков в /metrics (волна 2)")
+    check('await emit("plan_step"' in src and 'await emit("final"' in src,
+          "Colab: /plan/stream кладёт результат в шину событий (панель Colab)")
+    check('"plain_text"' in src and '"model_switches"' in src,
+          "Colab: счётчики plain_text/model_switches отдаются в /metrics")
+    check("fetch('/health',{headers:H()})" in src,
+          "Colab: токен не уезжает в query у health-проверки встроенной панели")
+
+    launch = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    check("def _restart_api" in launch and 'PROCS["api"] = api_proc' in launch,
+          "Colab: сторож убивает прежний API перед перезапуском")
+    check("def _tunnel_alive" in launch and "_start_tunnel()" in launch,
+          "Colab: сторож проверяет туннель снаружи и поднимает его заново")
 
     cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
     check("--no-access-log" in (ROOT / "thinking" / "colab" / "cell_d_launch.py")
