@@ -168,6 +168,8 @@ class ThinkingClient:
             or self.cfg.get("token")
             or os.environ.get("THINKING_TOKEN", "")
         )
+        # --url задал адрес вручную: reload_config() не должен его перетирать
+        self.base_locked = False
         self.timeout = float(self.cfg.get("timeout", 45))
         self.connect_timeout = float(self.cfg.get("connect_timeout", 5))
         self.retry = self.cfg.get("retry") or {}
@@ -218,14 +220,65 @@ class ThinkingClient:
     #  конфигурация
     # ------------------------------------------------------------------ #
     @staticmethod
-    def set_url(base_url: str, token: str = "") -> Path:
-        """Пишет URL/токен в config/thinking.local.json (секреты не в git)."""
+    def set_url(base_url: str, token: str = "", back: bool = False) -> Path:
+        """Пишет URL/токен в config/thinking.local.json (секреты не в git).
+
+        Текущая пара запоминается в поле «prev», а `set-url --back` меняет
+        её местами с текущей. Это и есть возврат с локальной заглушки на
+        Colab: одна команда, без копирования адреса и токена из чата, и
+        повторный --back снова уводит на заглушку.
+        """
         data = _read_json(LOCAL_PATH)
-        data["base_url"] = base_url.rstrip("/")
+        if back:
+            prev = data.get("prev")
+            prev = prev if isinstance(prev, dict) else {}
+            if not prev.get("base_url"):
+                raise ThinkingError(
+                    "предыдущий адрес не сохранён — выполни вручную: "
+                    "python tools/thinking_cli.py set-url <URL> <TOKEN>")
+            cur_base = str(data.get("base_url") or "").rstrip("/")
+            cur_token = str(data.get("token") or "")
+            data["base_url"] = str(prev.get("base_url") or "").rstrip("/")
+            data["token"] = str(prev.get("token") or "")
+            if cur_base:
+                data["prev"] = {"base_url": cur_base, "token": cur_token}
+            else:
+                data.pop("prev", None)
+            _write_json(LOCAL_PATH, data)
+            return LOCAL_PATH
+        base = str(base_url or "").rstrip("/")
+        old = str(data.get("base_url") or "").rstrip("/")
+        if old and old != base:
+            # ушли на другой адрес — запоминаем, откуда пришли
+            data["prev"] = {"base_url": old,
+                            "token": str(data.get("token") or "")}
+        data["base_url"] = base
         if token:
-            data["token"] = token
+            data["token"] = str(token)
         _write_json(LOCAL_PATH, data)
         return LOCAL_PATH
+
+    def reload_config(self) -> bool:
+        """Перечитывает адрес/токен из config/thinking.local.json.
+
+        Панель живёт часами и не хочет рестарта после set-url: она сверяет
+        файл и подхватывает новый адрес сама. Переопределение через --url
+        (base_locked) файлом не перетирается — иначе разовый запуск против
+        заглушки молча уехал бы в Colab.
+        """
+        if getattr(self, "base_locked", False):
+            return False
+        import os
+        local = _read_json(LOCAL_PATH)
+        base = str(local.get("base_url")
+                   or self.cfg.get("base_url")
+                   or os.environ.get("THINKING_URL", "") or "").rstrip("/")
+        token = str(local.get("token") or self.cfg.get("token")
+                    or os.environ.get("THINKING_TOKEN", "") or "")
+        if (base, token) == (self.base, self.token):
+            return False
+        self.base, self.token = base, token
+        return True
 
     def set_token(self, token: str) -> Path:
         """Сохраняет токен в локальный конфиг и подставляет в живой клиент.

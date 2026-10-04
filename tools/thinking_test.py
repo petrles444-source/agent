@@ -1009,12 +1009,284 @@ def test_parallel_models() -> None:
           "клиент: на N моделей увеличено ожидание (ядра делятся)")
 
     tools = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
-    check("def cmd_ask_multi(" in tools and 'sub.add_parser("ask-multi")' in tools,
+    # Команды объявляет либо напрямую sub.add_parser, либо общий аддитер add()
+    # (он раздаёт --url/--token для разового запуска против заглушки).
+    check("def cmd_ask_multi(" in tools and '"ask-multi"' in tools
+          and "add(" in tools,
           "CLI: команда ask-multi")
     check("самый быстрый:" in tools,
           "CLI: показывает, какая модель ответила быстрее всего")
     check("суммарная скорость не растёт" in " ".join(tools.split()).lower(),
           "CLI: повторяет честное предупреждение о скорости")
+
+
+def test_model_choice_decision() -> None:
+    """Решение «одна основная модель, окно для GPU сохранено» не разъезжается.
+
+    Принято по замерам 04.10: на бесплатном Colab 2 ядра, поэтому параллельные
+    модели не дают прироста суммарной скорости (ядра те же), 3B даёт рабочий
+    баланс (2.5 ток/с), 7B — только фон (1.3 ток/с), а 14B не работает вовсе
+    (0.05 ток/с из-за подкачки страниц). Решение: одна основная 3B, 7B рядом
+    для проверки качества, окно больших моделей не закрыть.
+
+    Документация проверяется тройкой: README, быстрый старт и код профилей
+    обязаны говорить одно и то же, иначе человек примет решение по устаревшей
+    таблице (именно так было: strong числился рекомендованным, пока замер не
+    показал 0.05 ток/с).
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    start = (ROOT / "docs" / "БЫСТРЫЙ_СТАРТ.md").read_text(encoding="utf-8")
+    setup = (ROOT / "thinking" / "colab" / "cell_a_setup.py").read_text(encoding="utf-8")
+
+    for name, text in (("README", readme), ("БЫСТРЫЙ_СТАРТ", start)):
+        check("dev" in text and "3B + 1.5B" in text,
+              f"{name}: профиль dev рекомендован на CPU")
+        check("0.05 ток/с" in text,
+              f"{name}: названа замеренная скорость 14B, а не обещание")
+        check("включается сменой одной строки" in text or "без других" in text
+              or "сменой `PROFILE`" in text,
+              f"{name}: сказано, как открыть окно больших моделей на GPU")
+        check("THINKING_PARALLEL" in text,
+              f"{name}: описано, что параллельность — по включению, не по умолчанию")
+
+    # strong больше не рекомендуется — замер этого не подтвердил
+    check("не для бесплатного Colab" in readme and "не для бесплатного Colab" in start,
+          "документация: strong помечен как нерабочий на бесплатном Colab")
+    check('"dev"' in setup, "ячейка A: профиль dev существует")
+    # ядра не растут — аргумент, на котором стоит решение
+    check("суммарн" in start and "не растёт" in start,
+          "БЫСТРЫЙ_СТАРТ: объяснено, почему параллельные модели не ускоряют")
+
+
+def _load_mock_module():
+    """Заглушка LLM — отдельный файл, грузится по пути, как CLI."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "mock_llm_under_test", ROOT / "tools" / "mock_llm.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_mock_llm_stub() -> None:
+    """Локальная заглушка: все маршруты сервера живут без Colab.
+
+    Это и есть проверка обещания «панель, клиент и CLI гоняются за секунды»:
+    поднимаем tools/mock_llm.py на эфемерном порту и прогоняем по нему
+    настоящий клиент — от /health до /ask/multi. Ничего не качается, ни
+    туннеля, ни GPU; работает офлайн в любой системе.
+
+    Отдельно проверяются режимы-аварии (503, обрыв потока, кривой JSON,
+    долгая генерация): они нужны, чтобы путь отката и пинги SSE проверялись
+    воспроизводимо, а не по настроению бесплатного туннеля.
+    """
+    mock = _load_mock_module()
+    running: list = []
+
+    def serve(**kw) -> str:
+        srv = mock.create_server(port=0, **kw)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        running.append(srv)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    # ретраи не должны тратить секунды на ожидание в упавшем режиме
+    fast = {"retry": {"max_attempts": 1, "backoff_base": 0.001}}
+    try:
+        url = serve()
+        c = make_client()
+        c.base = url
+        check(c.health(), "заглушка: /health отвечает")
+        check(c.health_data.get("model") == "mock-llm",
+              "заглушка: модель названа честно, а не выдана за Colab")
+
+        # --- /plan -------------------------------------------------------
+        plan = c.plan("проверить заглушку", max_steps=4)
+        p = Plan.from_dict(plan)
+        check(p.goal == "проверить заглушку", "заглушка: цель взята из запроса")
+        check(len(p.steps) == 4, "заглушка: шагов ровно столько, сколько просили")
+        ids = {s.id for s in p.steps}
+        check(all(set(s.depends_on) <= ids for s in p.steps),
+              "заглушка: depends_on не ссылается на несуществующие шаги")
+        check(c.stats["plans"] == 1 and bool(c.reports),
+              "заглушка: план попал в учёт и в отчёты")
+
+        # --- /plan/stream ------------------------------------------------
+        streamed = Plan.from_dict(c.plan_stream("потоковая задача", max_steps=3))
+        check(streamed.goal == "потоковая задача",
+              "заглушка: /plan/stream отдаёт валидный план")
+        ev = c.events(tail=50)
+        check(any(e.get("type") == "plan_step" for e in ev["events"]),
+              "заглушка: шаги уходят в журнал событий")
+        check(ev["last_seq"] > 0, "заглушка: у событий есть порядковый номер")
+
+        # --- /chat + память ---------------------------------------------
+        c.remember("предпочитает короткие ответы")
+        rep = ChatReply.from_dict(c.chat("привет"))
+        check("привет" in rep.reply, "заглушка: ответ содержит вопрос")
+        check(rep.tokens_out > 0 and rep.tokens_estimate,
+              "заглушка: расход токенов оценён, а не выдан за точный")
+
+        got: list[str] = []
+        srep = ChatReply.from_dict(c.chat_stream("что помнишь?",
+                                                 on_token=got.append))
+        check(bool(got) and "".join(got) == srep.reply,
+              "заглушка: /chat/stream отдаёт токены, и итог — это их сумма")
+        check(srep.memory_used and "короткие ответы" in srep.reply,
+              "заглушка: память дошла до сервера и вернулась в ответ")
+
+        # --- /reflect ----------------------------------------------------
+        rf = ReflectResponse.from_dict(c.reflect(plan["plan_id"], 1, "сделано"))
+        check(rf.status == "ok", "заглушка: успешный шаг даёт status=ok")
+        rf2 = ReflectResponse.from_dict(
+            c.reflect(plan["plan_id"], 1, "упало", error="TimeoutError: 500"))
+        check(rf2.status == "adjust", "заглушка: ошибка шага даёт status=adjust")
+
+        # --- /dev --------------------------------------------------------
+        dv = c.dev("добавь функцию", active_name="a.py", active_code="x = 1")
+        check(dv["action"] in ("none", "create", "edit")
+              and dv["filename"] == "a.py",
+              "заглушка: /dev отвечает предложением по активному файлу")
+
+        # --- /ask/multi, /models, /parallel ------------------------------
+        mm = c.multi_chat("сравни ответы")
+        check(mm["count"] == 2 and all(a.get("ok") for a in mm["answers"]),
+              "заглушка: /ask/multi отдаёт ответы нескольких «моделей»")
+        check(c.models().get("active_label") == "MOCK",
+              "заглушка: /models отвечает в ожидаемой форме")
+        check(c.parallel_models().get("count") == 1,
+              "заглушка: /parallel отвечает в ожидаемой форме")
+
+        # --- OpenAI-совместимый upstream ---------------------------------
+        v1 = c._json("GET", "/v1/models", None, timeout=10)
+        check(v1["data"][0]["id"] == "mock-llm",
+              "заглушка: /v1/models совместим с OpenAI")
+        out = c._json("POST", "/v1/chat/completions",
+                      {"model": "mock",
+                       "messages": [{"role": "user", "content": "привет"}]},
+                      timeout=10)
+        check("привет" in out["choices"][0]["message"]["content"],
+              "заглушка: /v1/chat/completions отвечает как настоящая LLM")
+        with c._open("POST", "/v1/chat/completions",
+                     {"model": "mock", "stream": True,
+                      "messages": [{"role": "user", "content": "привет"}]},
+                     stream=True, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        check("data: [DONE]" in raw and '"delta"' in raw,
+              "заглушка: поток /v1/chat/completions заканчивается [DONE]")
+
+        # --- метка режима в тексте действует на один запрос ---------------
+        check(raises(lambda: c.plan("[mock:error] задача"), ThinkingError),
+              "заглушка: метка [mock:error] ломает только свой запрос")
+        check(bool(c.plan("обычная задача")),
+              "заглушка: после метки следующий запрос снова проходит")
+
+        # --- режим error --------------------------------------------------
+        ce = make_client(**fast)
+        ce.base = serve(mode="error")
+        check(not ce.health(), "режим error: /health не проходит — сервер «упал»")
+
+        # --- режим drop: поток рвётся, короткий маршрут спасает -----------
+        cd = make_client(**fast)
+        cd.base = serve(mode="drop")
+        d = cd.chat_stream("обрыв")
+        check(d.get("stream_fallback") is True,
+              "режим drop: обрыв SSE уводит на /chat, ответ получен")
+
+        # --- режим badjson: контракт ловит мусор --------------------------
+        cb = make_client(**fast)
+        cb.base = serve(mode="badjson")
+        plan4, used_fb = cb.plan_with_fallback("сломай JSON")
+        check(used_fb and bool(plan4.get("steps")),
+              "режим badjson: мусорный ответ уводит в локальный фолбэк")
+
+        # --- режим slow: пинги держат поток живым -------------------------
+        cs = make_client(**fast, stream_stall=1.0)
+        cs.base = serve(mode="slow", first_delay=1.5, ping=0.2)
+        t0 = time.time()
+        slow = cs.chat_stream("долгая генерация")
+        took = time.time() - t0
+        pings = running[-1].mock_state.counters.get("pings", 0)
+        check(bool(slow.get("reply")) and took >= 1.0,
+              "режим slow: клиент дождался первого токена")
+        check(pings > 0,
+              "режим slow: во время ожидания шли пинги SSE (иначе "
+              "stream_stall оборвал бы чтение)")
+        check(c.stats["plans"] >= 2,
+              "заглушка: обычные запросы не пострадали от режимов")
+    finally:
+        for srv in running:
+            srv.shutdown()
+            srv.server_close()
+
+
+def test_stub_switching() -> None:
+    """Возврат с заглушки на настоящий Colab — одна команда и ничего не потеряно.
+
+    Память, отчёты и таймлайн лежат на ПК: при переключении меняется только
+    то, кто печатает ответ. Поэтому set-url запоминает пару «адрес + токен»,
+    а --back просто меняет её местами.
+    """
+    path = client_mod.LOCAL_PATH
+    saved = path.read_bytes() if path.exists() else None
+    try:
+        path.unlink(missing_ok=True)
+        ThinkingClient.set_url("http://stub.local:8010", "stub-token")
+        ThinkingClient.set_url("http://colab.local", "colab-token")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        check(data["base_url"] == "http://colab.local",
+              "set-url: новый адрес записан")
+        check(data.get("prev", {}).get("base_url") == "http://stub.local:8010"
+              and data.get("prev", {}).get("token") == "stub-token",
+              "set-url: прежняя пара сохранена для --back целиком")
+
+        ThinkingClient.set_url("", "", back=True)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        check(data["base_url"] == "http://stub.local:8010"
+              and data["token"] == "stub-token",
+              "set-url --back: вернулись на прежний адрес и токен")
+        check(data.get("prev", {}).get("base_url") == "http://colab.local",
+              "set-url --back: и это направление тоже запомнено")
+
+        ThinkingClient.set_url("", "", back=True)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        check(data["base_url"] == "http://colab.local",
+              "set-url --back: повторное переключение работает")
+
+        path.write_text(json.dumps({"base_url": "http://x"}), encoding="utf-8")
+        check(raises(lambda: ThinkingClient.set_url("", "", back=True),
+                     ThinkingError),
+              "set-url --back: без запомненного адреса — честная ошибка")
+
+        # Панель живёт часами: подхватывает новый адрес без рестарта
+        path.write_text(json.dumps({"base_url": "http://one", "token": "t1"}),
+                        encoding="utf-8")
+        c = ThinkingClient({})
+        check(c.base == "http://one", "конфиг: адрес прочитан из файла")
+        path.write_text(json.dumps({"base_url": "http://two", "token": "t2"}),
+                        encoding="utf-8")
+        check(c.reload_config() and c.base == "http://two",
+              "панель: новый адрес подхвачен без перезапуска")
+        c.base_locked = True
+        path.write_text(json.dumps({"base_url": "http://three"}),
+                        encoding="utf-8")
+        check(not c.reload_config() and c.base == "http://two",
+              "панель: разовый --url не перетирается файлом конфига")
+
+        # --url задаёт адрес на один запуск и не трогает настройки
+        cli = _load_cli_module()
+        before = path.read_bytes()
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["url", "--url", "http://127.0.0.1:8010"])
+        check(code == 0, "CLI --url: адрес взят на этот запуск")
+        check(path.read_bytes() == before,
+              "CLI --url: config/thinking.local.json не изменён")
+    finally:
+        if saved is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(saved)
 
 
 def test_instructions_present() -> None:
@@ -1645,6 +1917,9 @@ def main() -> int:
     test_watchdog_and_ram_guard()
     test_dev_profile_and_honest_hints()
     test_parallel_models()
+    test_model_choice_decision()
+    test_mock_llm_stub()
+    test_stub_switching()
     test_instructions_present()
     test_dev_layout_vertical()
     test_dev_run_stdin()

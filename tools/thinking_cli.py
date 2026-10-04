@@ -154,6 +154,15 @@ def cmd_doctor(client: ThinkingClient, args: argparse.Namespace) -> int:
 
 
 def cmd_set_url(client: ThinkingClient, args: argparse.Namespace) -> int:
+    if getattr(args, "back", False):
+        path = ThinkingClient.set_url("", "", back=True)
+        fresh = ThinkingClient()
+        _out(f"возврат на {fresh.base or '(пусто)'} → {path}")
+        _out("панель подхватит новый адрес сама, рестарт не нужен")
+        return 0 if fresh.health(timeout=6) else 4
+    if not args.url:
+        _out("! не указан адрес: set-url <URL> [TOKEN] либо set-url --back")
+        return 3
     path = ThinkingClient.set_url(args.url, args.token or "")
     _out(f"сохранено в {path}")
     fresh = ThinkingClient()
@@ -778,6 +787,19 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
     client.sync_history(tail=200)
     client.start_stream(lambda ev: None)
 
+    def _sync_target() -> None:
+        """Панель подхватывает новый адрес без рестарта.
+
+        set-url меняет config/thinking.local.json; раньше панель держала
+        адрес, созданный при старте, и после каждой смены (заглушка ↔ Colab)
+        приходилось её перезапускать. Теперь сверка идёт на каждом запросе.
+        """
+        try:
+            if client.reload_config():
+                _out(f"[конфиг] новый адрес: {client.base}")
+        except Exception:                                       # noqa: BLE001
+            pass
+
     # Первичный канал ПК по ТЗ — опрос GET /events: SSE через туннель может
     # молчать (ping-строки не доходят), поэтому фоновый опрос страхует поток.
     stop_poll = threading.Event()
@@ -791,6 +813,7 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
         while not stop_poll.wait(every):
             n += 1
             try:
+                _sync_target()
                 client.sync_history(tail=50)
                 if n % warm_every == 0:
                     try:
@@ -838,6 +861,7 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 return {}
 
         def do_POST(self):  # noqa: N802
+            _sync_target()
             """Действия панели: чат, память, удаление записей."""
             path = self.path.split("?")[0]
             data = self._body()
@@ -1099,6 +1123,7 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
             self._send(404, "text/plain; charset=utf-8", b"not found")
 
         def do_GET(self):  # noqa: N802
+            _sync_target()
             path = self.path.split("?")[0]
             query = urllib.parse.parse_qs(self.path.partition("?")[2])
             if path in ("/", "/index.html"):
@@ -1248,15 +1273,29 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="thinking_cli", description="Субагент «Мышление»")
     sub = p.add_subparsers(dest="cmd")
 
-    sub.add_parser("doctor")
-    sub.add_parser("url")
-    sub.add_parser("metrics")
+    # Адрес на один запуск, без записи в конфиг: так локальную заглушку
+    # можно прогнать, не трогая настройки настоящего Colab-адреса.
+    once = argparse.ArgumentParser(add_help=False)
+    once.add_argument("--url", default="",
+                      help="адрес субагента только на этот запуск")
+    once.add_argument("--token", default="",
+                      help="токен только на этот запуск")
+
+    def add(name: str, **kw):
+        kw.setdefault("parents", [once])
+        return sub.add_parser(name, **kw)
+
+    add("doctor")
+    add("url")
+    add("metrics")
 
     s = sub.add_parser("set-url")
-    s.add_argument("url")
+    s.add_argument("url", nargs="?")
     s.add_argument("token", nargs="?")
+    s.add_argument("--back", action="store_true",
+                   help="вернуть предыдущий адрес (заглушка ↔ Colab)")
 
-    s = sub.add_parser("plan")
+    s = add("plan")
     s.add_argument("task")
     s.add_argument("--files", default="", help="список путей через запятую")
     s.add_argument("--constraint", action="append")
@@ -1265,7 +1304,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--stream", action="store_true")
 
-    s = sub.add_parser("ask")
+    s = add("ask")
     s.add_argument("task")
     s.add_argument("--files", default="")
     s.add_argument("--constraint", action="append")
@@ -1274,11 +1313,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--stream", action="store_true")
 
-    s = sub.add_parser("ask-multi")
+    s = add("ask-multi")
     s.add_argument("task")
     s.add_argument("--json", action="store_true")
 
-    s = sub.add_parser("reflect")
+    s = add("reflect")
     s.add_argument("plan_id")
     s.add_argument("--step", type=int, required=True)
     s.add_argument("--result", required=True)
@@ -1286,28 +1325,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--error")
     s.add_argument("--async", dest="async_mode", action="store_true")
 
-    s = sub.add_parser("tail")
+    s = add("tail")
     s.add_argument("--n", type=int, default=30)
     s.add_argument("--follow", action="store_true")
 
-    s = sub.add_parser("panel")
+    s = add("panel")
     s.add_argument("--port", type=int, default=0)
     s.add_argument("--open", action="store_true",
                    help="открыть панель в браузере сразу после старта")
 
-    s = sub.add_parser("dump", help="скачать логи Colab в локальную папку")
+    s = add("dump", help="скачать логи Colab в локальную папку")
     s.add_argument("name", nargs="?", default="llm.log",
                    help=f"файл из списка: {', '.join(DUMP_FILES)}")
     s.add_argument("--all", action="store_true", help="снять весь белый список")
     s.add_argument("--out", default="", help="куда класть (по умолчанию colab_downloads/)")
     s.add_argument("--timeout", type=float, default=30.0)
 
-    sub.add_parser("models", help="показать модели в Colab и активную из них")
-    s = sub.add_parser("use-model", help="переключить модель в Colab")
+    add("models", help="показать модели в Colab и активную из них")
+    s = add("use-model", help="переключить модель в Colab")
     s.add_argument("model", help="короткое имя (3b, 1.5B) или путь к .gguf")
 
-    s = sub.add_parser("reflect-metrics",
-                       help="рефлексия по метрикам выгоды (отчёт в «Отчёты»)")
+    s = add("reflect-metrics",
+            help="рефлексия по метрикам выгоды (отчёт в «Отчёты»)")
     s.add_argument("--engine", choices=("subagent", "local"), default="subagent",
                    help="субагент (модель Colab) или локальные правила")
     s.add_argument("--since", default="",
@@ -1326,6 +1365,12 @@ def main(argv: list[str] | None = None) -> int:
         build_parser().print_help()
         return 0
     client = ThinkingClient()
+    # --url/--token: адрес на один запуск, файл конфигурации не трогаем
+    if args.cmd != "set-url" and getattr(args, "url", ""):
+        client.base = str(args.url).rstrip("/")
+        client.base_locked = True
+        if getattr(args, "token", ""):
+            client.token = str(args.token)
     try:
         if args.cmd == "doctor":
             return cmd_doctor(client, args)
