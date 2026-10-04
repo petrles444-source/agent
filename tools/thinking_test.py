@@ -1448,6 +1448,73 @@ def test_mock_llm_stub() -> None:
         cq3.base = "http://127.0.0.1:2"
         check(cq3.stream_quiet() is False,
               "тихий период не переносится на другой адрес")
+
+        # --- регресс: считаются ВНУТРЕННИЕ попытки, а не одна на команду ---
+        # Живой прогон 05.10 показал ошибку: счётчик рос на команду, а внутри
+        # команды _stream_read делает 1 + stream_retries попыток, и на живом
+        # туннеле обрезаются все. Тихий период тогда наступал бы только на
+        # третью команду — первые две платили бы по полторы минуты впустую.
+        state2 = TMP / "stream_state2.json"
+        cm = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+                         stream_retries=2, stream_first_streak=3,
+                         stream_first_pause=600, state_path=str(state2),
+                         log_path=str(TMP / "m_log.jsonl"),
+                         reports_path=str(TMP / "m_rep.jsonl"))
+        cm.base = serve(mode="slow", first_delay=2.5, ping=0)
+        cm.plan_with_fallback("одна команда, три обрезанные попытки")
+        check(cm.stream_quiet() is True,
+              "тихий период наступает после первой команды, если внутри неё "
+              "три обрезанные попытки")
+
+        # --- 429: повторяется, но предохранитель не открывает --------------
+        # Настоящий сервер считает частоту в том же _auth, что и токен, при
+        # RPS=5 (cell_c:695-704): 429 получает и опрос /health панели. Если бы
+        # он копился в предохранителе, несколько минут работы панели положили
+        # бы связь на 10 минут при живом туннеле.
+        url_rate = serve(mode="rate", rps=100)      # лимит не мешает проверке
+        srv_rate = running[-1]
+        srv_rate.mock_state.rps = 1        # 429 начиная со второго запроса в секунду
+        # все попытки упираются в лимит → ошибка честная, но предохранитель
+        # закрыт: туннель-то жив, просто мы ходим слишком быстро
+        flood = make_client(retry={"max_attempts": 3, "backoff_base": 0.001},
+                            breaker_errors=1)
+        flood.base = url_rate
+        before = srv_rate.mock_state.counters["requests"]
+        for _ in range(3):
+            try:
+                flood.health()
+            except Exception:                                    # noqa: BLE001, S110
+                pass
+        after = srv_rate.mock_state.counters["requests"]
+        check(after - before > 3,
+              f"429: клиент повторяет запрос, а не сдаётся сразу "
+              f"(3 вызова → {after - before} запросов к серверу)")
+        check(flood._cb_open_until == 0.0,                      # noqa: SLF001
+              "429 не открывает предохранитель: это «слишком быстро», "
+              "а не «туннель мёртв»")
+        check("429" in (flood.last_error or ""),
+              f"429: причина названа прямо (last_error={flood.last_error!r})")
+        srv_rate.mock_state.rps = 100      # дальше лимит не мешает
+
+        # --- заглушка не мягче настоящего сервера на спец-маршрутах ------
+        # /dump/{name} у настоящего — белый список и 404 (cell_c:1249, 1662-1669),
+        # /model — 404 «модель не найдена». Заглушка отвечала 200 на всё, и
+        # путь «404 → сообщение пользователю» не исполнялся (аудит B).
+        chk = make_client(**fast)
+        chk.base = url_rate
+        err = ""
+        try:
+            chk.dump("no-such-file.log")
+        except Exception as exc:                                 # noqa: BLE001
+            err = str(exc)
+        check("404" in err, f"заглушка: /dump отдаёт 404 на чужое имя ({err[:60]})")
+        err2 = ""
+        try:
+            chk.set_model("такой-модели-нет")
+        except Exception as exc:                                 # noqa: BLE001
+            err2 = str(exc)
+        check("404" in err2,
+              f"заглушка: /model отдаёт 404 на несуществующую модель ({err2[:60]})")
     finally:
         for srv in running:
             srv.shutdown()

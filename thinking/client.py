@@ -536,6 +536,7 @@ class ThinkingClient:
         backoff = float(self.retry.get("backoff_base", 1.5))
         cap = float(self.retry.get("max_backoff", 15))
         last: Optional[BaseException] = None
+        rate_limited = False
         for i in range(attempts):
             try:
                 req = urllib.request.Request(url, data=payload, headers=headers, method=method)
@@ -545,6 +546,7 @@ class ThinkingClient:
                 self.last_error = ""
                 self._cb_errors = 0      # успех сбрасывает счётчик ошибок
                 self._cb_stream_errors = 0  # живой туннель виден обоим каналам
+                rate_limited = False
                 return resp
             except urllib.error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", "replace")[:400]
@@ -564,6 +566,11 @@ class ThinkingClient:
                     self.last_error = "HTTP 524 (origin timeout, нужен поток)"
                     raise ThinkingError(f"HTTP 524: {raw}") from exc
                 last = ThinkingError(f"HTTP {exc.code}: {raw}")
+                # 429 обязан повторяться (см. ниже), но САМ по себе он не
+                # открывает предохранитель: это «слишком часто», а не «мёртвый
+                # туннель». Помечаем флагом — на случай, если все попытки
+                # упрутся в лимит.
+                rate_limited = rate_limited or exc.code == 429
             except Exception as exc:  # таймаут, DNS, обрыв туннеля
                 last = exc
             wait = min(cap, backoff ** (i + 1))
@@ -571,6 +578,15 @@ class ThinkingClient:
                         method, path, last, wait)
             time.sleep(wait)
         limit = int(self.cfg.get("breaker_errors", 5))
+        if rate_limited:
+            # 429 — это не «туннель мёртв», это «ты слишком быстро». Настоящий
+            # сервер отдаёт его при RPS=5 (cell_c_server.py:_auth), и мы к
+            # нему обращаемся часто: панель шлёт опрос /health каждые 5 с, а
+            # он идёт в тот же счётчик. Если бы 429 копилось в предохранителе,
+            # достаточно было бы нескольких минут работы панели, чтобы
+            # положить связь на 10 минут при живом туннеле (аудит B, 04-tests-mock).
+            self.last_error = "HTTP 429 (слишком часто, туннель жив)"
+            raise ThinkingError(f"субагент ответил 429: {last}")
         if stream:
             # Длинный поток — отдельный канал: его неудачи копятся только у
             # потока и не трогают онлайн-статус (его ведёт REST /health).
@@ -770,14 +786,12 @@ class ThinkingClient:
                     and not self.stream_quiet()):
             try:
                 out = self._reflect_stream(body)
-                self._note_stream(None)
             except SchemaError:
                 raise
             except Exception as exc:
                 first = exc
                 log.warning("поток рефлексии не прошёл: %s", exc)
                 self.last_error = str(exc)[:200]
-                self._note_stream(exc)
         # К не-потоковому маршруту идём при любой отказе, кроме ошибки самого
         # сервера (404 у старого ноутбука, мусорный JSON — повтор не поможет).
         # Прежний отказ от маршрута на обрыве потока был основан на гипотезе
@@ -936,16 +950,13 @@ class ThinkingClient:
             if (stream_error is None and self.cfg.get("stream_first", True)
                     and not self.stream_quiet()):
                 try:
-                    plan = self.plan_stream(task, **stream_kw)
-                    self._note_stream(None)
-                    return plan, False
+                    return self.plan_stream(task, **stream_kw), False
                 except SchemaError:
                     raise  # секреты в задаче — не повод молча уходить в fallback
                 except Exception as exc:
                     log.warning("поток плана не прошёл: %s", exc)
                     self.last_error = str(exc)[:200]
                     stream_error = exc
-                    self._note_stream(exc)
             if stream_error is not None and _is_read_timeout(stream_error):
                 log.warning("поток плана оборван (%s) — пробую обычный /plan: "
                             "короткий ответ туннель проносит целиком", stream_error)
@@ -1587,9 +1598,16 @@ class ThinkingClient:
             except (OSError, http.client.IncompleteRead) as exc:
                 last = exc          # таймаут чтения, обрыв соединения
             if done:
+                self._note_stream(None)
                 return pieces, done
             if last is None:
                 last = ThinkingError(f"{label} завершился без ответа")
+            # Учёт именно ПОПЫТКИ, а не команды: внутри цикла их
+            # 1 + stream_retries, и на живом туннеле Cloudflare все они
+            # обрезаются одинаково. Считать по команде нельзя — тогда тихий
+            # период наступал бы только на третью команду, а каждая из них
+            # платила бы полторы минуты на заведомо потерянные попытки.
+            self._note_stream(last)
             if attempt >= total or time.time() - t0 > budget:
                 break
             log.warning("%s %s оборвался (%s), повтор %d/%d",
@@ -1647,7 +1665,6 @@ class ThinkingClient:
                 label="поток чата")
             if not done:
                 raise ThinkingError("поток чата завершился без ответа")
-            self._note_stream(None)
         except ThinkingError as exc:
             # Запасной транспорт (решение от 03.10): при обрывах «окнами»
             # короткий не-потоковый /chat проходит там, где SSE умирает.
@@ -1662,7 +1679,6 @@ class ThinkingClient:
                               error=f"поток чата не прошёл: {exc}"[:400],
                               author=author)
             log.warning("поток чата не прошёл (%s) — пробую /chat без потока", exc)
-            self._note_stream(exc)
             # author пробрасываем: диалог человека, спасённый фолбэком,
             # иначе уходит в журнал как агентский (аудит B-2)
             out = self.chat(text, use_memory=use_memory, max_steps=max_steps,

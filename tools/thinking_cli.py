@@ -298,7 +298,6 @@ def _plan_streamed(client: ThinkingClient, task: str, context: dict,
     try:
         plan = client.plan_stream(task, context=context, constraints=constraints,
                                   max_steps=max_steps, on_event=on_event)
-        client._note_stream(None)                             # noqa: SLF001
     except ThinkingError as exc:
         # Обрыв туннеля, 524 или ошибка модели на середине потока (живой
         # прогон 04.10: сервер додумал план за 5 с, а байты до клиента не
@@ -308,7 +307,6 @@ def _plan_streamed(client: ThinkingClient, task: str, context: dict,
         # отвечает за 86 с и возвращает настоящий план).
         _out("", file=diag)
         _out(f"! поток не прошёл ({exc}) → пробую обычный запрос", file=diag)
-        client._note_stream(exc)                              # noqa: SLF001
         plan, is_fallback = client.plan_with_fallback(
             task, stream_error=exc, context=context, constraints=constraints,
             max_steps=max_steps)

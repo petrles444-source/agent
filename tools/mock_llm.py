@@ -50,7 +50,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-MODES = ("normal", "slow", "error", "drop", "badjson")
+MODES = ("normal", "slow", "error", "drop", "badjson", "rate")
+
+# Белый список выгрузки — как у настоящего сервера (cell_c:DUMP_FILES).
+DUMP_FILES = {"llm.log", "api.log", "tunnel.log", "server.py",
+              "snapshot.json", "last_bad_json.txt", "model_path.txt"}
 HINTS = {
     "[mock:slow]": "slow",
     "[mock:error]": "error",
@@ -229,7 +233,7 @@ class MockState:
     def __init__(self, mode: str = "normal", delay: float = 0.01,
                  first_delay: float = 0.0, ping: float = 15.0,
                  max_tokens: int = 700, dev_max_tokens: int = 1600,
-                 token: str = "", verbose: bool = False) -> None:
+                 token: str = "", verbose: bool = False, rps: int = 5) -> None:
         self.mode = mode if mode in MODES else "normal"
         self.delay = max(0.0, float(delay))
         self.first_delay = max(0.0, float(first_delay))
@@ -240,6 +244,9 @@ class MockState:
         self.max_tokens = int(max_tokens)
         self.dev_max_tokens = int(dev_max_tokens)
         self.token = str(token)
+        self.rps = max(1, int(rps))       # режим rate: 429 начиная с RPS+1
+        self.win_t = 0.0
+        self.win_n = 0
         self.verbose = bool(verbose)
         self.t0 = time.time()
         self.lock = threading.Lock()
@@ -248,6 +255,7 @@ class MockState:
         self.counters = {
             "plans": 0, "reflects": 0, "chats": 0, "errors": 0,
             "bad_json": 0, "dropped": 0, "requests": 0,
+            "rate_limited": 0,
             "tokens_in": 0, "tokens_out": 0,
         }
         self.llm_ms: list[int] = []
@@ -501,6 +509,28 @@ def make_handler(state: MockState) -> type:
             state.emit("error", "заглушка: режим error — 503")
             self._send(503, {"error": "заглушка: LLM недоступен (режим error)"})
 
+        def _maybe_rate_limit(self) -> bool:
+            """Режим rate: 429 начиная с N-го запроса в секунду (RPS).
+
+            Настоящий сервер палит токен и считает частоту запросов в одном
+            `_auth` (cell_c_server.py:695-704, RPS=5 по умолчанию) — там 429
+            получает и опрос /health панели. Без этого режима путь «429 →
+            повтор» и «429 не открывает предохранитель» не исполнялся офлайн
+            вовсе (аудит B, 04-tests-mock).
+            """
+            if state.mode_for(self._hinted) != "rate":
+                return False
+            now = time.time()
+            with state.lock:
+                if now - state.win_t >= 1.0:
+                    state.win_t, state.win_n = now, 0
+                state.win_n += 1
+                over = state.win_n > state.rps
+            if over:
+                state.count("rate_limited")
+                self._send(429, {"error": "слишком часто (rate limit)"})
+            return over
+
         def _tokens(self, text: str) -> None:
             for piece in pieces(text):
                 self._sleep_between()
@@ -532,6 +562,8 @@ def make_handler(state: MockState) -> type:
             # (аудит A-4, 04-tests-mock: раньше заглушка гасила всё, и тест
             # закреплял «сервер упал» вместо «LLM упала»).
             if route == "/health":
+                if self._maybe_rate_limit():
+                    return
                 self._send(200, _health(state))
             elif route == "/metrics":
                 self._send(200, _metrics(state))
@@ -574,6 +606,15 @@ def make_handler(state: MockState) -> type:
                 })
             elif route.startswith("/dump/"):
                 name = route.split("/dump/", 1)[1]
+                # Настоящий сервер отдаёт только белый список и 404 на чужое
+                # имя (cell_c:1249, 1662-1669). Заглушка, отвечавшая 200 на
+                # всё подряд, делала этот путь недостижимым офлайн, а
+                # человеку показывала «файл есть», когда его нет (аудит B).
+                if name not in DUMP_FILES:
+                    self._send(404, {"error":
+                                     f"файл «{name}» не в списке: "
+                                     f"{', '.join(sorted(DUMP_FILES))}"})
+                    return
                 self._send(200, f"заглушка: файлов Colab нет (запрошен {name})\n",
                            "text/plain; charset=utf-8")
             else:
@@ -592,6 +633,8 @@ def make_handler(state: MockState) -> type:
             self._hinted, _ = strip_hints(probe_text(body))
             mode = state.mode_for(self._hinted)
             route = self._content_route() or route
+            if self._maybe_rate_limit():
+                return
 
             # --- OpenAI-совместимый upstream (для настоящего сервера) --------
             if route == "/v1/chat/completions":
@@ -632,6 +675,14 @@ def make_handler(state: MockState) -> type:
                 elif route == "/ask/multi":
                     self._ask_multi(body)
                 elif route == "/model":
+                    # Настоящий сервер отвечает 404, если такой модели нет
+                    # (cell_c:1181-1185) — клиент обязан это пережить и
+                    # показать человеку внятную причину, а не «переключено».
+                    want = str(body.get("model") or "").strip()
+                    if want and want not in ("mock", f"mock://{MODEL_ID}"):
+                        self._send(404, {"error":
+                                         f"модель «{want}» не найдена"})
+                        return
                     self._send(200, {"ok": True, "active": f"mock://{MODEL_ID}",
                                      "label": "MOCK",
                                      "note": "заглушка: переключать некуда"})
