@@ -118,6 +118,12 @@ def _is_read_timeout(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.URLError) and isinstance(
             exc.reason, (socket.timeout, TimeoutError)):
         return True
+    # Ответ самого сервера («сервер: LLM backend недоступен: ReadTimeout»)
+    # — уровень приложения: сервер жив и отвечает, и чинить его надо не
+    # транспортом. Раньше подстрока "timeout" ловила такие ответы, и
+    # plan_with_fallback молча уходил в шаблон вместо живого /plan (аудит B).
+    if str(exc).lstrip().startswith("сервер:"):
+        return False
     text = str(exc).lower()
     # «оборвался после N попыток» — исход _stream_read: ни одна из повторных
     # попыток не донесла ответа, значит мёртв канал, а не маршрут (замер
@@ -283,6 +289,12 @@ class ThinkingClient:
         if (base, token) == (self.base, self.token):
             return False
         self.base, self.token = base, token
+        # Аудит B: предохранители считают ошибки СТАРОГО адреса. Сценарий
+        # спасения «Colab умер → set-url на свежий туннель» блокировался бы
+        # до конца чужой паузы (до 600 с), пока панель уже ходит по новому
+        # URL. Ошибки старого адреса к новому отношения не имеют.
+        self._cb_errors = self._cb_stream_errors = 0
+        self._cb_open_until = self._cb_stream_until = 0.0
         return True
 
     def set_token(self, token: str) -> Path:
@@ -313,6 +325,17 @@ class ThinkingClient:
         # потока событий не должны блокировать короткие REST-вызовы (чат,
         # разработка, health) на 10 минут — у каналов свои счётчики и своя
         # пауза. Живой туннель (успех любого канала) сбрасывает оба счётчика.
+        # Пауза истекла — сбрасываем счётчик. Иначе «5 ошибок подряд»
+        # превращалось в «1 ошибка раз в паузу»: во время паузы успех
+        # недоступен (гейт блокирует), после неё первая же ошибка даёт
+        # счётчик 6 ≥ 5 и новую паузу, и так по кругу (аудит B).
+        now = time.time()
+        if now >= self._cb_open_until > 0:
+            self._cb_open_until = 0.0
+            self._cb_errors = 0
+        if now >= self._cb_stream_until > 0:
+            self._cb_stream_until = 0.0
+            self._cb_stream_errors = 0
         gate = self._cb_stream_until if stream else self._cb_open_until
         if time.time() < gate:
             # Туннель уже доказал, что он мёртв: не ходим по нему вхолостую.
@@ -388,8 +411,20 @@ class ThinkingClient:
 
     def _json(self, method: str, path: str, body: Optional[dict] = None,
               timeout: Optional[float] = None) -> Any:
-        with self._open(method, path, body, timeout) as resp:
-            raw = resp.read().decode("utf-8", "replace")
+        # Аудит A-3: resp.read() стоял вне try — socket.timeout и, главное,
+        # http.client.IncompleteRead (он НЕ наследует OSError) вылетали сырыми,
+        # не поставив last_error/предохранитель и минуя обработчики панели,
+        # которые ловят только ThinkingError. Для этого туннеля обрыв тела
+        # ответа — штатный сценарий.
+        try:
+            with self._open(method, path, body, timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except ThinkingError:
+            raise
+        except (socket.timeout, TimeoutError, http.client.HTTPException,
+                OSError) as exc:
+            self.last_error = f"обрыв чтения ответа: {exc}"
+            raise ThinkingError(f"обрыв чтения ответа: {exc}") from exc
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -486,10 +521,20 @@ class ThinkingClient:
             if on_event:
                 on_event({"type": "token", "text": piece})
 
-        _pieces, done = self._stream_read(
-            "/plan/stream", body, label="план", terminal="final",
-            on_token=_forward if on_event else None,
-            on_event=on_event, remember=True)
+        try:
+            _pieces, done = self._stream_read(
+                "/plan/stream", body, label="план", terminal="final",
+                on_token=_forward if on_event else None,
+                on_event=on_event, remember=True)
+        except ThinkingError as exc:
+            # Аудит B: провал потокового плана не писался ни в журнал, ни в
+            # stats["errors"] — при мёртвом туннеле в «Диагностике» ноль
+            # ошибок при полном провале (у plan() запись была, у plan_stream нет)
+            self.stats["errors"] += 1
+            self._record("plan", task, t0, ok=False,
+                         summary=f"поток плана не прошёл: {exc}"[:400],
+                         author=author)
+            raise
         plan: dict = {}
         text = str(done.get("text") or "")
         if text.strip().startswith("{"):
@@ -1735,17 +1780,42 @@ class ThinkingClient:
     #  Удаление записей (кнопки в панели)
     # ------------------------------------------------------------------ #
     def delete_history(self, kind: str = "report", n: Optional[int] = None,
-                       before: str = "", rid: str = "", at: str = "") -> int:
+                       before: str = "", rid: str = "", at: str = "",
+                       wipe: bool = False) -> int:
         """Удаляет из журнала отчётов/диалогов: по rid, по номеру+времени,
-        по времени или всё.
+        по времени или — только при явном `wipe` — всё.
 
         rid — уникальный идентификатор записи. Поле `n` уникальным НЕ является
         (это счётчик внутри процесса, у каждого процесса он начинается с 1),
         поэтому удаление только по `n` сносило лишнее. Поэтому: если задан rid —
         удаляем ровно одну запись; иначе по `n` — только совпадение n И времени.
+
+        Аудит A-1: «нет критериев» читалось как «снеси раздел целиком», и
+        пустое тело кросс-запроса превращалось в полную очистку журнала.
+        Теперь полная очистка требует явного `wipe=True` (кнопка «Удалить всё»
+        его и передаёт), без критериев и без wipe — SchemaError.
         """
         if kind not in ("report", "dialog", "chat", "all"):
             raise SchemaError(f"неизвестный раздел: {kind}")
+        if not rid and n is None and not before and not wipe:
+            raise SchemaError("нет критериев удаления: нужен rid, n+at, before "
+                              "или явный wipe для полной очистки")
+
+        def _hit(line: dict) -> bool:
+            """Удалять ли эту запись — одна логика на диск и на память."""
+            if rid:
+                return str(line.get("rid") or "") == rid
+            if n is not None:
+                # номер + метка времени: номер сам по себе не уникален
+                try:
+                    ln = int(line.get("n", -1))
+                except (TypeError, ValueError):
+                    ln = -1
+                return ln == int(n) and str(line.get("at", "")) == str(at)
+            if before:
+                return str(line.get("at", "")) < str(before)
+            return True                          # wipe: чистка раздела целиком
+
         targets: list[Path] = []
         if kind in ("report", "all"):
             targets.append(self._rep_path)
@@ -1759,27 +1829,20 @@ class ThinkingClient:
                 continue
             kept: list[str] = []
             for line in _read_jsonl(path, 100000):
-                hit = False
-                if rid:
-                    hit = str(line.get("rid") or "") == rid
-                elif n is not None:
-                    # номер + метка времени: номер сам по себе не уникален
-                    hit = (int(line.get("n", -1)) == int(n)
-                           and str(line.get("at", "")) == str(at))
-                elif before:
-                    hit = str(line.get("at", "")) < str(before)
-                else:
-                    hit = True                      # чистка раздела целиком
-                if hit:
+                if _hit(line):
                     removed += 1
                 else:
                     kept.append(json.dumps(line, ensure_ascii=False, default=str))
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
             tmp.replace(path)
-        if rid:
-            self.reports = [r for r in self.reports if r.get("rid") != rid]
-            self.interactions = [r for r in self.interactions if r.get("rid") != rid]
+        # Память чистим той же предикатной функцией: раньше фильтр стоял только
+        # под `if rid:`, и clearAll/clearOld воскрешали записи после сброса
+        # _disk_cache (аудит B — «удалённое вернётся после рестарта»).
+        if kind in ("report", "all"):
+            self.reports = [r for r in self.reports if not _hit(r)]
+        if kind in ("dialog", "all"):
+            self.interactions = [r for r in self.interactions if not _hit(r)]
         self._disk_cache = (None, [], [])
         return removed
 

@@ -181,7 +181,20 @@ def test_client() -> None:
     check({"online", "interactions", "reports", "benefits"} <= set(st),
           "status: отдаёт interactions/reports/benefits")
     check(not c.base, "клиент: URL берётся из config/thinking.local.json (здесь пусто)")
-    check(c.cfg.get("enabled") is True, "клиент: config/thinking.json читается")
+    # Аудит A-4: проверка ниже была тавтологией — make_client сам передаёт
+    # "enabled": True, а __init__ делает {**base_cfg, **cfg} (client.py:164):
+    # истинно при любых значениях файла, ни один ключ не проверялся.
+    real_cfg = json.loads((ROOT / "config" / "thinking.json").read_text(encoding="utf-8"))
+    check(isinstance(real_cfg, dict) and bool(real_cfg),
+          "клиент: config/thinking.json читается как непустой объект")
+    check(set(real_cfg) <= set(c.cfg),
+          "клиент: ключи config/thinking.json попали в cfg")
+    check(c.cfg.get("plan_timeout") == real_cfg.get("plan_timeout") == 360,
+          "клиент: plan_timeout из файла дошёл до клиента (360)")
+    check(c.cfg.get("stream_timeout") == real_cfg.get("stream_timeout"),
+          "клиент: stream_timeout из файла дошёл до клиента")
+    check(c.cfg.get("panel_port") == real_cfg.get("panel_port"),
+          "клиент: panel_port из файла дошёл до клиента")
 
     check(raises(lambda: c._check_secrets("password=hunter2"), SchemaError),
           "секрет в задаче блокирует вызов (SchemaError)")
@@ -894,12 +907,20 @@ def test_sse_heartbeat() -> None:
     ошибка модели — подниматься до вызывающего.
     """
     import asyncio
+    from collections import deque as _deque
+
     src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
     start = src.index("async def with_heartbeat")
     rest = src[start + 10:]
     end = min((rest.find("\nasync def ") if rest.find("\nasync def ") >= 0 else len(rest)),
               (rest.find("\ndef ") if rest.find("\ndef ") >= 0 else len(rest)))
-    ns: dict = {"asyncio": asyncio, "time": __import__("time")}
+
+    class _S:
+        # серверный синглтон: для этой проверки нужны только счётчики потоков
+        stats = {"stream_aborted": 0, "stream_first_ms": _deque(maxlen=200),
+                 "sem_timeouts": 0, "sem_wait_ms": _deque(maxlen=200)}
+
+    ns: dict = {"asyncio": asyncio, "time": __import__("time"), "S": _S}
     exec("import asyncio, time\n" + src[start:start + 10 + end], ns)
     hb = ns["with_heartbeat"]
 
@@ -927,6 +948,13 @@ def test_sse_heartbeat() -> None:
           "SSE: данные модели проходят насквозь")
     check(chunks[-1].startswith("data:"),
           "SSE: поток заканчивается данными, а не пингом")
+    # телеметрия (аудит 03): TTFT замеряется, завершённый поток не считается
+    # обрывом — иначе «все потоки оборвались» читалось бы и с идеальной лентой
+    check(len(_S.stats["stream_first_ms"]) == 1
+          and _S.stats["stream_first_ms"][0] >= 200,
+          f"SSE: первый некий байт (TTFT) замерян: {_S.stats['stream_first_ms']}")
+    check(_S.stats["stream_aborted"] == 0,
+          "SSE: нормально завершённый поток не считается обрывом")
 
     async def collect_err():
         out = []
@@ -939,6 +967,8 @@ def test_sse_heartbeat() -> None:
     kind, val = asyncio.run(collect_err())
     check(kind == "raised" and "upstream упал" in val,
           "SSE: ошибка модели поднимается до вызывающего, а не теряется")
+    check(_S.stats["stream_aborted"] == 1,
+          "SSE: незавершённый поток посчитан как обрыв (stream_aborted)")
 
     # пинги должны быть на маршрутах, которые ходят через туннель
     for route in ("/plan/stream", "/chat/stream", "/dev/stream"):
@@ -2015,8 +2045,17 @@ def test_plan_stream_resilience() -> None:
             parsed = json.loads(out[start:])
         except Exception:
             parsed = None
-    check(rc in (0, 2) and isinstance(parsed, dict) and parsed.get("steps"),
+    # Аудит B (и A-4): rc=2 здесь — штатный путь (мок уже остановлен, работает
+    # fallback), но stdout обязан быть ЧИСТЫМ JSON: раньше перед JSON печатался
+    # «[субагент недоступен: …]», потоковые метки и токены — контракт --json
+    # ломался ровно в самом частом сценарии.
+    check(isinstance(parsed, dict) and parsed.get("steps"),
           f"план-поток: --stream --json печатает JSON (C-9, rc={rc})")
+    check(out.lstrip().startswith("{") and '"steps"' in out,
+          "A-4: --stream --json: stdout целиком JSON")
+    check("[субагент недоступен:" not in out and "--- поток мыслей" not in out
+          and "--- конец потока" not in out,
+          "A-4: диагностика ушла в stderr и не мешает --json")
 
 
 def test_audit_round2_fixes() -> None:
@@ -2159,8 +2198,15 @@ def test_panel_host_and_models() -> None:
           "AUD-17: чужой Origin у POST → 403")
     check(not mod.host_allowed("127.0.0.1:8765", "http://evil.example:8765", 8765),
           "AUD-17: Origin чужого хоста → 403")
-    check(mod.host_allowed("127.0.0.1:8765", "null", 8765),
-          "AUD-17: запрос без Origin (curl, file://) не блокируется")
+    check(mod.host_allowed("127.0.0.1:8765", "", 8765),
+          "AUD-17: запрос без Origin (curl) не блокируется")
+    # Аудит A-1: "null" — sandboxed-iframe/data:-страница чужого сайта, а не curl.
+    # Раньше здесь была обратная проверка — и дыра до стирания журналов была
+    # закреплена собственным тестом.
+    check(not mod.host_allowed("127.0.0.1:8765", "null", 8765),
+          "A-1: Origin: null (sandboxed-iframe) отклоняется")
+    check(not mod.host_allowed("127.0.0.1:8765", "undefined", 8765),
+          "A-1: Origin: undefined отклоняется")
 
     cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
     get_pos, post_pos = cli_src.find("def do_GET("), cli_src.find("def do_POST(")
@@ -2177,6 +2223,121 @@ def test_panel_host_and_models() -> None:
           "вкладка «Модели»: место под параллельные движки")
     check('data["parallel"] = client.parallel_models()' in cli_src,
           "/api/models отдаёт /parallel — данные для вкладки «Модели»")
+
+
+def test_audit_wave_a() -> None:
+    """Волна A полного аудита 04.10 (audit-full.md): CSRF, редьюсер, критерии
+    удаления, заголовки панели, обрыв чтения в `_json`."""
+    import ast as _ast
+
+    from thinking.schemas import redact_secrets
+
+    # --- A-2: серверный redact() обязан вести себя как schemas -----------
+    # (правка B-1 была применена только к schemas.py, ячейка C осталась со
+    # старым паттерном — JSON-секрет уезжал в события и в /dump)
+    src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    # первая строка — директива %%writefile, она не Python (как в других тестах)
+    src_py = "\n".join(ln for ln in src.splitlines() if not ln.startswith("%%"))
+    tree = _ast.parse(src_py)
+    keep = []
+    for node in tree.body:
+        if isinstance(node, _ast.Assign):
+            names = {t.id for t in node.targets if isinstance(t, _ast.Name)}
+            if names & {"SECRET_RE", "_SECRET_REF"}:
+                keep.append(node)
+        elif isinstance(node, _ast.FunctionDef) and node.name == "redact":
+            keep.append(node)
+    ns: dict = {"re": re}
+    exec(compile(_ast.Module(body=keep, type_ignores=[]), "<cell_c>", "exec"), ns)
+    server_redact = ns["redact"]
+    for sample in ('{"password": "hunter2"}',
+                   '{"token": "sk-LEAKED123456", "url": "https://x"}',
+                   "api_key=sk-LEAKED123456",
+                   "password=hunter2",
+                   "Authorization: Bearer abc.def.ghi",
+                   'token = os.getenv("X")',
+                   "пароль hunter2", ""):
+        got, want = server_redact(sample), redact_secrets(sample)
+        check(got == want,
+              f"A-2: redact сервера == schemas на {sample!r} ({got!r} != {want!r})")
+    check("hunter2" not in server_redact('{"password": "hunter2"}'),
+          "A-2: JSON-секрет маскируется, а не проходит мимо редьюсера")
+    check("os.getenv" in server_redact('token = os.getenv("X")'),
+          "A-2: ссылка на переменную не портится (AUD-13)")
+    check('fh.write(redact(raw or ""))' in src,
+          "A-2: last_bad_json.txt пишется через редьюсер (попадает в /dump)")
+
+    # --- A-1: полная очистка журнала требует явного wipe -----------------
+    c = make_client()
+    with open(c._rep_path, "w", encoding="utf-8") as fh:
+        for rid in ("r1", "r2"):
+            fh.write(json.dumps({"n": 1, "rid": rid,
+                                 "at": "2026-10-02T10:00:00+00:00",
+                                 "type": "plan", "goal": "тест " + rid},
+                                ensure_ascii=False) + "\n")
+    c.reports = [{"n": 1, "rid": "r1", "at": "2026-10-02T10:00:00+00:00"},
+                 {"n": 1, "rid": "r2", "at": "2026-10-02T10:00:00+00:00"}]
+    check(raises(lambda: c.delete_history("report"), SchemaError),
+          "A-1: без критериев полная очистка запрещена")
+    check(raises(lambda: c.delete_history("report", rid="", n=None, before=""),
+                 SchemaError),
+          "A-1: пустые критерии не читаются как «снеси всё»")
+    removed = c.delete_history("report", wipe=True)
+    check(removed == 2, f"A-1: wipe чистит раздел целиком (removed={removed})")
+    check(c.reports == [], "A-1: wipe чистит и in-memory копию отчётов")
+    check(count_lines(c.cfg.get("reports_path")) == 0, "A-1: файл отчётов пуст")
+
+    # --- A-1: удаление по before больше не воскрешает записи -------------
+    c2 = make_client()
+    with open(c2._rep_path, "w", encoding="utf-8") as fh:
+        for rid, at in (("old1", "2026-10-01T10:00:00+00:00"),
+                        ("new1", "2026-10-04T10:00:00+00:00")):
+            fh.write(json.dumps({"n": 1, "rid": rid, "at": at, "type": "plan",
+                                 "goal": "тест " + rid}, ensure_ascii=False) + "\n")
+    c2.reports = [{"n": 1, "rid": "old1", "at": "2026-10-01T10:00:00+00:00"},
+                  {"n": 1, "rid": "new1", "at": "2026-10-04T10:00:00+00:00"}]
+    c2.delete_history("report", before="2026-10-02T00:00:00+00:00")
+    check([r["rid"] for r in c2.reports] == ["new1"],
+          "A-1: удаление по before чистит и память — записи не воскресают")
+
+    # --- маркеры панели, закрывающие кросс-запрос ------------------------
+    cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    for marker, name in (
+            ('self.send_header("X-Frame-Options", "DENY")',
+             "A-1: панель нельзя встроить в чужую страницу"),
+            ('self.send_header("Content-Security-Policy", "frame-ancestors \'none\'")',
+             "A-1: frame-ancestors закрывает clickjacking"),
+            ('self.send_header("X-Content-Type-Options", "nosniff")',
+             "A-1: nosniff у JSON-ответов"),
+            ('if "application/json" not in ctype:', "A-1: _body требует JSON"),
+            ('if data is None:', "A-1: не-JSON тело → 400, а не пустой словарь"),
+            ("wipe = bool(data.get(\"wipe\"))", "A-1: /api/delete читает явный wipe")):
+        check(marker in cli_src, name)
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    check("wipe: true" in html, "A-1: кнопка «Удалить всё» шлёт явный wipe")
+    check('r => ({rid: r.rid || "", n: r.n, at: r.at || ""})' in html,
+          "B: «только заглушки» удаляет по rid, а не по одному n")
+
+    # --- A-3: обрыв чтения тела ответа превращается в ThinkingError ------
+    import http.client as _hc
+
+    c3 = make_client()
+
+    class _BrokenResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            raise _hc.IncompleteRead(b"half of the body")
+
+    c3._open = lambda *a, **k: _BrokenResp()
+    check(raises(lambda: c3._json("GET", "/health"), ThinkingError),
+          "A-3: IncompleteRead → ThinkingError, а не сырое исключение")
+    check("обрыв чтения" in str(c3.last_error or ""),
+          "A-3: last_error заполнен — предохранитель видит обрыв тела")
 
 
 def main() -> int:
@@ -2202,6 +2363,7 @@ def main() -> int:
     test_plan_stream_resilience()
     test_audit_round2_fixes()
     test_panel_host_and_models()
+    test_audit_wave_a()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

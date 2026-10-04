@@ -968,7 +968,10 @@ async function clearAll(kind) {
   const label = kind === "report" ? "все отчёты" :
                 (kind === "chat" ? "историю чата" : "весь диалог");
   if (!confirm("Удалить " + label + "? Это необратимо.")) return;
-  const res = await api("/api/delete", {kind: kind});
+  // wipe: полная очистка теперь требует явного флага — сервер не примет
+  // «пустой запрос» как «снеси всё» (аудит A-1)
+  const res = await api("/api/delete", {kind: kind, wipe: true});
+  if (res && res.error) { alert(res.error); return; }
   lastSig = "";
   state();
 }
@@ -981,10 +984,21 @@ async function clearOld(kind) {
 }
 async function clearFallback() {
   const list = (STATE && STATE.reports) || [];
-  const ids = list.filter(r => r.fallback).map(r => r.n);
+  // rid — единственная уникальная метка: только по n сервер не находит запись
+  // (n уникален лишь внутри процесса), и кнопка молча удаляла 0 записей
+  const ids = list.filter(r => r.fallback)
+                  .map(r => ({rid: r.rid || "", n: r.n, at: r.at || ""}))
+                  .filter(x => x.rid || x.at);
   if (!ids.length) { alert("Заглушек нет — удалять нечего"); return; }
   if (!confirm("Удалить " + ids.length + " отчёт(ов) из заглушки?")) return;
-  for (const n of ids) await api("/api/delete", {kind: "report", n: n});
+  let removed = 0;
+  for (const rec of ids) {
+    const res = await api("/api/delete", Object.assign({kind: "report"}, rec));
+    if (res && res.removed) removed += res.removed;
+  }
+  // раньше результат не читался вовсе: кнопка врала, что вычистила мусор
+  alert(removed ? ("Удалено записей: " + removed)
+                : "Ничего не удалено — записи уже ушли из журнала");
   lastSig = "";
   state();
 }

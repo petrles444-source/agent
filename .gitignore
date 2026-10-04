@@ -1,6 +1,12 @@
 # === Секреты: НИКОГДА не попадают в git ===
 # base_url + токен Colab пишет команда set-url; шаблон — config/thinking.local.json.example
 config/thinking.local.json
+# аудит 05: закрываем всё, что похоже на локальный конфиг, а не только один путь
+*.local.json
+.env
+.env.*
+thinking_url.txt
+*token*.txt
 
 # === Локальная история (переписка, события, отчёты) — только на ПК ===
 logs/

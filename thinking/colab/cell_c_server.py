@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
@@ -73,7 +74,16 @@ ACTIONS = {"build", "test", "refactor", "verify", "docs", "prompt", "debug", "re
 RETRY = {"none", "once", "exponential"}
 SECRET_RE = re.compile(
     r"\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key|token)\b"
-    r"\s*[=:]\s*\S+", re.I)
+    r"""["']?\s*[=:]\s*["']?[^\s"',}]+""",
+    re.I,
+)
+# Аудит A-2 (правка B-1 была применена только к thinking/schemas.py): без
+# допуска кавычек JSON-литерал «"password": "hunter2"» проходил мимо редьюсера
+# и уезжал в события/отчёты/дамп. Паттерн и список «ссылок, а не секретов»
+# держим один в один с schemas.py — тест test_secret_redactor_parity сверяет.
+_SECRET_REF = ("os.getenv(", "os.environ[", "environ[", "getenv(",
+               "self.", "cfg[", "config.", "settings.", "args.",
+               '""', "''", "None", "True", "False")
 
 
 def utcnow() -> str:
@@ -81,7 +91,13 @@ def utcnow() -> str:
 
 
 def redact(text: str) -> str:
-    return SECRET_RE.sub(lambda m: f"{m.group(1)}=[скрыто]", text or "")
+    def _sub(m: "re.Match[str]") -> str:
+        full, key = m.group(0), m.group(1) or ""
+        tail = full.split(key, 1)[-1] if key in full else full
+        if tail.lstrip("=: \t\"'").startswith(_SECRET_REF):
+            return m.group(0)        # «token = os.getenv(…)» — это код (AUD-13)
+        return f"{key}=[скрыто]"
+    return SECRET_RE.sub(_sub, text or "")
 
 
 # --------------------------------------------------------------- схемы ----
@@ -218,7 +234,13 @@ class State:
                       "bad_json": 0, "llm_ms": deque(maxlen=200),
                       # честный учёт токенов: usage приходит не от каждого
                       # вызова, поэтому держим и «чистые» вызовы с usage
-                      "tokens_in": 0, "tokens_out": 0, "usage_calls": 0}
+                      "tokens_in": 0, "tokens_out": 0, "usage_calls": 0,
+                      # Телеметрия потоков (аудит 03): без неё обрыв на
+                      # доставке невозможно отличить от падения генератора —
+                      # ровно та задача, которая встала после живого прогона
+                      # 04.10 (сервер додумал план, байты не доехали).
+                      "stream_aborted": 0, "stream_first_ms": deque(maxlen=200),
+                      "sem_timeouts": 0, "sem_wait_ms": deque(maxlen=200)}
 
 
 S = State()   # единственный синглтон: снаружи глобальных переменных нет
@@ -237,6 +259,42 @@ async def cors(request: Request, call_next):
 @app.options("/{path:path}")
 async def options(path: str):
     return {"ok": True}
+
+
+# Сколько ждать свободного слота генерации, прежде чем честно отказать.
+# 120 с = лимит Cloudflare на не-потоковый ответ: дольше всё равно бессмысленно.
+SEM_WAIT_S = float(os.environ.get("THINKING_SEM_WAIT", "120"))
+
+
+@asynccontextmanager
+async def sem_slot():
+    """Слот генерации с честным отказом вместо бесконечной очереди.
+
+    CONCURRENCY=1 сериализует всю генерацию. Без таймаута запрос, чей
+    предшественник умер молча (без EOF — живой симптом 04.10), стоял бы
+    в очереди под пинги: сервер докручивает чужую генерацию, клиент не может
+    отличить «стою в очереди» от «думаю», а его повтор упирается в то же
+    ожидание — это самая правдоподобная причина, почему все три попытки
+    плана умерли одинаково. Теперь по истечении SEM_WAIT_S — 503, который
+    клиент честно показывает и повторяет.
+    """
+    t = time.monotonic()
+    try:
+        await asyncio.wait_for(S.sem.acquire(), timeout=SEM_WAIT_S)
+    except asyncio.TimeoutError:
+        S.stats["sem_timeouts"] += 1
+        raise HTTPException(503, "LLM занят другим запросом — повторите позже")
+    S.stats["sem_wait_ms"].append(int((time.monotonic() - t) * 1000))
+    try:
+        yield
+    finally:
+        S.sem.release()
+
+
+def _avg(values) -> Optional[int]:
+    """Среднее по выборке; пустая выборка → None, а не 0 (0 читался бы как «мгновенно»)."""
+    vals = list(values)
+    return int(sum(vals) / len(vals)) if vals else None
 
 
 # -------------------------------------------------------------- события ---
@@ -453,7 +511,7 @@ async def chat_json_usage(system: str, user: str,
     llama.cpp-сервер отдаёт usage не всегда, поэтому при отсутствии честно
     отдаём пустой dict: ПК посчитает оценку по длине текста сам.
     """
-    async with S.sem:
+    async with sem_slot():
         t = time.time()
         async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as c:
             r = await c.post(UPSTREAM, json={
@@ -485,9 +543,17 @@ async def with_heartbeat(src, gap: float = 15.0):
 
     Наполнение идёт отдельной задачей: иначе таймаут отменял бы чтение
     модели на полуслове и поток вёлся бы в никуда.
+
+    Плюс телеметрия (аудит 03): первый некий байт (TTFT) и факт обрыва.
+    Раньше сервер вообще не знал, закончился ли поток `done`-событием или
+    его вырезали посередине — отличить «туннель убил» от «клиент закрыл»
+    было нечем, и живой симптом 04.10 объяснялся только гипотезами.
     """
     q: asyncio.Queue = asyncio.Queue()
     done = object()
+    t0 = time.monotonic()
+    started = False
+    completed = False
 
     async def _pump() -> None:
         try:
@@ -509,12 +575,21 @@ async def with_heartbeat(src, gap: float = 15.0):
                 yield f": ping {int(time.time())}\n\n"
                 continue
             if item is done:
+                completed = True               # генератор доработал до конца
                 return
             if isinstance(item, BaseException):
                 raise item
+            if not started:
+                started = True                 # первый реальный байт = TTFT
+                S.stats["stream_first_ms"].append(
+                    int((time.monotonic() - t0) * 1000))
             yield item
     finally:
         task.cancel()
+        if not completed:
+            # клиент ушёл, соединение умерло молча или генератор упал —
+            # раньше это выглядело как успешный поток
+            S.stats["stream_aborted"] = int(S.stats.get("stream_aborted", 0)) + 1
 
 
 async def chat_stream(system: str, user: str, max_tokens: int = MAX_TOKENS,
@@ -561,8 +636,10 @@ async def _guard(raw: str) -> dict:
     except Exception as exc:
         S.stats["bad_json"] += 1
         try:
+            # сырой вывод LLM уходит в дамп (/dump/last_bad_json.txt) — через
+            # редьюсер, как и весь остальной вывод сервера (аудит A-2)
             with open("/content/last_bad_json.txt", "w", encoding="utf-8") as fh:
-                fh.write(raw or "")
+                fh.write(redact(raw or ""))
         except Exception:
             pass
         await emit("error", f"LLM вернула не-JSON: {exc}")
@@ -727,7 +804,12 @@ async def metrics(x_agent_token: str = Header(default=""), token: str = ""):
             "tokens_in": S.stats["tokens_in"], "tokens_out": S.stats["tokens_out"],
             "tokens_total": S.stats["tokens_in"] + S.stats["tokens_out"],
             "usage_calls": S.stats["usage_calls"],
-            "usage_exact": bool(calls) and S.stats["usage_calls"] >= calls}
+            "usage_exact": bool(calls) and S.stats["usage_calls"] >= calls,
+            # телеметрия потоков: сколько оборвалось, как долго ждали очередь
+            "stream_aborted": S.stats["stream_aborted"],
+            "stream_first_ms_avg": _avg(S.stats["stream_first_ms"]),
+            "sem_wait_ms_avg": _avg(S.stats["sem_wait_ms"]),
+            "sem_timeouts": S.stats["sem_timeouts"]}
 
 
 @app.get("/events")
@@ -809,7 +891,7 @@ async def plan_stream(req: PlanRequest, x_agent_token: str = Header(default=""),
     async def gen():
         buf: list[str] = []
         try:
-            async with S.sem:
+            async with sem_slot():
                 async for piece in chat_stream(SYSTEM_PLAN, build_plan_prompt(req)):
                     buf.append(piece)
                     yield f"data: {json.dumps({'type': 'token', 'text': piece}, ensure_ascii=False)}\n\n"
@@ -918,7 +1000,7 @@ async def reflect_stream(req: ReflectRequest, x_agent_token: str = Header(defaul
     async def gen():
         buf: list[str] = []
         try:
-            async with S.sem:
+            async with sem_slot():
                 async for piece in chat_stream(SYSTEM_REFLECT,
                                                _reflect_user(req, plan_json),
                                                min(500, _ctx_limit())):
@@ -1291,7 +1373,7 @@ async def chat_stream_ep(req: ChatRequest, x_agent_token: str = Header(default="
     async def gen():
         buf: list[str] = []
         try:
-            async with S.sem:
+            async with sem_slot():
                 async for piece in chat_stream(SYSTEM_CHAT,
                                                build_chat_prompt(req), max_tokens):
                     buf.append(piece)
@@ -1369,7 +1451,7 @@ async def dev_stream(req: DevRequest, x_agent_token: str = Header(default=""),
     async def gen():
         buf: list[str] = []
         try:
-            async with S.sem:
+            async with sem_slot():
                 async for piece in chat_stream(SYSTEM_DEV, build_dev_prompt(req),
                                                max_tokens):
                     buf.append(piece)

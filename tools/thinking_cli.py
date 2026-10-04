@@ -66,7 +66,7 @@ DUMP_FILES = ("llm.log", "api.log", "tunnel.log", "server.py",
               "snapshot.json", "last_bad_json.txt", "model_path.txt")
 
 
-def _out(text: str) -> None:
+def _out(text: str, file=None) -> None:
     """Печать в консоль, которая не умеет в unicode.
 
     На Windows консоль по умолчанию cp1251, и любой символ вне неё (стрелка,
@@ -75,15 +75,21 @@ def _out(text: str) -> None:
     Раньше каждая команда должна была обойти это вручную; теперь печать
     безопасна везде, а символы, которые консоль не тянет, заменяются на
     похожие: → ⇒ >, ✓ v, ✗ x, ⚠ !
+
+    `file` — куда печатать: по умолчанию stdout, а в режиме `--json`
+    диагностика уходит в stderr, иначе контракт JSON ломается (аудит B:
+    `plan --json` при fallback печатал `[субагент недоступен: …]` прямо
+    перед JSON, и парсер получал мусор).
     """
+    dst = file or sys.stdout
     text = text.translate(_ASCII_FALLBACK)
     try:
-        sys.stdout.write(text + "\n")
-        sys.stdout.flush()
+        dst.write(text + "\n")
+        dst.flush()
     except UnicodeEncodeError:
-        enc = sys.stdout.encoding or "ascii"
-        sys.stdout.write(text.encode(enc, "replace").decode(enc, "replace") + "\n")
-        sys.stdout.flush()
+        enc = dst.encoding or "ascii"
+        dst.write(text.encode(enc, "replace").decode(enc, "replace") + "\n")
+        dst.flush()
 
 
 # Символы, которых нет в cp1251, но которые мы печатаем регулярно.
@@ -203,12 +209,17 @@ def cmd_plan(client: ThinkingClient, args: argparse.Namespace) -> int:
         context["extra"] = args.context
     constraints = list(args.constraint or [])
     stream = getattr(args, "stream", False)
+    # --json: в stdout только сам JSON, вся диагностика — в stderr, иначе
+    # контракт ломается ровно в самом частом сценарии (fallback, exit 2)
+    diag = sys.stderr if getattr(args, "json", False) else None
 
     if stream:
         plan, is_fallback = _plan_streamed(client, args.task, context,
-                                           constraints, args.max_steps)
+                                           constraints, args.max_steps,
+                                           diag=diag)
         if is_fallback:
-            _out(f"[субагент недоступен: {offline_reason(client)}] → шаблон-заглушка")
+            _out(f"[субагент недоступен: {offline_reason(client)}] → шаблон-заглушка",
+                 file=diag)
         if args.json:
             _out(json.dumps(plan, ensure_ascii=False, indent=2))
         else:
@@ -218,7 +229,8 @@ def cmd_plan(client: ThinkingClient, args: argparse.Namespace) -> int:
     plan, is_fallback = client.plan_with_fallback(
         args.task, context=context, constraints=constraints, max_steps=args.max_steps)
     if is_fallback:
-        _out(f"[субагент недоступен: {offline_reason(client)}] → шаблон-заглушка")
+        _out(f"[субагент недоступен: {offline_reason(client)}] → шаблон-заглушка",
+             file=diag)
     if args.json:
         _out(json.dumps(plan, ensure_ascii=False, indent=2))
     else:
@@ -227,24 +239,30 @@ def cmd_plan(client: ThinkingClient, args: argparse.Namespace) -> int:
 
 
 def _plan_streamed(client: ThinkingClient, task: str, context: dict,
-                   constraints: list[str], max_steps: int) -> tuple[dict, bool]:
-    """Стримит токены в терминал и возвращает итоговый план."""
+                   constraints: list[str], max_steps: int,
+                   diag=None) -> tuple[dict, bool]:
+    """Стримит токены в терминал и возвращает итоговый план.
+
+    `diag` — поток для диагностики и токенов (stderr в режиме `--json`);
+    по умолчанию всё уходит в stdout, как раньше.
+    """
     def on_event(ev: dict) -> None:
         kind = ev.get("type", "")
         text = str(ev.get("text", ""))
         if kind == "token":
-            sys.stdout.write(text)
-            sys.stdout.flush()
+            dst = diag or sys.stdout
+            dst.write(text)
+            dst.flush()
             return
         label = EVENT_RU.get(kind, kind)
-        _out(f"\n[{label}] {text}")
+        _out(f"\n[{label}] {text}", file=diag)
 
     if not client.cfg.get("enabled", True):
         plan, is_fb = client.plan_with_fallback(task, context=context,
                                                 constraints=constraints,
                                                 max_steps=max_steps)
         return plan, is_fb
-    _out("--- поток мыслей субагента ---")
+    _out("--- поток мыслей субагента ---", file=diag)
     try:
         plan = client.plan_stream(task, context=context, constraints=constraints,
                                   max_steps=max_steps, on_event=on_event)
@@ -254,14 +272,14 @@ def _plan_streamed(client: ThinkingClient, task: str, context: dict,
         # доехали). Раньше здесь падал трейсбек прямо из http.client.
         # Передаём причину: при обрыве транспорта обычный /plan съел бы
         # те же 120 с, поэтому дальше сразу шаблон-план.
-        _out("")
-        _out(f"! поток не прошёл ({exc}) → пробую обычный запрос")
+        _out("", file=diag)
+        _out(f"! поток не прошёл ({exc}) → пробую обычный запрос", file=diag)
         plan, is_fallback = client.plan_with_fallback(
             task, stream_error=exc, context=context, constraints=constraints,
             max_steps=max_steps)
-        _out("--- конец потока ---")
+        _out("--- конец потока ---", file=diag)
         return plan, is_fallback
-    _out("--- конец потока ---")
+    _out("--- конец потока ---", file=diag)
     return plan, False
 
 
@@ -305,12 +323,12 @@ def cmd_ask_multi(client: ThinkingClient, args: argparse.Namespace) -> int:
 
 
 def cmd_ask(client: ThinkingClient, args: argparse.Namespace) -> int:
-    args.files = ""
-    args.constraint = []
-    args.context = None
-    args.json = False
-    args.stream = getattr(args, "stream", False)
+    # Аудит B: флаги ask молча обнулялись — `ask --json` печатал человекочитаемый
+    # текст, а `--files/--constraint/--context` просто игнорировались, хотя
+    # парсер их принимает. Единственное отличие ask от plan — короткий ответ,
+    # поэтому ограничиваем только max_steps, остальное пробрасываем как есть.
     args.max_steps = min(args.max_steps, 5)
+    args.stream = getattr(args, "stream", False)
     return cmd_plan(client, args)
 
 
@@ -825,8 +843,14 @@ def host_allowed(host: str, origin: str = "", port: object = "") -> bool:
     if p and str(port) and p != str(port):
         return False
     origin = str(origin or "").strip()
-    if not origin or origin.lower() in ("null", "undefined"):
+    if not origin:
         return True                       # curl/свой скрипт — Origin не шлёт
+    if origin.lower() in ("null", "undefined"):
+        # Аудит A-1: браузер у POST Origin ВСЕГДА шлёт, поэтому пустой Origin —
+        # это curl. А вот литерал "null" — sandboxed-iframe, data:/file:-страница
+        # чужого сайта: раньше она считалась «своей», и кросс-запрос доезжал до
+        # /api/delete и стирал журналы. Свои страницы шлют http://127.0.0.1:…
+        return False
     try:
         u = urllib.parse.urlparse(origin)
     except ValueError:
@@ -950,6 +974,15 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            # Аудит A-1: панель умеет менять настройки и стирать журналы —
+            # не даём встроить её в чужую страницу (клик по прозрачному iframe
+            # шлёт уже «свой» Origin, и проверку Origin он обходит силами
+            # пользователя). nosniff — чтобы JSON не читался как скрипт.
+            self.send_header("X-Frame-Options", "DENY")
+            # только frame-ancestors — остальные ресурсы (шрифты, иконки с CDN)
+            # этот заголовок не трогает
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -960,20 +993,36 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
             self._send(code, "application/json; charset=utf-8",
                        json.dumps(data, ensure_ascii=False, default=str).encode("utf-8"))
 
-        def _body(self) -> dict:
-            """Читает JSON тела запроса; плохой JSON — не ошибка сервера."""
+        def _body(self) -> dict | None:
+            """Читает JSON тела запроса. `None` — тело принять нельзя.
+
+            Аудит A-1: раньше и битый JSON, и не-JSON тело молча превращались
+            в `{}` — кросс-запрос формой (`enctype="text/plain"`) получал
+            «пустой запрос», которого в `/api/delete` хватало на полную
+            очистку журнала. Теперь не-JSON — это 400, а не пустой словарь.
+            Пустое тело (Content-Length = 0) остаётся `{}`: маршруты сами
+            проверяют свои поля.
+            """
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except (TypeError, ValueError):
                 length = 0
             if length <= 0:
                 return {}
+            ctype = str(self.headers.get("Content-Type") or "").lower()
+            if "application/json" not in ctype:
+                # тело всё равно съедаем, иначе соединение рассинхронизируется
+                try:
+                    self.rfile.read(length)
+                except OSError:
+                    pass
+                return None
             try:
                 raw = self.rfile.read(length).decode("utf-8", "replace")
                 data = json.loads(raw)
-                return data if isinstance(data, dict) else {}
             except (ValueError, OSError):
-                return {}
+                return None
+            return data if isinstance(data, dict) else None
 
         def _deny_host(self, with_origin: bool = False) -> bool:
             """AUD-17: отсекаем чужой Host, а у POST — и чужой Origin."""
@@ -993,6 +1042,12 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
             """Действия панели: чат, память, удаление записей."""
             path = self.path.split("?")[0]
             data = self._body()
+            if data is None:
+                # Аудит A-1: молчаливое превращение не-JSON тела в {}
+                # заканчивалось чужим «пустым запросом» вместо ошибки
+                self._json_out(400, {"error": "нужен JSON "
+                                              "(Content-Type: application/json)"})
+                return
             if path == "/api/chat":
                 message = str(data.get("message") or "").strip()
                 if not message:
@@ -1103,13 +1158,22 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 kind = str(data.get("kind") or "report")
                 n = data.get("n")
                 before = str(data.get("before") or "")
+                rid = str(data.get("rid") or "")
+                at = str(data.get("at") or "")
+                wipe = bool(data.get("wipe"))
+                if not rid and not str(n or "").strip() and not before and not wipe:
+                    # Аудит A-1: пустое тело раньше читалось как «удали всё»
+                    self._json_out(400, {"error": "нужен rid, n+at, before "
+                                                  "или wipe=true"})
+                    return
                 try:
                     removed = client.delete_history(
                         kind=kind,
-                        rid=str(data.get("rid") or ""),
+                        rid=rid,
                         n=int(n) if str(n or "").strip() else None,
-                        at=str(data.get("at") or ""),
-                        before=before)
+                        at=at,
+                        before=before,
+                        wipe=wipe)
                 except (SchemaError, ThinkingError) as exc:
                     self._json_out(400, {"error": str(exc)[:200]})
                     return
