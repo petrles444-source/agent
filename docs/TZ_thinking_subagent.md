@@ -930,21 +930,36 @@ ThinkingAgent/
 {
   "enabled": true,
   "base_url": "",
-  "timeout": 30,
+  "timeout": 45,
   "connect_timeout": 5,
   "retry": {"max_attempts": 3, "backoff_base": 1.5, "max_backoff": 15},
   "stream": true,
+  "stream_timeout": 40,
   "fallback_on_error": true,
   "reconnect_delay": 5,
+  "panel_poll": 5,
+  "plan_timeout": 360,
+  "reflect_timeout": 180,
+  "stream_stall": 45,
+  "stream_retries": 2,
+  "chat_json_timeout": 300,
+  "chat_timeout": 600,
+  "dev_timeout": 600,
+  "breaker_pause": 600,
+  "answer_cache_ttl": 1800,
   "log_path": "logs/thinking/thoughts.jsonl",
   "log_max_bytes": 5242880,
+  "interactions_path": "logs/thinking/interactions.jsonl",
+  "reports_path": "logs/thinking/reports.jsonl",
   "panel_host": "127.0.0.1",
   "panel_port": 8765,
   "source": "colab"
 }
 ```
 
-`base_url` пустой ⇒ клиент берёт `THINKING_URL` из окружения, затем `config/thinking.local.json` → `{"base_url": ..., "token": ...}`. Обнаружение URL описано в §7.
+`base_url` пустой ⇒ клиент берёт адрес по цепочке `config/thinking.local.json`
+→ `config/thinking.json` → `THINKING_URL` из окружения (именно в этом
+порядке, `client.py: reload_config`). Обнаружение URL описано в §7.
 
 ## 5.2. `thinking/client.py`
 
@@ -1444,7 +1459,7 @@ PANEL:    http://127.0.0.1:8765
 `ПРОЙДЕНО: N   ПРОВАЛЕНО: N` + строки `  ! ...`, exit 1 при провалах.
 
 Проверки (без сети, всегда зелёные на CI/локально):
-1. `thinking.schemas.Plan.model_json_schema()` == `docs/schema_plan.json` (снимок).
+1. `thinking.schemas.plan_schema()` == `docs/schema_plan.json` (снимок).
 2. Уникальность `step.id` валидируется; `>30` шагов отклоняется.
 3. `thinking.schemas.extract_json`: plain JSON, JSON в ```` ```json ````, JSON с хвостом-текстом, JSON с висячей запятой, отсутствие `{` → `ValueError`.
 4. `local_plan()` возвращает `source="local-fallback"`, ≥1 шаг, `plan_id` непустой.

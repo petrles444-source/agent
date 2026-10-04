@@ -263,6 +263,7 @@ class State:
                       # ровно та задача, которая встала после живого прогона
                       # 04.10 (сервер додумал план, байты не доехали).
                       "stream_aborted": 0, "stream_first_ms": deque(maxlen=200),
+                      "stream_ms": deque(maxlen=200), "stream_tokens": 0,
                       "sem_timeouts": 0, "sem_wait_ms": deque(maxlen=200)}
 
 
@@ -588,6 +589,8 @@ async def with_heartbeat(src, gap: float = 15.0):
     t0 = time.monotonic()
     started = False
     completed = False
+    items = 0
+    first_ms = 0
 
     async def _pump() -> None:
         try:
@@ -615,15 +618,28 @@ async def with_heartbeat(src, gap: float = 15.0):
                 raise item
             if not started:
                 started = True                 # первый реальный байт = TTFT
-                S.stats["stream_first_ms"].append(
-                    int((time.monotonic() - t0) * 1000))
+                first_ms = int((time.monotonic() - t0) * 1000)
+                S.stats["stream_first_ms"].append(first_ms)
+            items += 1
             yield item
     finally:
         task.cancel()
+        dt = int((time.monotonic() - t0) * 1000)
+        S.stats["stream_ms"].append(dt)
+        S.stats["stream_tokens"] = int(S.stats.get("stream_tokens", 0)) + items
         if not completed:
             # клиент ушёл, соединение умерло молча или генератор упал —
-            # раньше это выглядело как успешный поток
+            # раньше это выглядело как успешный поток. Строка в ленте нужна
+            # для сверки: если сервер здесь «оборвался», а клиент видел
+            # обрыв — рвётся доставка, а не генерация.
             S.stats["stream_aborted"] = int(S.stats.get("stream_aborted", 0)) + 1
+            try:
+                await emit("error",
+                           f"поток оборван на {dt} мс, отдано {items} сообщений"
+                           + (f", первый байт через {first_ms} мс"
+                              if first_ms else ", ни одного байта"))
+            except Exception:
+                pass
 
 
 async def chat_stream(system: str, user: str, max_tokens: int = MAX_TOKENS,
@@ -911,6 +927,8 @@ async def metrics(x_agent_token: str = Header(default=""), token: str = ""):
             # телеметрия потоков: сколько оборвалось, как долго ждали очередь
             "stream_aborted": S.stats["stream_aborted"],
             "stream_first_ms_avg": _avg(S.stats["stream_first_ms"]),
+            "stream_ms_avg": _avg(S.stats["stream_ms"]),
+            "stream_tokens": S.stats["stream_tokens"],
             "sem_wait_ms_avg": _avg(S.stats["sem_wait_ms"]),
             "sem_timeouts": S.stats["sem_timeouts"],
             # счётчики, которые считались, но не отдавались — мёртвая

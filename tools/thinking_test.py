@@ -74,6 +74,14 @@ def count_lines(path: object) -> int:
         return 0
 
 
+def _free_port() -> int:
+    """Свободный порт для поднятия панели в тесте."""
+    import socket as _s
+    with _s.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
 def _cli_subcommands(mod) -> list[str]:
     """Список подкоманд CLI — прямо из парсера, а не ручным списком в тесте."""
     import argparse as _ap
@@ -951,6 +959,7 @@ def test_sse_heartbeat() -> None:
     class _S:
         # серверный синглтон: для этой проверки нужны только счётчики потоков
         stats = {"stream_aborted": 0, "stream_first_ms": _deque(maxlen=200),
+                 "stream_ms": _deque(maxlen=200), "stream_tokens": 0,
                  "sem_timeouts": 0, "sem_wait_ms": _deque(maxlen=200)}
 
     ns: dict = {"asyncio": asyncio, "time": __import__("time"), "S": _S}
@@ -1002,6 +1011,8 @@ def test_sse_heartbeat() -> None:
           "SSE: ошибка модели поднимается до вызывающего, а не теряется")
     check(_S.stats["stream_aborted"] == 1,
           "SSE: незавершённый поток посчитан как обрыв (stream_aborted)")
+    check(_S.stats["stream_tokens"] > 0 and _S.stats["stream_ms"],
+          "SSE: сервер считает отданные сообщения и длительность потока")
 
     # пинги должны быть на маршрутах, которые ходят через туннель
     for route in ("/plan/stream", "/chat/stream", "/dev/stream"):
@@ -2567,6 +2578,132 @@ def test_journals_redacted_on_disk() -> None:
           "журналы: секрет вычищен и из in-memory копий, что отдаёт /api/state")
 
 
+def test_panel_http_layer() -> None:
+    """Аудит A-1: HTTP-слой панели раньше не исполнялся ни одним тестом.
+
+    Поднимаем настоящий Handler на эфемерном порту и бьём его так, как бьёт
+    чужой браузер: `Origin: null`, форма без JSON, удаление без критериев.
+    Проверяем поведение, а не наличие строк в исходнике.
+    """
+    import urllib.error
+    import urllib.request
+
+    mod = _load_cli_module()
+    port = _free_port()
+    c = make_client(reports_path=str(TMP / "http_rep.jsonl"),
+                    interactions_path=str(TMP / "http_int.jsonl"),
+                    chat_path=str(TMP / "http_chat.jsonl"),
+                    log_path=str(TMP / "http_log.jsonl"))
+    threading.Thread(target=mod.cmd_panel,
+                     args=(c, argparse.Namespace(port=port, open=False)),
+                     daemon=True).start()
+
+    def _up() -> bool:
+        for _ in range(100):
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/state", timeout=2) as r:
+                    return r.status == 200
+            except Exception:
+                time.sleep(0.1)
+        return False
+
+    check(_up(), "панель: сервер поднялся на эфемерном порту")
+    if not _up():
+        return
+
+    def _post(path: str, body: bytes, headers: dict) -> tuple:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                     data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    js = {"Content-Type": "application/json"}
+    st, _ = _post("/api/delete", b'{"kind":"report"}', dict(js, Origin="null"))
+    check(st == 403, f"A-1: Origin: null отклонён (статус {st})")
+    st, _ = _post("/api/delete", b'{"kind":"report"}',
+                  {"Content-Type": "text/plain"})
+    check(st == 400, f"A-1: тело без JSON → 400 (статус {st})")
+    st, _ = _post("/api/delete", b'{"kind":"report"}', dict(js))
+    check(st == 400, f"A-1: удаление без критериев → 400 (статус {st})")
+    st, body = _post("/api/delete", b'{"kind":"report","wipe":true}', dict(js))
+    check(st == 200 and b"removed" in body,
+          f"A-1: явный wipe чистит раздел (статус {st})")
+
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
+        head = r.headers
+    check(head.get("X-Frame-Options") == "DENY"
+          and head.get("X-Content-Type-Options") == "nosniff"
+          and "frame-ancestors 'none'" in (head.get("Content-Security-Policy") or ""),
+          "A-1: панель отдаёт заголовки против встраивания в чужую страницу")
+
+
+def test_breaker_and_rotation() -> None:
+    """Аудит B (04-tests-mock): цикл предохранителя и ротация журнала.
+
+    Раньше состояние предохранителя выставляли руками и проверяли только
+    «пауза открыта»; что происходит после её истечения — не проверял
+    никто, и счётчик не обнулялся (одна ошибка снова открывала паузу).
+    """
+    from thinking.client import _looks_like_missing_route
+
+    c = make_client(retry={"max_attempts": 1, "backoff_base": 0.001},
+                    breaker_errors=2, breaker_pause=600)
+    c.base = "http://127.0.0.1:1"                 # закрытый порт
+    check(raises(lambda: c._open("GET", "/health"), ThinkingError),
+          "предохранитель: ошибка связи превращается в ThinkingError")
+    check(c._cb_errors == 1 and c._cb_open_until == 0.0,
+          f"предохранитель: первая ошибка не открывает паузу ({c._cb_errors})")
+    check(raises(lambda: c._open("GET", "/health"), ThinkingError),
+          "предохранитель: вторая ошибка проходит")
+    check(c._cb_open_until > time.time(),
+          "предохранитель: на пороге открывается пауза")
+    blocked = "предохранитель" in str(_capture(lambda: c._open("GET", "/health")))
+    check(blocked, "предохранитель: во время паузы запрос не идёт в сеть")
+    # пауза истекла: счётчик обязан обнулиться, иначе «1 ошибка раз в паузу»
+    c._cb_open_until = time.time() - 1
+    check(raises(lambda: c._open("GET", "/health"), ThinkingError),
+          "предохранитель: после паузы запрос снова уходит в сеть")
+    check(c._cb_errors == 1 and c._cb_open_until == 0.0,
+          f"предохранитель: счётчик обнулён на истечении паузы ({c._cb_errors})")
+
+    c2 = make_client(retry={"max_attempts": 1, "backoff_base": 0.001},
+                     breaker_errors=1, breaker_pause=600)
+    c2.base = "http://127.0.0.1:1"
+    check(raises(lambda: c2._open("GET", "/events/stream", stream=True),
+                 ThinkingError),
+          "предохранитель: обрыв потока считается")
+    check(c2._cb_stream_until > 0 and c2._cb_open_until == 0.0,
+          "предохранитель: пауза потока не блокирует REST (AUD-05)")
+
+    # _looks_like_missing_route решает, уйти ли на запасной маршрут
+    check(_looks_like_missing_route(ThinkingError("HTTP 404: нет маршрута"))
+          and _looks_like_missing_route(ThinkingError("Not Found")),
+          "маршрут: 404/Not Found распознаны как отсутствующий маршрут")
+    check(not _looks_like_missing_route(ThinkingError("HTTP 503: занято")),
+          "маршрут: 503 — не отсутствующий маршрут, повтор нужен")
+
+    # ротация журнала по log_max_bytes
+    c3 = make_client(log_path=str(TMP / "rot.jsonl"), log_max_bytes=400)
+    for i in range(60):
+        c3._append_log({"seq": i, "type": "thought", "text": "строка " + "x" * 40})
+    check((TMP / "rot.jsonl.1").exists()
+          and 0 < count_lines(TMP / "rot.jsonl") < 60,
+          "журнал: thoughts.jsonl ротируется по log_max_bytes")
+
+
+def _capture(fn) -> str:
+    """Текст исключения вместо самого исключения (для проверки гейта)."""
+    try:
+        fn()
+    except Exception as exc:
+        return str(exc)
+    return ""
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2595,6 +2732,8 @@ def main() -> int:
     test_server_resource_fixes()
     test_plan_redacts_all_text_fields()
     test_journals_redacted_on_disk()
+    test_panel_http_layer()
+    test_breaker_and_rotation()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()
