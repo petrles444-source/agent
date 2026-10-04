@@ -1909,8 +1909,8 @@ def test_quickwins() -> None:
     # --- тайминги под медленную модель и «окна» туннеля ---
     check('"chat_json_timeout", 300' in client_src,
           "чат: не-потоковый ответ ждёт до 300 с, а не 45")
-    check('"stream_stall", 75' in client_src,
-          "поток: stall 75 с — учитывает обработку промта на CPU")
+    check('"stream_stall", 45' in client_src,
+          "поток: stall 45 с — три пропущенных пинга (замер 04.10: пинги 15.0 с)")
     check('"plan_timeout", 360' in client_src,
           "план: не-потоковый /plan ждёт до 360 с под медленную модель")
     check("напиши ещё раз, обычно помогает повтор" in panel,
@@ -1929,9 +1929,12 @@ def test_plan_stream_resilience() -> None:
     mod = _load_cli_module()
     client_src = (ROOT / "thinking" / "client.py").read_text(encoding="utf-8")
     ps_src = client_src.split("def plan_stream(")[1].split("\n    def ")[0]
-    check('"stream_stall", 75' in ps_src and '"plan_timeout", 360' not in ps_src,
+    sr_src = client_src.split("def _stream_read(")[1].split("\n    def ")[0]
+    check('"stream_stall"' in sr_src and '"plan_timeout"' not in sr_src,
           "план-поток: таймаут чтения — stream_stall, а не 360 с (живой прогон)")
-    check("поток плана оборвался" in client_src and "http.client.HTTPException" in ps_src,
+    check('_stream_read(' in ps_src and 'terminal="final"' in ps_src,
+          "план-поток: читается через _stream_read — обрыв повторяется, как у чата")
+    check("оборвался после" in client_src and "http.client.IncompleteRead" in sr_src,
           "план-поток: обрыв превращается в ThinkingError, а не в трейсбек")
     check(": open" in (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(
         encoding="utf-8"),
@@ -1946,6 +1949,55 @@ def test_plan_stream_resilience() -> None:
     plan, is_fb = mod._plan_streamed(c, "задача", {}, [], 3)
     check(bool(plan.get("steps")) and is_fb is True,
           "план-поток: после обрыва команда отдаёт план, а не исключение")
+
+    # Обрыв первой попытки переживается повтором: туннель 04.10 рвал
+    # соединение молча (без EOF), а туннель при этом оставался живым.
+    retry_plan = json.dumps({"plan_id": "p_retry", "goal": "цель",
+                             "steps": [{"id": 1, "action": "build",
+                                        "desc": "собрать"}]})
+    tries = {"n": 0}
+
+    class HDrop(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            tries["n"] += 1
+            if tries["n"] == 1:
+                # начало потока есть, дальше соединение умирает — как 04.10
+                part = 'data: {"type": "rationale", "text": "обрыв"}\n\n'.encode(
+                    "utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", "1000")   # длина враёт
+                self.end_headers()
+                self.wfile.write(part)
+                self.wfile.flush()
+                self.connection.close()
+                return
+            body = (f'data: {{"type": "rationale", "text": "почему"}}\n\n'
+                    f'data: {{"type": "final", "text": '
+                    f'{json.dumps(retry_plan)}}}\n\n').encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HDrop)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c2 = make_client(retry={"max_attempts": 1, "backoff_base": 0.001})
+        c2.base = f"http://127.0.0.1:{srv.server_address[1]}"
+        got = c2.plan_stream("задача после обрыва")
+        check(got.get("plan_id") == "p_retry",
+              f"план-поток: обрыв первой попытки переживается повтором "
+              f"(получено {got.get('plan_id')})")
+        check(tries["n"] == 2, f"план-поток: ровно две попытки, было {tries['n']}")
+    finally:
+        srv.shutdown()
 
     # --stream --json обязан печатать JSON, а не человекочитаемый план (C-9)
     import contextlib
@@ -1965,6 +2017,124 @@ def test_plan_stream_resilience() -> None:
             parsed = None
     check(rc in (0, 2) and isinstance(parsed, dict) and parsed.get("steps"),
           f"план-поток: --stream --json печатает JSON (C-9, rc={rc})")
+
+
+def test_audit_round2_fixes() -> None:
+    """Вторая волна разбора аудита 04.10: 524, /reflect/stream, N-3, N-4, C-3.
+
+    Плюс синтаксис ячеек ноутбука: ячейка D уходила в git с лишней кавычкой,
+    `build_colab.py` это не видит и собирает ноутбук с битой строкой —
+    `ast.parse` такое ловит, а маркеры вида «тут Popen» нет.
+    """
+    import ast
+
+    # --- ячейки ноутбука парсятся ---------------------------------------
+    bad = []
+    for cell in sorted((ROOT / "thinking" / "colab").glob("cell_*.py")):
+        src = "\n".join(line for line in cell.read_text(encoding="utf-8").splitlines()
+                        if not line.startswith("%%"))   # %%writefile — не Python
+        try:
+            ast.parse(src)
+        except SyntaxError as exc:
+            bad.append(f"{cell.name}:{exc.lineno} {exc.msg}")
+    check(not bad, f"ячейки ноутбука синтаксически валидны ({'; '.join(bad) or 'ок'})")
+
+    # --- 524 не ретраится: живой прогон сжигал 3 × 120 с впустую --------
+    hits = {"n": 0}
+
+    class H524(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            hits["n"] += 1
+            body = (b'{"title":"Error 524: A timeout occurred","status":524,'
+                    b'"detail":"The origin web server did not return a complete'
+                    b' response within the 120-second Proxy Read Timeout."}')
+            self.send_response(524)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H524)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c = make_client(retry={"max_attempts": 3, "backoff_base": 0.001})
+        c.base = f"http://127.0.0.1:{srv.server_address[1]}"
+        t0, err = time.time(), ""
+        try:
+            c.plan("задача")
+        except Exception as exc:                            # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+        check(hits["n"] == 1, f"524: ровно один запрос к серверу, было {hits['n']}")
+        check("524" in err, f"524: ошибка дошла до вызывающего ({err[:70]})")
+        check(time.time() - t0 < 10, "524: быстрый отказ, а не три ретрая по 120 с")
+    finally:
+        srv.shutdown()
+
+    # --- B-5: рефлексия идёт по /reflect/stream --------------------------
+    mock = _load_mock_module()
+    msrv = mock.create_server(port=0)
+    threading.Thread(target=msrv.serve_forever, daemon=True).start()
+    try:
+        cr = make_client(retry={"max_attempts": 1, "backoff_base": 0.001})
+        cr.base = f"http://127.0.0.1:{msrv.server_address[1]}"
+        # «сломаем» не-потоковый маршрут: если рефлексия всё равно проходит,
+        # значит клиент пошёл по потоку, а не по старому /reflect
+        plain = cr._json                                            # noqa: SLF001
+
+        def no_plain(method, path, body=None, timeout=None):
+            if path == "/reflect":
+                raise ThinkingError("не-потоковый /reflect отключён в тесте")
+            return plain(method, path, body, timeout=timeout)
+
+        cr._json = no_plain                                         # noqa: SLF001
+        rf = ReflectResponse.from_dict(cr.reflect("plan-x", 1, "сделано"))
+        check(rf.status == "ok", "B-5: рефлексия проходит по /reflect/stream")
+        server = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(
+            encoding="utf-8")
+        check('"/reflect/stream"' in server, "B-5: сервер Colab знает /reflect/stream")
+        check("with_heartbeat" in server.split("@app.post(\"/reflect/stream\")")[1][:3000],
+              "B-5: поток рефлексии завёрнут в heartbeat — иначе 524 на 120-й секунде")
+        stub = (ROOT / "tools" / "mock_llm.py").read_text(encoding="utf-8")
+        check('"/reflect/stream"' in stub and "def _reflect_stream(" in stub,
+              "B-5: заглушка умеет /reflect/stream — фолбэк гоняется офлайн")
+    finally:
+        msrv.shutdown()
+
+    # --- N-3: полный провал /ask/multi — не успех ------------------------
+    mod = _load_cli_module()
+    c3 = make_client(interactions_path=str(TMP / "n3_inter.jsonl"))
+    c3.interactions.clear()
+    c3._account_multi("вопрос без ответа",                        # noqa: SLF001
+                      {"answers": [{"ok": False, "answer": ""}],
+                       "note": "ни одна модель не ответила"}, time.time())
+    got = c3.status()["interactions"]
+    check(bool(got) and got[-1].get("ok") is False,
+          f"N-3: «ни одна не ответила» записана как ok=False (получено "
+          f"{got[-1].get('ok') if got else 'нет записи'})")
+
+    # --- N-4: IPv6-петля не считается чужим хостом -----------------------
+    check(mod.host_allowed("::1", "", 8765), "N-4: Host ::1 без скобок проходит")
+    check(mod.host_allowed("[::1]", "", 8765), "N-4: Host [::1] без порта проходит")
+    check(mod.host_allowed("[::1]:8765", "", 8765), "N-4: Host [::1]:8765 проходит")
+    check(not mod.host_allowed("fe80::1", "", 8765),
+          "N-4: чужой IPv6 всё равно не проходит")
+
+    # --- C-3: дедуп кэш-журнала переживает рестарт панели ----------------
+    chat_path = TMP / "c3_chat.jsonl"
+    chat_path.unlink(missing_ok=True)
+    c_old = make_client(chat_path=str(chat_path))
+    c_old._remember_chat("вопрос из прошлой жизни",               # noqa: SLF001
+                         ChatReply.from_dict({"reply": "ответ из файла"}))
+    c_new = make_client(chat_path=str(chat_path))     # «рестарт»: память пуста
+    check(mod._cache_seen(c_new, "вопрос из прошлой жизни", "ответ из файла"),
+          "C-3: дедуп видит обмен из файла после рестарта панели")
+    check(not mod._cache_seen(c_new, "другой вопрос", "ответ из файла"),
+          "C-3: чужой обмен не считается дублем")
 
 
 def test_panel_host_and_models() -> None:
@@ -2030,6 +2200,7 @@ def main() -> int:
     test_breaker_channels()
     test_plan_stream_accounting()
     test_plan_stream_resilience()
+    test_audit_round2_fixes()
     test_panel_host_and_models()
     test_benefits_no_double_count()
     test_token_honesty()

@@ -392,7 +392,7 @@ try:
     if CF_TOKEN:
         with open("/content/tunnel.log", "w", encoding="utf-8") as _fh:
             subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate", "run",
-                              "--token", CF_TOKEN"],
+                              "--token", CF_TOKEN],
                              stdout=_fh, stderr=subprocess.STDOUT,
                              start_new_session=True)
         time.sleep(12)

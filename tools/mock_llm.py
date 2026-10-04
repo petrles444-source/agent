@@ -461,7 +461,8 @@ def make_handler(state: MockState) -> type:
         def _content_route(self) -> Optional[str]:
             """Маршруты, которые генерируют текст (на них действуют режимы)."""
             p = self._route
-            return p if p in ("/plan", "/plan/stream", "/reflect", "/chat",
+            return p if p in ("/plan", "/plan/stream", "/reflect",
+                              "/reflect/stream", "/chat",
                               "/chat/stream", "/dev", "/dev/stream",
                               "/ask/multi") else None
 
@@ -592,6 +593,8 @@ def make_handler(state: MockState) -> type:
                     self._plan_stream(body)
                 elif route == "/reflect":
                     self._reflect(body)
+                elif route == "/reflect/stream":
+                    self._reflect_stream(body)
                 elif route == "/chat":
                     self._chat(body)
                 elif route == "/chat/stream":
@@ -684,6 +687,26 @@ def make_handler(state: MockState) -> type:
             state.emit(etype, f"[{out['status']}] {out['advice']}",
                        plan_id=str(body.get("plan_id") or ""))
             self._send(200, out)
+
+        def _reflect_stream(self, body: dict) -> None:
+            """Рефлексия по потоку: как /reflect, но итог уходит в done.
+
+            Нужен, чтобы офлайн-тесты гоняли клиентский фолбэк B-5 так же,
+            как настоящий сервер на Colab: токены — по мере генерации,
+            итог — событие done с полем response.
+            """
+            state.emit("thought", f"Рефлексия (поток) шага {body.get('step_id', 0)}",
+                       plan_id=str(body.get("plan_id") or ""))
+            out = build_reflect(body, state.max_tokens)
+            self._sse_open()
+            if not self._wait_first():
+                return
+            self._tokens(f"[{out['status']}] {out['advice']}")
+            self._sse({"type": "done", "response": out})
+            state.count("reflects")
+            etype = "final" if out["status"] == "ok" else "contradiction"
+            state.emit(etype, f"[{out['status']}] {out['advice']}",
+                       plan_id=str(body.get("plan_id") or ""))
 
         def _chat(self, body: dict) -> None:
             state.emit("thought", f"Чат: {str(body.get('message') or '')[:120]}")

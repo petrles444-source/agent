@@ -112,14 +112,18 @@ def _append_jsonl(path: Path, obj: dict) -> None:
 
 
 def _is_read_timeout(exc: BaseException) -> bool:
-    """Чистый обрыв по таймауту чтения, а не падение сервера."""
+    """Транспорт мёртв: обрыв/таймаут чтения, а не падение самого сервера."""
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return True
     if isinstance(exc, urllib.error.URLError) and isinstance(
             exc.reason, (socket.timeout, TimeoutError)):
         return True
     text = str(exc).lower()
-    return "timed out" in text or "timeout" in text
+    # «оборвался после N попыток» — исход _stream_read: ни одна из повторных
+    # попыток не донесла ответа, значит мёртв канал, а не маршрут (замер
+    # 04.10: во время «тишины» в потоке /health отвечал за 0.2 с)
+    return ("timed out" in text or "timeout" in text
+            or "оборвался после" in text)
 
 
 def new_rid() -> str:
@@ -458,67 +462,59 @@ class ThinkingClient:
                     constraints: Optional[list[str]] = None, max_steps: int = 12,
                     on_event: Optional[Callable[[dict], None]] = None,
                     author: str = "agent") -> dict:
-        """POST /plan/stream: отдаёт токены по мере генерации, возвращает план."""
+        """POST /plan/stream: отдаёт токены по мере генерации, возвращает план.
+
+        Читается через `_stream_read`, поэтому обрыв туннеля повторяется —
+        как у чата и рефлексии. Замер 04.10: SSE-соединение умирало молча
+        (без EOF) через 3-4 с после первого токена, при этом сам туннель
+        отвечал на /health за 0.2 с; без повтора план до ПК не доезжал и
+        заканчивался шаблон-заглушкой.
+
+        Первый байт приходит сразу (`: open`), пинги каждые 15 с держат
+        соединение живым, пока модель думает (первый токен на CPU — от 16
+        до 72 с по замеру), поэтому таймаут чтения — stream_stall, а не
+        plan_timeout.
+        """
         self._check_secrets(task, json.dumps(context or {}, ensure_ascii=False))
         t0 = time.time()
         body = {"task": task, "context": context or {},
                 "constraints": constraints or [],
                 "max_steps": max(1, min(30, int(max_steps)))}
+
+        def _forward(piece: str) -> None:
+            # токены тоже уходят наружу одним обработчиком: CLI печатает их
+            if on_event:
+                on_event({"type": "token", "text": piece})
+
+        _pieces, done = self._stream_read(
+            "/plan/stream", body, label="план", terminal="final",
+            on_token=_forward if on_event else None,
+            on_event=on_event, remember=True)
         plan: dict = {}
-        # Первый байт приходит сразу: сервер кладёт `: open` и шлёт пинги
-        # каждые 15 с, пока модель думает. Поэтому читаем с таймаутом
-        # stream_stall, а не plan_timeout: если ни байта, ни пинга не было
-        # stream_stall секунд — туннель умер молча. Раньше здесь стояло
-        # 360 с, и живой прогон 04.10 провисел на обрыве шесть минут,
-        # а сверху упал сырой TimeoutError с трейсбеком (аудит B-5/находка
-        # живого прогона).
-        stall = max(float(self.cfg.get("stream_stall", 75)), 30.0)
-        try:
-            with self._open("POST", "/plan/stream", body, stream=True,
-                            timeout=stall) as resp:
-                buf: list[str] = []
-                for raw in resp:
-                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                    if line.startswith("data:"):
-                        buf.append(line[5:].strip())
-                    elif line.startswith(":"):
-                        continue
-                    elif line == "" and buf:
-                        chunk = "".join(buf)
-                        buf = []
-                        try:
-                            ev = json.loads(chunk)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(ev, dict):
-                            continue
-                        etype = ev.get("type")
-                        if etype == "error":
-                            raise ThinkingError(f"сервер: {ev.get('text')}")
-                        if etype == "final" and str(ev.get("text", "")).strip().startswith("{"):
-                            try:
-                                plan = json.loads(ev["text"])
-                            except json.JSONDecodeError:
-                                plan = {}
-                            continue
-                        self._remember_ev(ev)
-                        if on_event:
-                            try:
-                                on_event(ev)
-                            except Exception as exc:
-                                log.debug("обработчик потока упал: %s", exc)
-        except ThinkingError:
-            raise
-        except (TimeoutError, socket.timeout, OSError,
-                http.client.HTTPException) as exc:
-            # обрыв на середине — честная ошибка, а не трейсбек из глубин
-            # http.client: caller (plan_with_fallback) решит, что делать дальше
-            log.warning("поток плана оборвался: %s", exc)
-            raise ThinkingError(f"поток плана оборвался: {exc}") from exc
-        if plan:
-            self._account_plan(plan, task, t0, author=author)
-            return plan
-        raise ThinkingError("поток завершился без итогового плана")
+        text = str(done.get("text") or "")
+        if text.strip().startswith("{"):
+            try:
+                plan = json.loads(text)
+            except json.JSONDecodeError:
+                plan = {}
+        if not isinstance(plan, dict) or not plan.get("steps"):
+            raise ThinkingError("поток завершился без итогового плана")
+        self._account_plan(plan, task, t0, author=author)
+        return plan
+
+    def _reflect_stream(self, body: dict) -> dict:
+        """POST /reflect/stream: токены идут по мере генерации, итог — в done.
+
+        Повторы при обрыве даёт сам `_stream_read`: туннель местами замирает
+        посреди ответа, а повтор почти всегда проходит — ровно так чат и
+        доживает до конца ответа (аудит B-5).
+        """
+        _pieces, done = self._stream_read("/reflect/stream", body,
+                                          label="рефлексия")
+        resp = done.get("response")
+        if not isinstance(resp, dict):
+            raise ThinkingError("поток рефлексии завершился без ответа")
+        return resp
 
     def reflect(self, plan_id: str, step_id: int, result: str,
                 observation: Optional[str] = None, error: Optional[str] = None,
@@ -527,20 +523,43 @@ class ThinkingClient:
         if timeout is None:
             timeout = max(self.timeout, float(self.cfg.get("reflect_timeout", 180)))
         t0 = time.time()
-        try:
-            out = self._json("POST", "/reflect", {
-                "plan_id": plan_id,
+        body = {"plan_id": plan_id,
                 "step_id": int(step_id),
                 "result": str(result),
                 "observation": observation,
-                "error": error,
-            }, timeout=timeout)
+                "error": error}
+        out: Optional[dict] = None
+        first: Optional[BaseException] = None
+        # Поток — основной путь: на CPU рефлексия живёт 100-200 с, а
+        # не-потоковый /reflect прокси обрезает на 120-й секунде, и раньше
+        # результат просто не доезжал до ПК (аудит B-5).
+        try:
+            out = self._reflect_stream(body)
+        except SchemaError:
+            raise
         except Exception as exc:
+            first = exc
+            log.warning("поток рефлексии не прошёл: %s", exc)
+            self.last_error = str(exc)[:200]
+        # К не-потоковому маршруту идём только когда в этом есть смысл:
+        # обрыв транспорта даст тот же лимит (524 = 120 с впустую), а ответ
+        # самого сервера будет тем же. Идём, если поток просто не знает
+        # маршрута (старый ноутбук) или упал по чужой причине.
+        if out is None and first is not None \
+                and not _is_read_timeout(first) \
+                and not str(first).startswith("сервер:"):
+            try:
+                out = self._json("POST", "/reflect", body, timeout=timeout)
+            except Exception as exc:
+                first = exc
+        if out is None:
+            exc = first if isinstance(first, Exception) else \
+                ThinkingError("рефлексия не удалась")
             self.stats["errors"] += 1
             self._record("reflect", f"шаг {step_id}: {result[:300]}", t0,
                          ok=False, summary=f"не ответил: {exc}"[:400],
                          plan_id=plan_id, author=author)
-            raise
+            raise exc
         if isinstance(out, dict):
             self._remember_json("reflect", out)
             self._report_reflect(out, plan_id, step_id, result)
@@ -1036,8 +1055,12 @@ class ThinkingClient:
                    if isinstance(a, dict)]
         ok_ones = [a for a in answers if a.get("ok") and str(a.get("answer") or "").strip()]
         if not ok_ones:
-            self._record_chat(question, "", t0, fallback=False,
-                              error=str(out.get("note") or "ни одна модель не ответила"),
+            # ни одна модель не ответила — это провал, а не успех: раньше
+            # ok=bool(reply) or bool(error) помечал запись как удачную
+            # (аудит N-3), и «История» показывала обмен без ответа как ок
+            self._record_chat(question, "", t0, fallback=False, ok=False,
+                              error=str(out.get("note")
+                                        or "ни одна модель не ответила"),
                               author=author)
             return
         main = str(ok_ones[0].get("answer") or "")
@@ -1187,7 +1210,10 @@ class ThinkingClient:
     def _stream_read(self, path: str, body: dict,
                      on_token: Optional[Callable[[str], None]] = None,
                      on_retry: Optional[Callable[[int, int], None]] = None,
-                     label: str = "поток") -> tuple[list[str], dict]:
+                     label: str = "поток",
+                     terminal: str = "done",
+                     on_event: Optional[Callable[[dict], None]] = None,
+                     remember: bool = False) -> tuple[list[str], dict]:
         """Читает поток events и повторяет запрос при обрыве.
 
         Беспроводной путь до туннеля Cloudflare местами замирает посреди
@@ -1195,13 +1221,22 @@ class ThinkingClient:
         а клиенту байты не приходят и EOF не закрывается. Повтор почти
         всегда проходит, поэтому: read-timeout stream_stall секунд на
         чтение, затем до stream_retries повторных попыток (всего —
-        1 + stream_retries), пока не придёт done.
+        1 + stream_retries), пока не придёт terminal-событие.
 
+        Замер 04.10 (живой туннель, три прогона подряд): во время «тишины»
+        в потоке /health отвечал за 0.2 с каждые 5 с — мертло только это
+        конкретное соединение, без единого байта и без EOF. Повтор на
+        новом соединении проходил; пинги сервера шли ровно каждые 15.0 с,
+        поэтому stall 45 с = три пропущенных пинга.
+
+        on_token(piece) получает куски текста, on_event(ev) — все события,
+        кроме token/terminal/error (план так печатает rationale и шаги).
+        remember=True докладывает события в буфер панели.
         on_retry(attempt, total) вызывается перед каждой повторной
         попыткой — интерфейс может сказать человеку «повторяю…».
         Ошибки сервера/схемы (ThinkingError) не повторяются.
         """
-        stall = float(self.cfg.get("stream_stall", 75))
+        stall = float(self.cfg.get("stream_stall", 45))
         budget = max(stall * 2, float(self.cfg.get("chat_timeout", 600)))
         total = 1 + max(0, int(self.cfg.get("stream_retries", 2)))
         t0 = time.time()
@@ -1223,6 +1258,8 @@ class ThinkingClient:
                         if not isinstance(ev, dict):
                             continue
                         etype = ev.get("type")
+                        if remember and etype not in ("error", terminal):
+                            self._remember_ev(ev)
                         if etype == "token":
                             piece = str(ev.get("text") or "")
                             if piece:
@@ -1234,9 +1271,14 @@ class ThinkingClient:
                                         log.debug("on_token упал: %s", exc)
                         elif etype == "error":
                             raise ThinkingError(f"сервер: {ev.get('text')}")
-                        elif etype == "done":
+                        elif etype == terminal:
                             done = ev
                             break   # ответ получен: не ждём EOF (keep-alive)
+                        elif on_event:
+                            try:
+                                on_event(ev)
+                            except Exception as exc:
+                                log.debug("on_event упал: %s", exc)
             except ThinkingError:
                 raise               # ошибки сервера/схемы не повторяем
             except (OSError, http.client.IncompleteRead) as exc:
@@ -1255,6 +1297,8 @@ class ThinkingClient:
                 except Exception as exc:
                     log.debug("on_retry упал: %s", exc)
             last = None
+        # «оборвался после N попыток» = транспорт не донёс ни одной попытки:
+        # вызывающий по этой фразе узнаёт, что не-потоковый маршрут бессмыслен
         raise ThinkingError(f"{label} оборвался после {total} попыток: {last}")
 
     def chat_stream(self, message: str, on_token: Optional[Callable[[str], None]] = None,
@@ -1489,8 +1533,10 @@ class ThinkingClient:
                     # пересечение: одна строка целиком содержится в другой
                     if o and o != new and min(len(o), len(new)) >= 12 and \
                             (o in new or new in o):
-                        if len(new) > len(o):     # оставляем более полный:
-                            # сравнение идёт по нормализованным строкам —        # иначе сырой факт длиннее, а по смыслу короче
+                        if len(new) > len(o):
+                            # оставляем более полный: сравнение идёт по
+                            # нормализованным строкам, а иначе сырой факт
+                            # длиннее, а по смыслу короче
                             facts[i] = fact[:300]
                         merged = True
                         log.info("память: факт объединён с похожим — %s", fact[:80])
@@ -1590,13 +1636,19 @@ class ThinkingClient:
     def _record_chat(self, question: str, reply: str, t0: float,
                      fallback: bool, error: str = "", plan_id: str = "",
                      tokens_in: int = 0, tokens_out: int = 0,
-                     estimate: bool = True, author: str = "agent") -> None:
+                     estimate: bool = True, author: str = "agent",
+                     ok: Optional[bool] = None) -> None:
         who = str(author or "human")[:20]
+        # ok по умолчанию: ответ есть либо есть хоть какая-то причина.
+        # Явный ok=False нужен, когда ответа нет вовсе — например, «ни одна
+        # модель не ответила» в /ask/multi (аудит N-3)
+        if ok is None:
+            ok = bool(reply) or bool(error)
         rec = {"n": len(self.interactions) + 1, "rid": new_rid(), "kind": "chat", "at": utcnow(),
                "request": question[:700],
                "author": who,
                "duration_ms": int((time.time() - t0) * 1000),
-               "ok": bool(reply) or bool(error), "fallback": bool(fallback),
+               "ok": bool(ok), "fallback": bool(fallback),
                "background": False, "source": "local-fallback" if fallback else "colab",
                "plan_id": plan_id or "",
                "summary": (f"чат: {reply[:400]}" if reply else f"ошибка чата: {error}")[:900],

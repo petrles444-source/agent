@@ -681,6 +681,28 @@ def _cache_ttl(client: ThinkingClient) -> float:
         return 1800.0
 
 
+def _tail_lines(path: Any, count: int = 60, kb: int = 512) -> list[str]:
+    """Последние `count` строк файла.
+
+    Читается только хвост (до `kb` КБ): полное чтение всего журнала на
+    каждом промахе кэша было заметно при живом чате (аудит AUD-25).
+    Обрезанная первая строка не распарсится — она и не нужна: окно и так
+    хвостовые строки.
+    """
+    p = Path(path) if path else None
+    if not p or not p.exists():
+        return []
+    try:
+        with open(p, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - kb * 1024))
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return tail.splitlines()[-count:]
+
+
 def _cache_get(client: ThinkingClient, kind: str, message: str) -> dict | None:
     ttl, norm = _cache_ttl(client), _cache_norm(message)
     if not norm or ttl <= 0:
@@ -690,22 +712,9 @@ def _cache_get(client: ThinkingClient, kind: str, message: str) -> dict | None:
         return dict(hit[1], cached=True)
     # перезапуск панели: такой же вопрос мог остаться в журнале диалога
     path = getattr(client, "_chat_path", None)
-    if not path or not Path(path).exists():
+    if not path:
         return None
-    try:
-        # Читаем только хвост файла (до 512 КБ): полное чтение всего
-        # журнала (после ротации — до 8 МБ) на каждом промахе кэша было
-        # заметно при живом чате (аудит AUD-25). Обрезанная первая строка
-        # не распарсится — она и не нужна: окно и так хвостовые 60 строк.
-        with open(path, "rb") as fh:
-            fh.seek(0, 2)
-            size = fh.tell()
-            fh.seek(max(0, size - 512 * 1024))
-            tail = fh.read().decode("utf-8", "replace")
-        lines = tail.splitlines()[-60:]
-    except OSError:
-        return None
-    for line in reversed(lines):
+    for line in reversed(_tail_lines(path, 60)):
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
@@ -740,6 +749,27 @@ def _cache_put(client: ThinkingClient, kind: str, message: str,
         _ANSWER_CACHE.pop(next(iter(_ANSWER_CACHE)))
 
 
+def _cache_seen(client: ThinkingClient, question: str, reply: str) -> bool:
+    """Такой обмен уже лежит в журнале диалога?
+
+    Смотрится и память процесса, и хвост файла: после рестарта панели
+    `chat_log` пуст, и без чтения файла дубль возвращался рядом с
+    оригиналом — в «Истории» он появлялся дважды (аудит C-3).
+    """
+    want_q, want_r = str(question or "")[:2000], str(reply or "")[:4000]
+    for rec in reversed(list(client.chat_log[-10:])):
+        if rec.get("question") == want_q and rec.get("reply") == want_r:
+            return True
+    for line in _tail_lines(getattr(client, "_chat_path", None), 40):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("question") == want_q and rec.get("reply") == want_r:
+            return True
+    return False
+
+
 def _cache_journal(client: ThinkingClient, message: str, reply: dict) -> None:
     """Ответ из кэша тоже пишем в журнал диалога.
 
@@ -751,11 +781,8 @@ def _cache_journal(client: ThinkingClient, message: str, reply: dict) -> None:
         # попадает в историю дважды и второй раз в хвостовой скан кэша
         # (аудит C-3). Перерисовка, ради которой писался дубль, находит
         # оригинал: он и есть первая запись.
-        want_q = str(message or "")[:2000]
-        want_r = str(reply.get("reply") or "")[:4000]
-        for rec in reversed(list(client.chat_log[-10:])):
-            if rec.get("question") == want_q and rec.get("reply") == want_r:
-                return
+        if _cache_seen(client, message, str(reply.get("reply") or "")):
+            return
         client._remember_chat(                              # noqa: SLF001
             message, ChatReply.from_dict(
                 {k: v for k, v in reply.items() if k != "cached"}),
@@ -779,7 +806,17 @@ def host_allowed(host: str, origin: str = "", port: object = "") -> bool:
     на чужих страницах: на no-cors-запрос заголовок Origin всё равно идёт).
     """
     host = str(host or "").strip().lower()
-    if ":" in host:
+    # IPv6 надо разбирать до обычного «хост:порт»: у ::1 двоеточий больше
+    # одного, и rpartition(":") даёт имя "::" — localhost считался бы чужим
+    if host.startswith("["):
+        end = host.find("]")                 # [::1]:8765 или [::1]
+        if end < 0:
+            return False
+        name, rest = host[1:end], host[end + 1:]
+        p = rest[1:] if rest.startswith(":") else rest
+    elif host.count(":") > 1:
+        name, p = host, ""                   # ::1 без скобок и без порта
+    elif ":" in host:
         name, _, p = host.rpartition(":")
     else:
         name, p = host, ""

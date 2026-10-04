@@ -837,38 +837,57 @@ async def plan_stream(req: PlanRequest, x_agent_token: str = Header(default=""),
                                       "X-Accel-Buffering": "no"})
 
 
+def _reflect_plan_json(req: ReflectRequest) -> str:
+    """Текст плана для промта рефлексии (или честная причина его отсутствия)."""
+    stored = S.plans.get(req.plan_id)
+    return json.dumps(stored, ensure_ascii=False, default=str) if stored \
+        else "план не найден (возможно, после рестарта сервера)"
+
+
+def _reflect_user(req: ReflectRequest, plan_json: str) -> str:
+    """Пользовательская часть промта рефлексии — общая для обоих маршрутов."""
+    return (f"ПЛАН: {plan_json[:3000]}\nШАГ: {req.step_id}\n"
+            f"РЕЗУЛЬТАТ: {req.result[:2000]}\n"
+            f"НАБЛЮДЕНИЕ: {req.observation or '-'}\n"
+            f"ОШИБКА: {req.error or '-'}")
+
+
+async def reflect_payload(req: ReflectRequest, raw: str) -> ReflectResponse:
+    """Собирает ответ рефлексии из сырого текста LLM.
+
+    Контракт один и тот же для /reflect и /reflect/stream (аудит B-5):
+    где бы генерация ни шла, дальше один и тот же разбор и те же лимиты.
+    """
+    data = await reflect_data(raw)
+    status = data.get("status")
+    if status not in ("ok", "adjust", "abort"):
+        status = "ok"
+    steps = []
+    for item in (data.get("next_steps") or [])[:8]:
+        try:
+            steps.append(PlanStep(**item))
+        except Exception:
+            continue
+    return ReflectResponse(
+        status=status,
+        advice=redact(str(data.get("advice") or ""))[:800],
+        rationale=redact(str(data.get("rationale") or ""))[:400],
+        next_steps=steps,
+        updated_goal_stack=[str(x) for x in (data.get("updated_goal_stack") or [])][:12],
+    )
+
+
 @app.post("/reflect")
 async def reflect(req: ReflectRequest, x_agent_token: str = Header(default=""), token: str = ""):
     _auth(x_agent_token, token)
-    stored = S.plans.get(req.plan_id)
-    plan_json = json.dumps(stored, ensure_ascii=False, default=str) if stored \
-        else "план не найден (возможно, после рестарта сервера)"
+    plan_json = _reflect_plan_json(req)
     await emit("thought", f"Рефлексия шага {req.step_id}",
                plan_id=req.plan_id, step_id=req.step_id)
     try:
         raw = await chat_json(SYSTEM_REFLECT,
-                              f"ПЛАН: {plan_json[:3000]}\nШАГ: {req.step_id}\n"
-                              f"РЕЗУЛЬТАТ: {req.result[:2000]}\n"
-                              f"НАБЛЮДЕНИЕ: {req.observation or '-'}\n"
-                              f"ОШИБКА: {req.error or '-'}",
+                              _reflect_user(req, plan_json),
                               max_tokens=min(500, _ctx_limit()))
-        data = await reflect_data(raw)
-        status = data.get("status")
-        if status not in ("ok", "adjust", "abort"):
-            status = "ok"
-        steps = []
-        for item in (data.get("next_steps") or [])[:8]:
-            try:
-                steps.append(PlanStep(**item))
-            except Exception:
-                continue
-        out = ReflectResponse(
-            status=status,
-            advice=redact(str(data.get("advice") or ""))[:800],
-            rationale=redact(str(data.get("rationale") or ""))[:400],
-            next_steps=steps,
-            updated_goal_stack=[str(x) for x in (data.get("updated_goal_stack") or [])][:12],
-        )
+        out = await reflect_payload(req, raw)
         S.stats["reflects"] += 1
         await emit("final" if out.status == "ok" else "contradiction",
                    f"[{out.status}] {out.advice}", plan_id=req.plan_id, step_id=req.step_id)
@@ -879,6 +898,50 @@ async def reflect(req: ReflectRequest, x_agent_token: str = Header(default=""), 
         S.stats["errors"] += 1
         await emit("error", f"рефлексия: {str(exc)[:200]}")
         raise HTTPException(500, str(exc)[:300])
+
+
+@app.post("/reflect/stream")
+async def reflect_stream(req: ReflectRequest, x_agent_token: str = Header(default=""), token: str = ""):
+    """Рефлексия по потоку — переживает генерацию дольше 120 с (аудит B-5).
+
+    Не-потоковый /reflect отдаёт тело только после всей генерации, а на CPU
+    рефлексия занимает 100-200 с: прокси обрезает такой ответ на 120-й
+    секунде (524) и результат до ПК не доезжает вовсе. Поток кладёт первый
+    байт сразу, пинги каждые 15 с держат соединение живым, а итог приходит
+    событием done — тело читается столько, сколько нужно.
+    """
+    _auth(x_agent_token, token)
+    plan_json = _reflect_plan_json(req)
+    await emit("thought", f"Рефлексия (поток) шага {req.step_id}",
+               plan_id=req.plan_id, step_id=req.step_id)
+
+    async def gen():
+        buf: list[str] = []
+        try:
+            async with S.sem:
+                async for piece in chat_stream(SYSTEM_REFLECT,
+                                               _reflect_user(req, plan_json),
+                                               min(500, _ctx_limit())):
+                    buf.append(piece)
+                    yield ("data: " + json.dumps({"type": "token", "text": piece},
+                                                 ensure_ascii=False) + "\n\n")
+            out = await reflect_payload(req, "".join(buf))
+            S.stats["reflects"] += 1
+            await emit("final" if out.status == "ok" else "contradiction",
+                       f"[{out.status}] {out.advice}",
+                       plan_id=req.plan_id, step_id=req.step_id)
+            yield ("data: " + json.dumps({"type": "done",
+                                          "response": out.model_dump()},
+                                         ensure_ascii=False, default=str) + "\n\n")
+        except Exception as exc:
+            S.stats["errors"] += 1
+            await emit("error", f"рефлексия: {str(exc)[:200]}")
+            yield ("data: " + json.dumps({"type": "error", "text": str(exc)[:300]},
+                                         ensure_ascii=False) + "\n\n")
+
+    return StreamingResponse(with_heartbeat(gen()), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.post("/cancel/{plan_id}")
