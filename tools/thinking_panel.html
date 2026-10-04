@@ -1889,7 +1889,7 @@ async function state() {
                           {headers: H()});
     const s = await r.json();
     STATE = s;
-    setBadge(!!s.online);
+    setBadge(!!s.online, s.last_error || "");
     // Токен: значение из config наружу не отдаётся (аудит B-8) — панели оно
     // и не нужно: её запросы идут через сервер панели, который токен держит
     // сам. Показываем только факт, что токен сохранён.
@@ -1967,10 +1967,25 @@ function showLimitWarn(h) {
     w.style.display = "none";
   }
 }
-function setBadge(on) {
+function setBadge(on, reason) {
   const b = document.getElementById("badge");
   b.className = on ? "on" : "off";
-  b.textContent = on ? "СУБАГЕНТ НА СВЯЗИ" : "НЕТ СВЯЗИ (реконнект…)";
+  if (on) { b.textContent = "СУБАГЕНТ НА СВЯЗИ"; b.title = ""; return; }
+  /* «реконнект…» тут вводило в заблуждение: при 401 или мёртвом туннеле
+     переподключение ничего не меняет, и человек ждал зря. Говорим причину. */
+  const why = String(reason || "");
+  let text = "НЕТ СВЯЗИ (реконнект…)";
+  if (/401/.test(why)) { text = "ТОКЕН НЕ ПОДОШЁЛ — вставьте новый"; }
+  else if (/403/.test(why)) { text = "ТОКЕН ОТКЛОНЁН"; }
+  else if (/530|1033|502|522|524/.test(why)) {
+    text = "ТУННЕЛЬ НЕДОСТУПЕН (Cloudflare) — нужен новый адрес";
+  } else if (/base_url пуст|адрес не задан/i.test(why)) {
+    text = "АДРЕС НЕ ЗАДАН — выполни set-url";
+  } else if (/предохранитель/.test(why)) {
+    text = "ПАУЗА ПОСЛЕ СБОЕВ — ждём";
+  }
+  b.textContent = text;
+  b.title = why || "";
 }
 
 /* ---------- экспорт ---------- */

@@ -320,6 +320,11 @@ def test_files() -> None:
     check("function isHumanCall" in html
           and 'm.author !== "human"' in html,
           "панель: «Связь агентов» показывает только вызовы агентов")
+    # Живой случай 04.10: 401 от Colab, а бейдж писал «реконнект…» —
+    # переподключение при устаревшем токене не помогает, и человек ждал зря.
+    check("ТОКЕН НЕ ПОДОШЁЛ" in html and "ТУННЕЛЬ НЕДОСТУПЕН" in html
+          and "setBadge(!!s.online, s.last_error" in html,
+          "панель: бейдж называет ПРИЧИНУ отсутствия связи, а не «реконнект»")
     check('"/api/state"' in html and 'EventSource("/events")' in html,
           "панель: подключена к /api/state и /events")
     check("СУБАГЕНТ НА СВЯЗИ" in html, "панель: бейдж связи по-русски")
