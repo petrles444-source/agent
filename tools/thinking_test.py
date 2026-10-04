@@ -777,6 +777,34 @@ def test_chat_author() -> None:
           "панель: её вызовы чата и разработки помечены как человеческие")
 
 
+def test_instructions_present() -> None:
+    """Инструкция «как поднять» есть в ноутбуке, README и быстром старте.
+
+    Её легко потерять при правке документации, а она нужна каждый раз,
+    когда сессия Colab обрывается.
+    """
+    nb = (ROOT / "colab" / "thinking_agent_ver3.ipynb").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    quick = (ROOT / "docs" / "БЫСТРЫЙ_СТАРТ.md").read_text(encoding="utf-8")
+    for name, text in (("ноутбук", nb), ("README", readme),
+                       ("быстрый старт", quick)):
+        check("colab.research.google.com" in text,
+              f"{name}: есть ссылка на Colab")
+        check("Run all" in text, f"{name}: есть шаг Run all")
+        check("PROFILE" in text, f"{name}: есть напоминание про PROFILE в ячейке A")
+        check("АДРЕС ТУННЕЛЯ" in text.upper(),
+              f"{name}: есть шаг с адресом туннеля (ячейка 7/7)")
+        check("своём" in text or "своем" in text,
+              f"{name}: сказано открыть в своём браузере")
+    # причина, почему не в браузере агента, объяснена
+    for name, text in (("ноутбук", nb), ("README", readme),
+                       ("быстрый старт", quick)):
+        check("JavaScript" in text,
+              f"{name}: объяснено, почему вход в Google в браузере агента не работает")
+    check("thinking_agent_ver3.ipynb" in nb,
+          "ноутбук: инструкция называет актуальный файл ver3")
+
+
 def test_dev_layout_vertical() -> None:
     """«Разработка» идёт сверху вниз: чат → код → вывод → журнал → дамп."""
     html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
@@ -1350,6 +1378,7 @@ def main() -> int:
     test_devsave_args()
     test_dev_reports()
     test_chat_author()
+    test_instructions_present()
     test_dev_layout_vertical()
     test_dev_run_stdin()
     test_chat_autoscroll()
