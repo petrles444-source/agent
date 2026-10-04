@@ -177,7 +177,8 @@ class ThinkingClient:
         self._log_max = int(self.cfg.get("log_max_bytes", 5 * 1024 * 1024))
         self._events: list[dict] = []
         self._seq = 0
-        self._lock = threading.Lock()
+        self._seq_local = 0            # свои seq, чтобы не ронять события
+        self._lock = threading.Lock()  # из одной миллисекунды (аудит C-2)
         self._stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
         self.last_ok: Optional[str] = None
@@ -288,8 +289,10 @@ class ThinkingClient:
         приходится заменять вручную — этой кнопкой.
         """
         data = _read_json(LOCAL_PATH)
-        if self.base:
-            data["base_url"] = self.base
+        # base_url здесь не трогаем (аудит C-4): адресом отвечает set_url.
+        # Раньше сохранение токена из панели молча перезаписывало адрес
+        # текущим — панель, запущенная с --url на заглушку, прописывала бы
+        # её в конфиг навсегда.
         data["token"] = token
         _write_json(LOCAL_PATH, data)
         self.token = token
@@ -341,6 +344,16 @@ class ThinkingClient:
                     self.online = False
                     self.last_error = f"HTTP {exc.code}"
                     raise ThinkingError(f"HTTP {exc.code}: {raw}") from exc
+                if exc.code == 524:
+                    # Cloudflare не дождался ответа origin за 120 с.
+                    # Повтор того же не-потокового маршрута упрётся в тот же
+                    # лимит (и начнёт вторую генерацию на сервере, который
+                    # ещё думает над первой), поэтому падаем сразу: вызывающий
+                    # уйдёт на поток, где пинги каждые 15 с держат соединение
+                    # живым и 524 не бывает. Живой прогон 04.10: три ретрая
+                    # по 120 с = 360 с мёртвого ожидания вместо секунды.
+                    self.last_error = "HTTP 524 (origin timeout, нужен поток)"
+                    raise ThinkingError(f"HTTP 524: {raw}") from exc
                 last = ThinkingError(f"HTTP {exc.code}: {raw}")
             except Exception as exc:  # таймаут, DNS, обрыв туннеля
                 last = exc
@@ -452,42 +465,56 @@ class ThinkingClient:
                 "constraints": constraints or [],
                 "max_steps": max(1, min(30, int(max_steps)))}
         plan: dict = {}
-        # Первый байт может ждать и подсказку, и генерацию — даём плановый
-        # таймаут, а не обычный: токены после старта идут плотно.
-        read_to = max(self.timeout, float(self.cfg.get("plan_timeout", 360)))
-        with self._open("POST", "/plan/stream", body, stream=True,
-                        timeout=read_to) as resp:
-            buf: list[str] = []
-            for raw in resp:
-                line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                if line.startswith("data:"):
-                    buf.append(line[5:].strip())
-                elif line.startswith(":"):
-                    continue
-                elif line == "" and buf:
-                    chunk = "".join(buf)
-                    buf = []
-                    try:
-                        ev = json.loads(chunk)
-                    except json.JSONDecodeError:
+        # Первый байт приходит сразу: сервер кладёт `: open` и шлёт пинги
+        # каждые 15 с, пока модель думает. Поэтому читаем с таймаутом
+        # stream_stall, а не plan_timeout: если ни байта, ни пинга не было
+        # stream_stall секунд — туннель умер молча. Раньше здесь стояло
+        # 360 с, и живой прогон 04.10 провисел на обрыве шесть минут,
+        # а сверху упал сырой TimeoutError с трейсбеком (аудит B-5/находка
+        # живого прогона).
+        stall = max(float(self.cfg.get("stream_stall", 75)), 30.0)
+        try:
+            with self._open("POST", "/plan/stream", body, stream=True,
+                            timeout=stall) as resp:
+                buf: list[str] = []
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line.startswith("data:"):
+                        buf.append(line[5:].strip())
+                    elif line.startswith(":"):
                         continue
-                    if not isinstance(ev, dict):
-                        continue
-                    etype = ev.get("type")
-                    if etype == "error":
-                        raise ThinkingError(f"сервер: {ev.get('text')}")
-                    if etype == "final" and str(ev.get("text", "")).strip().startswith("{"):
+                    elif line == "" and buf:
+                        chunk = "".join(buf)
+                        buf = []
                         try:
-                            plan = json.loads(ev["text"])
+                            ev = json.loads(chunk)
                         except json.JSONDecodeError:
-                            plan = {}
-                        continue
-                    self._remember_ev(ev)
-                    if on_event:
-                        try:
-                            on_event(ev)
-                        except Exception as exc:
-                            log.debug("обработчик потока упал: %s", exc)
+                            continue
+                        if not isinstance(ev, dict):
+                            continue
+                        etype = ev.get("type")
+                        if etype == "error":
+                            raise ThinkingError(f"сервер: {ev.get('text')}")
+                        if etype == "final" and str(ev.get("text", "")).strip().startswith("{"):
+                            try:
+                                plan = json.loads(ev["text"])
+                            except json.JSONDecodeError:
+                                plan = {}
+                            continue
+                        self._remember_ev(ev)
+                        if on_event:
+                            try:
+                                on_event(ev)
+                            except Exception as exc:
+                                log.debug("обработчик потока упал: %s", exc)
+        except ThinkingError:
+            raise
+        except (TimeoutError, socket.timeout, OSError,
+                http.client.HTTPException) as exc:
+            # обрыв на середине — честная ошибка, а не трейсбек из глубин
+            # http.client: caller (plan_with_fallback) решит, что делать дальше
+            log.warning("поток плана оборвался: %s", exc)
+            raise ThinkingError(f"поток плана оборвался: {exc}") from exc
         if plan:
             self._account_plan(plan, task, t0, author=author)
             return plan
@@ -623,27 +650,51 @@ class ThinkingClient:
     def metrics(self) -> dict:
         return self._json("GET", "/metrics")
 
-    def plan_with_fallback(self, task: str, **kw: Any) -> tuple[dict, bool]:
-        """(план, is_fallback). Никогда не бросает исключение, кроме SchemaError."""
+    def plan_with_fallback(self, task: str,
+                           stream_error: Optional[BaseException] = None,
+                           **kw: Any) -> tuple[dict, bool]:
+        """(план, is_fallback). Никогда не бросает исключение, кроме SchemaError.
+
+        stream_error — вызывающий уже пробовал /plan/stream и получил эту
+        ошибку: её причина решает, есть ли смысл в не-потоковом маршруте
+        (при обрыве транспорта его ждёт тот же лимит Cloudflare — 120 с).
+        """
         t0 = time.time()
+        stream_kw = {k: v for k, v in kw.items()
+                     if k in ("context", "constraints", "max_steps", "author")}
         if self.cfg.get("enabled", True):
-            try:
-                return self.plan(task, **kw), False
-            except SchemaError:
-                raise  # секреты в задаче — не повод молча уходить в fallback
-            except Exception as exc:
-                log.warning("plan через субагента не прошёл: %s", exc)
-                self.last_error = str(exc)[:200]
-                # Бесплатный туннель Cloudflare режет длинные не-потоковые
-                # ответы (524/таймаут чтения). Повторяем тем же запросом, но
-                # по потоку: токены идут по мере генерации и соединение живо.
+            # Поток — основной путь. Первый байт тела уходит сразу, пинги
+            # каждые 15 с не дают Cloudflare дать 524, а генерация на CPU
+            # спокойно живёт дольше его лимита в 120 с. Не-потоковый /plan
+            # при этом гарантированно ловил 524 и сжигал 120 с впустую
+            # (живой прогон 04.10: сервер додумал план за 5 с, а клиент успел
+            # получить 524 и оборванный поток).
+            if stream_error is None:
                 try:
-                    stream_kw = {k: v for k, v in kw.items()
-                                 if k in ("context", "constraints", "max_steps")}
                     return self.plan_stream(task, **stream_kw), False
-                except Exception as exc2:
-                    log.warning("и поток не помог: %s", exc2)
-                    self.last_error = str(exc2)[:200]
+                except SchemaError:
+                    raise  # секреты в задаче — не повод молча уходить в fallback
+                except Exception as exc:
+                    log.warning("поток плана не прошёл: %s", exc)
+                    self.last_error = str(exc)[:200]
+                    stream_error = exc
+            if _is_read_timeout(stream_error):
+                # Транспорт мёртв или обрезан прокси: обычный маршрут упрётся
+                # в тот же лимит (524 = 120 с ожидания впустую) — сразу
+                # локальный план. А ошибку самого сервера (404 у старого
+                # ноутбука, мусорный JSON) имеет смысл отдать ему.
+                log.warning("транспорт не отвечает (%s) — беру локальный план, "
+                            "не-потоковый /plan не повторяю", stream_error)
+            else:
+                # путь для старых ноутбуков без /plan/stream и для случаев,
+                # когда поток упал по причине, а не по транспорту
+                try:
+                    return self.plan(task, **kw), False
+                except SchemaError:
+                    raise  # секреты в задаче — не повод молча уходить в fallback
+                except Exception as exc:
+                    log.warning("plan через субагента не прошёл: %s", exc)
+                    self.last_error = str(exc)[:200]
         if self.cfg.get("fallback_on_error", True):
             plan = local_plan(task)
             self._report_plan(plan, task)
@@ -735,7 +786,14 @@ class ThinkingClient:
     # ------------------------------------------------------------------ #
     def _remember_json(self, kind: str, data: Any) -> None:
         text = json.dumps(data, ensure_ascii=False, default=str)
-        self._remember_ev({"seq": int(time.time() * 1000), "type": kind,
+        # seq — метка времени в миллисекундах: два события в одну
+        # миллисекунду (план и рефлексия подряд) совпадали, и второе молча
+        # выбрасывалось дедупликацией по seq (аудит C-2). Счётчик поверх
+        # метки коллизию ловит и двигает номер.
+        with self._lock:
+            self._seq_local = max(int(time.time() * 1000), self._seq_local + 1)
+            seq = self._seq_local
+        self._remember_ev({"seq": seq, "type": kind,
                            "text": redact_secrets(text)[:4000], "ts": utcnow()})
 
     def _remember_ev(self, ev: dict) -> None:
@@ -926,7 +984,8 @@ class ThinkingClient:
     #  ЧАТ: человек ↔ субагент, с памятью и учётом токенов
     # ------------------------------------------------------------------ #
     def multi_chat(self, message: str, use_memory: bool = False,
-                   timeout: Optional[float] = None) -> dict:
+                   timeout: Optional[float] = None,
+                   author: str = "agent") -> dict:
         """Один вопрос — всем моделям сразу, ответы рядом.
 
         Дополнительные движки поднимает ячейка D (THINKING_PARALLEL) и
@@ -950,14 +1009,51 @@ class ThinkingClient:
                                  float(self.cfg.get("chat_json_timeout", 300)),
                                  # N моделей делят ядра: ждать дольше
                                  float(self.cfg.get("multi_timeout", 900)))
+        t0 = time.time()
         out = self._json("POST", "/ask/multi", body, timeout=read_to)
         answers = out.get("answers") or []
         if not isinstance(answers, list):
             raise SchemaError(f"/ask/multi: answers — не список: {type(answers).__name__}")
-        return {"answers": answers,
-                "count": int(out.get("count") or len(answers)),
-                "wall_seconds": float(out.get("wall_seconds") or 0.0),
-                "note": str(out.get("note") or "")}
+        result = {"answers": answers,
+                  "count": int(out.get("count") or len(answers)),
+                  "wall_seconds": float(out.get("wall_seconds") or 0.0),
+                  "note": str(out.get("note") or "")}
+        # маршрут жжёт токены N моделей разом, поэтому обязан учитываться так
+        # же, как обычный чат (аудит B-3)
+        self._account_multi(text, result, t0, author=author)
+        return result
+
+    def _account_multi(self, question: str, out: dict, t0: float,
+                       author: str = "agent") -> None:
+        """Учёт параллельного вопроса: история, «Связь агентов», «Токены».
+
+        Раньше /ask/multi не попадал ни в историю, ни в «Выгоду», ни в
+        «Токены», хотя промт уезжает в каждую модель — заметная цифра.
+        В историю кладётся ответ основной модели (первый успешный),
+        токены считаются суммарно по всем ответам: промт × N входов.
+        """
+        answers = [a for a in (out.get("answers") or [])
+                   if isinstance(a, dict)]
+        ok_ones = [a for a in answers if a.get("ok") and str(a.get("answer") or "").strip()]
+        if not ok_ones:
+            self._record_chat(question, "", t0, fallback=False,
+                              error=str(out.get("note") or "ни одна модель не ответила"),
+                              author=author)
+            return
+        main = str(ok_ones[0].get("answer") or "")
+        tin = estimate_tokens(question) * max(1, len(answers))
+        tout = sum(estimate_tokens(str(a.get("answer") or ""))
+                   for a in ok_ones)
+        reply = ChatReply.from_dict(
+            {"reply": main, "at": utcnow(), "fallback": False,
+             "tokens_in": tin, "tokens_out": tout, "tokens_estimate": True,
+             "duration_ms": int((time.time() - t0) * 1000)})
+        self._remember_chat(question, reply, author=author)
+        self.stats["chats"] += 1
+        self._record_chat(question, main, t0, fallback=False,
+                          tokens_in=tin, tokens_out=tout, estimate=True,
+                          author=author)
+        self.token_stats.record(reply)
 
     def parallel_models(self) -> dict:
         """Какие модели держатся параллельно прямо сейчас."""
@@ -1055,7 +1151,7 @@ class ThinkingClient:
         self._record_chat(text, reply.reply, t0, fallback=reply.fallback,
                           plan_id=reply.plan_id, tokens_in=reply.tokens_in,
                           tokens_out=reply.tokens_out,
-                          estimate=reply.tokens_estimate)
+                          estimate=reply.tokens_estimate, author=author)
         self.token_stats.record(reply)
         return reply.to_dict()
 
@@ -1202,8 +1298,10 @@ class ThinkingClient:
             if str(exc).startswith("сервер:"):
                 raise
             log.warning("поток чата не прошёл (%s) — пробую /chat без потока", exc)
+            # author пробрасываем: диалог человека, спасённый фолбэком,
+            # иначе уходит в журнал как агентский (аудит B-2)
             out = self.chat(text, use_memory=use_memory, max_steps=max_steps,
-                            timeout=timeout)
+                            timeout=timeout, author=author)
             out["stream_fallback"] = True     # панель покажет «без потока»
             return out
         out = dict(done)
@@ -1391,7 +1489,8 @@ class ThinkingClient:
                     # пересечение: одна строка целиком содержится в другой
                     if o and o != new and min(len(o), len(new)) >= 12 and \
                             (o in new or new in o):
-                        if len(fact) > len(old):      # оставляем более полный
+                        if len(new) > len(o):     # оставляем более полный:
+                            # сравнение идёт по нормализованным строкам —        # иначе сырой факт длиннее, а по смыслу короче
                             facts[i] = fact[:300]
                         merged = True
                         log.info("память: факт объединён с похожим — %s", fact[:80])
@@ -1752,7 +1851,10 @@ class ThinkingClient:
             "online": bool(self.online),
             "base": self.base,
             "has_token": bool(self.token),
-            "token": self.token,          # панель подставляет его сама (авто)
+            # сам токен наружу не отдаём (аудит B-8): панели он не нужен —
+            # её запросы идут через сервер панели, который токен держит сам.
+            # Для вида хватает факта наличия и последних двух символов.
+            "token_tail": self.token[-2:] if self.token else "",
             "since": since,
             "last_ok": self.last_ok,
             "last_error": self.last_error,

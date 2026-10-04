@@ -507,6 +507,8 @@
       <span id="modelnote" class="meta"></span>
     </div>
     <div id="models"><div class="empty">загружаю список моделей…</div></div>
+    <div class="mem" id="parallelbar"></div>
+    <div id="parallel"><div class="empty">параллельные модели не запрошены</div></div>
   </section>
 
   <!-- ============ ЧАТ С СУБАГЕНТОМ ============ -->
@@ -760,8 +762,14 @@ function toggleTokHelp() {
   document.getElementById("tokhelp").classList.toggle("on");
 }
 async function saveTok() {
-  TOKEN = document.getElementById("tok").value.trim();
-  if (TOKEN) localStorage.setItem("tk", TOKEN);
+  const raw = document.getElementById("tok").value.trim();
+  if (!raw) {
+    alert("Токен пуст — нечего сохранять. Он и так лежит в "
+        + "config/thinking.local.json." );
+    return;
+  }
+  TOKEN = raw;
+  localStorage.setItem("tk", TOKEN);
   try {
     const res = await api("/api/token", {token: TOKEN});
     if (res.error) { alert("не сохранилось: " + res.error); return; }
@@ -1193,11 +1201,41 @@ async function loadModels() {
       box.appendChild(row);
     });
     fillDevModels(list);
+    renderParallel(data);
     if (data && data.switching) note.textContent = "модель переключается…";
   } catch (e) {
     box.textContent = "";
     box.appendChild(el("div", "empty", "не удалось получить модели: " + e));
   }
+}
+/* Параллельные движки (/parallel): кто реально отвечает на /ask/multi.
+   Данные уже есть у сервера — вкладка «Модели» их показывает. */
+function renderParallel(data) {
+  const bar = document.getElementById("parallelbar");
+  const box = document.getElementById("parallel");
+  if (!bar || !box) return;
+  const par = (data && data.parallel) || {};
+  const all = [par.active].concat(par.extra || []).filter(Boolean);
+  box.textContent = "";
+  if (!all.length) {
+    bar.textContent = "";
+    box.appendChild(el("div", "empty",
+      "параллельных моделей нет — отвечает только основная. "
+      + "Включаются переменной THINKING_PARALLEL в ячейке D Colab."));
+    return;
+  }
+  bar.textContent = "Параллельные модели (ask-multi): " + (par.count || all.length);
+  const row = el("div", "row");
+  all.forEach(name => {
+    const chip = el("span", "mono small", name);
+    chip.style.cssText = "border:1px solid #30363d;border-radius:10px;"
+      + "padding:2px 8px;margin:2px 4px 2px 0";
+    row.appendChild(chip);
+  });
+  box.appendChild(row);
+  box.appendChild(el("div", "hint",
+    "один вопрос уходит всем сразу; суммарная скорость не растёт — ядра те же, "
+    + "ценность в сравнении ответов."));
 }
 function devSwitchModel(sel) {
   const opt = sel.options[sel.selectedIndex];
@@ -1826,13 +1864,17 @@ async function state() {
     const s = await r.json();
     STATE = s;
     setBadge(!!s.online);
-    // Токен: авто-режим — поле заполняется из config, если человек не ввёл сам
-    if (!TOKEN && s.token) {
-      TOKEN = s.token;
-      const ti = document.getElementById("tok");
-      ti.value = TOKEN;
-      ti.title = "автоматически из config/thinking.local.json";
+    // Токен: значение из config наружу не отдаётся (аудит B-8) — панели оно
+    // и не нужно: её запросы идут через сервер панели, который токен держит
+    // сам. Показываем только факт, что токен сохранён.
+    const ti = document.getElementById("tok");
+    if (!TOKEN && s.has_token) {
+      ti.placeholder = "токен уже сохранён — вводить не нужно";
+      ti.title = "из config/thinking.local.json, наружу не отдаётся"
+               + (s.token_tail ? " (оканчивается на " + s.token_tail + ")" : "");
       ti.style.color = "#7ee787";
+    } else if (!TOKEN) {
+      ti.placeholder = "вставьте токен из ячейки D";
     }
     const h = s.health || {};
     document.getElementById("meta").textContent =

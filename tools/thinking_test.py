@@ -664,6 +664,18 @@ def test_secrets_smart() -> None:
           "секреты: redact не трогает ссылки на переменные (AUD-13)")
     check(redact_secrets("password=hunter2") == "password=[скрыто]",
           "секреты: redact маскирует литерал")
+    # JSON/словарь: раньше кавычка между ключом и двоеточием ломала регулярку
+    # и секрет уезжал в Colab и оседал в журналах (аудит B-1)
+    check(has_secret('"password": "hunter2"') and has_secret("{'token': 'abc'}"),
+          "секреты: кавычки в JSON не прячут секрет (B-1)")
+    check(has_secret('{"api_key": "sk-123"}'),
+          "секреты: api_key в JSON находится (B-1)")
+    check(not has_secret('{"profile": "dev"}'),
+          "секреты: обычное JSON-поле не считается секретом")
+    check("hunter2" not in redact_secrets('"password": "hunter2"'),
+          "секреты: redact вычищает секрет из JSON (B-1)")
+    check(not has_secret('{"token": "os.getenv(X)"}'),
+          "секреты: ссылка на переменную в JSON — не секрет")
     c = make_client()
     check(raises(lambda: c._dev_body("посмотри конфиг",
                                      active_code='token = "abc123"'), SchemaError),
@@ -1148,9 +1160,23 @@ def test_mock_llm_stub() -> None:
               "заглушка: /dev отвечает предложением по активному файлу")
 
         # --- /ask/multi, /models, /parallel ------------------------------
+        ben_before = c.benefits().get("calls_chat", 0)
+        tok_before = c.tokens().get("tokens_out", 0)
+        chats_before = c.stats["chats"]
+        inter_before = len([i for i in c.interactions if i.get("kind") == "chat"])
         mm = c.multi_chat("сравни ответы")
         check(mm["count"] == 2 and all(a.get("ok") for a in mm["answers"]),
               "заглушка: /ask/multi отдаёт ответы нескольких «моделей»")
+        # учёт параллельного вопроса: он жжёт токены N моделей (аудит B-3)
+        check(c.stats["chats"] == chats_before + 1,
+              "заглушка: ask-multi увеличил счётчик обращений (B-3)")
+        check(len([i for i in c.interactions if i.get("kind") == "chat"])
+              > inter_before,
+              "заглушка: ask-multi записан в ленту «Связь агентов» (B-3)")
+        check(c.benefits().get("calls_chat", 0) > ben_before,
+              "заглушка: ask-multi виден в «Выгоде» (B-3)")
+        check(c.tokens().get("tokens_out", 0) > tok_before,
+              "заглушка: токены ответов всех моделей попали в «Токены» (B-3)")
         check(c.models().get("active_label") == "MOCK",
               "заглушка: /models отвечает в ожидаемой форме")
         check(c.parallel_models().get("count") == 1,
@@ -1186,11 +1212,16 @@ def test_mock_llm_stub() -> None:
         check(not ce.health(), "режим error: /health не проходит — сервер «упал»")
 
         # --- режим drop: поток рвётся, короткий маршрут спасает -----------
-        cd = make_client(**fast)
+        cd = make_client(**fast, chat_path=str(TMP / "drop_chat.jsonl"))
         cd.base = serve(mode="drop")
-        d = cd.chat_stream("обрыв")
+        d = cd.chat_stream("обрыв", author="human")
         check(d.get("stream_fallback") is True,
               "режим drop: обрыв SSE уводит на /chat, ответ получен")
+        drop_rows = [json.loads(l) for l in
+                     open(TMP / "drop_chat.jsonl", encoding="utf-8") if l.strip()]
+        check(bool(drop_rows) and drop_rows[-1].get("author") == "human",
+              "режим drop: фолбэк не теряет автора — реплика человека не "
+              "пишется как агентская (B-2)")
 
         # --- режим badjson: контракт ловит мусор --------------------------
         cb = make_client(**fast)
@@ -1858,6 +1889,8 @@ def test_quickwins() -> None:
     # --- экспорт/импорт памяти ---
     check('act == "export"' in cli_src and "_write_memory(clean)" in cli_src,
           "память: экспорт и импорт через /api/memory (с лимитами)")
+    check("memory_action(client, data)" in cli_src,
+          "память: /api/memory зовёт memory_action — одна логика на двоих (B-6)")
     check("exportMemory" in panel and "importMemory" in panel,
           "память: кнопки экспорта/импорта в панели")
 
@@ -1879,9 +1912,101 @@ def test_quickwins() -> None:
     check('"stream_stall", 75' in client_src,
           "поток: stall 75 с — учитывает обработку промта на CPU")
     check('"plan_timeout", 360' in client_src,
-          "план: read-timeout 360 с под медленную модель")
+          "план: не-потоковый /plan ждёт до 360 с под медленную модель")
     check("напиши ещё раз, обычно помогает повтор" in panel,
           "панель: человеческая подсказка при обрыве в «Разработке»")
+
+
+def test_plan_stream_resilience() -> None:
+    """Обрыв потока плана — честная ошибка и запасной путь, а не трейсбек.
+
+    Живой прогон 04.10: модель (3B на CPU) уложилась в 254 с, туннель донёс
+    начало потока и умер молча. Клиент ждал байтов 360 с (plan_timeout) и
+    упал TimeoutError прямо из http.client в терминал — traceback вместо
+    плана. Теперь таймаут чтения маленький (stream_stall, пинги сервера
+    его продлевают), ошибка — ThinkingError, а у CLI есть запасной путь.
+    """
+    mod = _load_cli_module()
+    client_src = (ROOT / "thinking" / "client.py").read_text(encoding="utf-8")
+    ps_src = client_src.split("def plan_stream(")[1].split("\n    def ")[0]
+    check('"stream_stall", 75' in ps_src and '"plan_timeout", 360' not in ps_src,
+          "план-поток: таймаут чтения — stream_stall, а не 360 с (живой прогон)")
+    check("поток плана оборвался" in client_src and "http.client.HTTPException" in ps_src,
+          "план-поток: обрыв превращается в ThinkingError, а не в трейсбек")
+    check(": open" in (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(
+        encoding="utf-8"),
+          "план-поток: сервер кладёт первый байт сразу (пинги держат туннель)")
+
+    c = make_client()
+
+    def boom(*_a, **_kw):
+        raise ThinkingError("поток плана оборвался: read timed out")
+
+    c.plan_stream = boom
+    plan, is_fb = mod._plan_streamed(c, "задача", {}, [], 3)
+    check(bool(plan.get("steps")) and is_fb is True,
+          "план-поток: после обрыва команда отдаёт план, а не исключение")
+
+    # --stream --json обязан печатать JSON, а не человекочитаемый план (C-9)
+    import contextlib
+    import io as _io
+    args = argparse.Namespace(files="", constraint=[], context=None,
+                              max_steps=3, task="задача", stream=True, json=True)
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.cmd_plan(c, args)
+    out = buf.getvalue()
+    start = out.find("{")
+    parsed = None
+    if start >= 0:
+        try:
+            parsed = json.loads(out[start:])
+        except Exception:
+            parsed = None
+    check(rc in (0, 2) and isinstance(parsed, dict) and parsed.get("steps"),
+          f"план-поток: --stream --json печатает JSON (C-9, rc={rc})")
+
+
+def test_panel_host_and_models() -> None:
+    """AUD-17 (чужой Host/Origin → 403) и вкладка «Модели» с данными /parallel."""
+    mod = _load_cli_module()
+
+    check(mod.host_allowed("127.0.0.1:8765", "", 8765),
+          "AUD-17: свой адрес 127.0.0.1:8765 проходит")
+    check(mod.host_allowed("localhost:8765", "", 8765),
+          "AUD-17: localhost проходит")
+    check(mod.host_allowed("[::1]:8765", "", 8765),
+          "AUD-17: IPv6-петля проходит")
+    check(not mod.host_allowed("evil.example", "", 8765),
+          "AUD-17: чужой Host → 403 (DNS-подмена)")
+    check(not mod.host_allowed("evil.example:8765", "", 8765),
+          "AUD-17: чужой Host с портом → 403")
+    check(not mod.host_allowed("127.0.0.1:9999", "", 8765),
+          "AUD-17: чужой порт → 403")
+    check(mod.host_allowed("127.0.0.1:8765", "http://127.0.0.1:8765", 8765),
+          "AUD-17: свой Origin у POST проходит")
+    check(not mod.host_allowed("127.0.0.1:8765", "https://evil.example", 8765),
+          "AUD-17: чужой Origin у POST → 403")
+    check(not mod.host_allowed("127.0.0.1:8765", "http://evil.example:8765", 8765),
+          "AUD-17: Origin чужого хоста → 403")
+    check(mod.host_allowed("127.0.0.1:8765", "null", 8765),
+          "AUD-17: запрос без Origin (curl, file://) не блокируется")
+
+    cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    get_pos, post_pos = cli_src.find("def do_GET("), cli_src.find("def do_POST(")
+    deny_g = cli_src.find("if self._deny_host():")
+    deny_p = cli_src.find("if self._deny_host(with_origin=True):")
+    check(0 < get_pos < deny_g, "AUD-17: do_GET вызывает _deny_host")
+    check(0 < post_pos < deny_p and deny_p - post_pos < 500,
+          "AUD-17: do_POST вызывает _deny_host с проверкой Origin")
+
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    check("renderParallel" in html and "data.parallel" in html,
+          "вкладка «Модели»: параллельные модели из /parallel нарисованы")
+    check('id="parallel"' in html,
+          "вкладка «Модели»: место под параллельные движки")
+    check('data["parallel"] = client.parallel_models()' in cli_src,
+          "/api/models отдаёт /parallel — данные для вкладки «Модели»")
 
 
 def main() -> int:
@@ -1904,6 +2029,8 @@ def main() -> int:
     test_panel_routes()
     test_breaker_channels()
     test_plan_stream_accounting()
+    test_plan_stream_resilience()
+    test_panel_host_and_models()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

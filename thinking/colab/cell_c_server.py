@@ -690,7 +690,10 @@ def _store(plan: Plan) -> None:
 # ---------------------------------------------------------- эндпоинты -----
 @app.get("/", response_class=HTMLResponse)
 async def index(token: str = ""):
-    return PANEL_HTML.replace("__TOKEN__", token)
+    # токен уезжает в JS через json.dumps: кавычки/переводы строки в нём
+    # экранируются, и ссылка вида /?token=";evil// не исполняется
+    # (аудит B-7)
+    return PANEL_HTML.replace("__TOKEN__", json.dumps(str(token)))
 
 
 @app.get("/health")
@@ -1056,8 +1059,11 @@ async def _switch_to(path: str) -> dict:
         await emit("thought", f"Переключаю модель на {_model_label(path)}…")
         subprocess.run(["pkill", "-f", "llama_cpp.server"], capture_output=True)
         await asyncio.sleep(2)
-        log = open(LLM_LOG, "a", encoding="utf-8")
-        S.llm_proc = subprocess.Popen(_llm_cmd(path), stdout=log, stderr=subprocess.STDOUT)
+        # with закрывает родительскую копию хендлера — у процесса своя,
+        # а хендлеров, утекающих на каждое переключение, больше нет (C-6)
+        with open(LLM_LOG, "a", encoding="utf-8") as log:
+            S.llm_proc = subprocess.Popen(_llm_cmd(path), stdout=log,
+                                          stderr=subprocess.STDOUT)
         if not await _llm_ready():
             raise RuntimeError(f"{_model_label(path)} не поднялась")
         try:
@@ -1290,8 +1296,12 @@ async def dev_stream(req: DevRequest, x_agent_token: str = Header(default=""),
     _auth(x_agent_token, token)
     t0 = time.time()
     await emit("thought", f"Разработка (поток): {req.message[:120]}")
-    max_tokens = int(os.environ.get("THINKING_DEV_MAX_TOKENS",
-                                    str(max(MAX_TOKENS, 1600))))
+    # бюджет, как и у соседних маршрутов (/dev, /chat/stream, /ask/multi),
+    # прижимается к окну модели: иначе промт с кодом активного файла уезжает
+    # вместе с 1600 токенами и llama.cpp молча режет его (аудит B-4)
+    max_tokens = min(int(os.environ.get("THINKING_DEV_MAX_TOKENS",
+                                        str(max(MAX_TOKENS, 1600)))),
+                     _ctx_limit())
 
     async def gen():
         buf: list[str] = []
@@ -1360,7 +1370,7 @@ h2{font-size:11px;margin:0 0 7px;color:#8b949e;letter-spacing:.08em}
 <main><section><h2>МЫСЛИ (LIVE)</h2><div id="a"></div></section>
 <section><h2>ПОСЛЕДНИЕ СОБЫТИЯ</h2><div id="c"></div></section></main>
 <script>
-const TOK="__TOKEN__";
+const TOK=__TOKEN__;
 function H(){return TOK?{"X-Agent-Token":TOK}:{}}
 function add(id,ev){const b=document.getElementById(id);if(b.children.length>300)b.removeChild(b.firstChild);
 const d=document.createElement('div');d.className='ev '+(ev.type||'');

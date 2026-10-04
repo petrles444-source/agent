@@ -148,7 +148,8 @@ llm_cmd = [sys.executable, "-m", "llama_cpp.server",
            "--model", MODEL, "--n_ctx", CTX, "--n_gpu_layers", "-1",
            "--host", "127.0.0.1", "--port", "8001", "--model_alias", "thinking",
            "--n_threads", "4", "--n_batch", "512", "--verbose", "False"]
-open(LOG_LLM, "a", encoding="utf-8").write(f"\n--- {time.strftime('%H:%M:%S')} {llm_cmd}\n")
+with open(LOG_LLM, "a", encoding="utf-8") as _fh:
+    _fh.write(f"\n--- {time.strftime('%H:%M:%S')} {llm_cmd}\n")
 
 # Модель могла не подойти — тогда берём следующую из списка (их до трёх).
 llm_proc = None
@@ -157,8 +158,10 @@ for attempt, cand in enumerate(MODELS, 1):
     size_gb = os.path.getsize(cand) / 1024 ** 3
     cmd = list(llm_cmd)
     cmd[cmd.index("--model") + 1] = cand
-    llm_proc = subprocess.Popen(cmd, stdout=open(LOG_LLM, "a", encoding="utf-8"),
-                                stderr=subprocess.STDOUT)
+    # with закрывает родительскую копию хендлера — процессу достаётся своя,
+    # а лишних открытых файлов в долгоживущей ячейке не копится (аудит C-5)
+    with open(LOG_LLM, "a", encoding="utf-8") as _fh:
+        llm_proc = subprocess.Popen(cmd, stdout=_fh, stderr=subprocess.STDOUT)
     print(f"llm pid {llm_proc.pid} ({attempt}/{len(MODELS)}: "
           f"{os.path.basename(cand)}, {size_gb:.1f} ГБ)")
     # Большая модель читается с диска долго: 17 ГБ успевает не всегда за 90 с,
@@ -285,8 +288,8 @@ for _i, _path in enumerate(_extra, start=2):
     _cmd[_cmd.index("--model") + 1] = _path
     _cmd[_cmd.index("--port") + 1] = str(8000 + _i)
     _cmd[_cmd.index("--model_alias") + 1] = f"thinking{_i}"
-    _proc = subprocess.Popen(_cmd, stdout=open(LOG_LLM, "a", encoding="utf-8"),
-                             stderr=subprocess.STDOUT)
+    with open(LOG_LLM, "a", encoding="utf-8") as _fh:
+        _proc = subprocess.Popen(_cmd, stdout=_fh, stderr=subprocess.STDOUT)
     print(f"  {_name} ({_gb:.1f} ГБ) на порту {8000 + _i}, pid {_proc.pid}")
     if wait_http(f"http://127.0.0.1:{8000 + _i}/v1/models",
                  tries=45 + int(_gb * 12), gap=2) is None:
@@ -297,7 +300,10 @@ for _i, _path in enumerate(_extra, start=2):
             pass
         continue
     PROCS[f"llm{_i}"] = _proc
-    _manifest.append({"path": _path, "label": _name,
+    # key/port — чтобы сторож мог поднять именно этот движок, если он умрёт:
+    # индекс в манифесте не совпадает с номером, когда часть моделей пропущена
+    _manifest.append({"path": _path, "label": _name, "key": f"llm{_i}",
+                      "port": 8000 + _i,
                       "url": f"http://127.0.0.1:{8000 + _i}",
                       "size_gb": round(_gb, 2), "pid": _proc.pid})
 with open(PARALLEL_FILE, "w", encoding="utf-8") as _fh:
@@ -336,10 +342,13 @@ assert os.path.exists("/content/thinking_server.py"), "сначала ячейк
 os.environ["THINKING_UPSTREAM"] = "http://127.0.0.1:8001/v1/chat/completions"
 api_cmd = [sys.executable, "-m", "uvicorn", "thinking_server:app",
            "--host", "127.0.0.1", "--port", "8000", "--app-dir", "/content"]
-open(LOG_API, "a", encoding="utf-8").write(f"\n--- {time.strftime('%H:%M:%S')} {api_cmd}\n")
-api_proc = subprocess.Popen(api_cmd, cwd="/content",
-                            stdout=open(LOG_API, "a", encoding="utf-8"),
-                            stderr=subprocess.STDOUT)
+with open(LOG_API, "a", encoding="utf-8") as _fh:
+    _fh.write(f"\n--- {time.strftime('%H:%M:%S')} {api_cmd}\n")
+# with закрывает родительскую копию хендлера (процессу достаётся своя) —
+# открытые файлы в долгоживущей ячейке не копятся (аудит C-5)
+with open(LOG_API, "a", encoding="utf-8") as _fh:
+    api_proc = subprocess.Popen(api_cmd, cwd="/content",
+                                stdout=_fh, stderr=subprocess.STDOUT)
 print("api pid", api_proc.pid)
 
 hdr = {"X-Agent-Token": TOKEN}
@@ -381,10 +390,11 @@ try:
     #    или вставьте токен ниже: CF_TOKEN = "eyJhIjoi..."
     CF_TOKEN = os.environ.get("CLOUDFLARE_TUNNEL_TOKEN", "")
     if CF_TOKEN:
-        subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate", "run",
-                          "--token", CF_TOKEN],
-                         stdout=open("/content/tunnel.log", "w", encoding="utf-8"),
-                         stderr=subprocess.STDOUT, start_new_session=True)
+        with open("/content/tunnel.log", "w", encoding="utf-8") as _fh:
+            subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate", "run",
+                              "--token", CF_TOKEN"],
+                             stdout=_fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
         time.sleep(12)
         txt = open("/content/tunnel.log", encoding="utf-8", errors="replace").read()
         m = re.search(r"https://[a-z0-9.-]+\.(?:trycloudflare\.com|"
@@ -399,11 +409,12 @@ try:
         # Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted 7168 kiB,
         # got 416 kiB») — SSE-потоки посреди передачи замирали, done не доходил.
         # HTTP/2 идёт по TCP и этих потерь не видит.
-        subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate",
-                          "--protocol", "http2",
-                          "--url", "http://localhost:8000"],
-                         stdout=open("/content/tunnel.log", "a", encoding="utf-8"),
-                         stderr=subprocess.STDOUT, start_new_session=True)
+        with open("/content/tunnel.log", "a", encoding="utf-8") as _fh:
+            subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate",
+                              "--protocol", "http2",
+                              "--url", "http://localhost:8000"],
+                             stdout=_fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
         for _ in range(40):
             txt = open("/content/tunnel.log", encoding="utf-8", errors="replace").read()
             m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", txt)
@@ -449,6 +460,42 @@ def _alive(url_: str) -> bool:
         return False
 
 
+def _restart_extra() -> None:
+    """Поднимает умершие параллельные движки (llm2, llm3…).
+
+    Иначе /ask/multi молча отвечает меньшим числом моделей, чем просили, и
+    ни панель, ни клиент этого не показывают (аудит C-5). Команды
+    собираем заново из манифеста — там путь, порт и ключ процесса.
+    """
+    try:
+        with open(PARALLEL_FILE, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except Exception:
+        return                      # параллельные модели не запускались
+    if not isinstance(manifest, list):
+        return
+    for idx, item in enumerate(manifest, start=2):
+        if not isinstance(item, dict) or not str(item.get("path") or ""):
+            continue
+        key = str(item.get("key") or f"llm{idx}")
+        proc = PROCS.get(key)
+        if proc is not None and proc.poll() is None:
+            continue
+        cmd = list(llm_cmd)
+        cmd[cmd.index("--model") + 1] = str(item["path"])
+        cmd[cmd.index("--port") + 1] = str(item.get("port") or (8000 + idx))
+        cmd[cmd.index("--model_alias") + 1] = f"thinking{idx}"
+        try:
+            with open(LOG_LLM, "a", encoding="utf-8") as fh:
+                PROCS[key] = subprocess.Popen(cmd, stdout=fh,
+                                              stderr=subprocess.STDOUT)
+            print(time.strftime("%H:%M:%S"),
+                  f"{key} ({item.get('label') or item['path']}) поднимаю заново")
+        except Exception as exc:
+            print(time.strftime("%H:%M:%S"),
+                  f"{key}: не поднялся: {type(exc).__name__} {exc}")
+
+
 def _watch() -> None:
     api_fail = llm_fail = 0
     while True:
@@ -490,17 +537,21 @@ def _watch() -> None:
                         pass
                     cmd = list(llm_cmd)
                     cmd[cmd.index("--model") + 1] = active
-                    PROCS["llm"] = subprocess.Popen(
-                        cmd, stdout=open(LOG_LLM, "a", encoding="utf-8"),
-                        stderr=subprocess.STDOUT)
+                    with open(LOG_LLM, "a", encoding="utf-8") as _fh:
+                        PROCS["llm"] = subprocess.Popen(
+                            cmd, stdout=_fh, stderr=subprocess.STDOUT)
                     time.sleep(90)
-                subprocess.Popen(api_cmd, cwd="/content",
-                                 stdout=open(LOG_API, "a", encoding="utf-8"),
-                                 stderr=subprocess.STDOUT)
+                    # доп. движки могли упасть вместе с основным
+                    _restart_extra()
+                with open(LOG_API, "a", encoding="utf-8") as _fh:
+                    subprocess.Popen(api_cmd, cwd="/content",
+                                     stdout=_fh, stderr=subprocess.STDOUT)
                 print(time.strftime("%H:%M:%S"), "API перезапущен")
                 api_fail = llm_fail = 0
         except Exception as exc:
-            print("watchdog:", type(exc).__name__)
+            # текст ошибки обязателен: «watchdog: RuntimeError» ничего не
+            # говорит, а причина обычно в строке (аудит C-5)
+            print("watchdog:", type(exc).__name__, str(exc)[:200])
 
 
 threading.Thread(target=_watch, daemon=True).start()

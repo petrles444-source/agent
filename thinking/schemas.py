@@ -35,10 +35,13 @@ CHARS_PER_TOKEN = 3
 MAX_MEMORY_TURNS = 12
 MAX_MEMORY_FACTS = 40
 
-# ключи, значения которых нельзя писать в журнал и слать в промт
+# ключи, значения которых нельзя писать в журнал и слать в промт.
+# Кавычки вокруг ключа и значения (JSON/словарь) пропускаются: раньше
+# `"password": "hunter2"` проходил мимо редьюсера, и секрет уезжал в Colab
+# и оседал в журналах (аудит B-1).
 SECRET_RE = re.compile(
     r"\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key|token)\b"
-    r"\s*[=:]\s*\S+",
+    r"""["']?\s*[=:]\s*["']?[^\s"',}]+""",
     re.I,
 )
 
@@ -55,7 +58,9 @@ def _secret_rhs(match: "re.Match[str]") -> str:
     """Правая часть «ключ = значение» из совпадения SECRET_RE."""
     full, key = match.group(0), match.group(1) or ""
     tail = full.split(key, 1)[-1] if key in full else full
-    return tail.lstrip("=: \t")
+    # кавычки значения в JSON — не часть секрета, их надо снять, чтобы
+    # «token = os.getenv(…)» в кавычках осталось ссылкой, а не значением
+    return tail.lstrip("=: \t\"'")
 
 
 # Значения-ссылки, а не секреты: ключ присваивается вызову/переменной

@@ -496,6 +496,12 @@ def make_handler(state: MockState) -> type:
                               "created": int(state.t0), "owned_by": "local"}],
                 })
                 return
+            # настоящий сервер палит токен на всех своих маршрутах — заглушка
+            # обязана вести себя так же, иначе неверный токен в конфиге
+            # маскируется «у заглушки и без токена работает» (аудит C-1).
+            # /v1/* открыт — это upstream для llama.cpp, у него своих нет.
+            if not self._authorized():
+                return
             if state.mode == "error":
                 self._fail()
                 return

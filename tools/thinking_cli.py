@@ -205,9 +205,15 @@ def cmd_plan(client: ThinkingClient, args: argparse.Namespace) -> int:
     stream = getattr(args, "stream", False)
 
     if stream:
-        plan = _plan_streamed(client, args.task, context, constraints, args.max_steps)
-        _print_plan(plan)
-        return 0
+        plan, is_fallback = _plan_streamed(client, args.task, context,
+                                           constraints, args.max_steps)
+        if is_fallback:
+            _out(f"[субагент недоступен: {offline_reason(client)}] → шаблон-заглушка")
+        if args.json:
+            _out(json.dumps(plan, ensure_ascii=False, indent=2))
+        else:
+            _print_plan(plan)
+        return 2 if is_fallback else 0
 
     plan, is_fallback = client.plan_with_fallback(
         args.task, context=context, constraints=constraints, max_steps=args.max_steps)
@@ -221,7 +227,7 @@ def cmd_plan(client: ThinkingClient, args: argparse.Namespace) -> int:
 
 
 def _plan_streamed(client: ThinkingClient, task: str, context: dict,
-                   constraints: list[str], max_steps: int) -> dict:
+                   constraints: list[str], max_steps: int) -> tuple[dict, bool]:
     """Стримит токены в терминал и возвращает итоговый план."""
     def on_event(ev: dict) -> None:
         kind = ev.get("type", "")
@@ -234,14 +240,29 @@ def _plan_streamed(client: ThinkingClient, task: str, context: dict,
         _out(f"\n[{label}] {text}")
 
     if not client.cfg.get("enabled", True):
-        plan, _ = client.plan_with_fallback(task, context=context,
-                                            constraints=constraints, max_steps=max_steps)
-        return plan
+        plan, is_fb = client.plan_with_fallback(task, context=context,
+                                                constraints=constraints,
+                                                max_steps=max_steps)
+        return plan, is_fb
     _out("--- поток мыслей субагента ---")
-    plan = client.plan_stream(task, context=context, constraints=constraints,
-                              max_steps=max_steps, on_event=on_event)
+    try:
+        plan = client.plan_stream(task, context=context, constraints=constraints,
+                                  max_steps=max_steps, on_event=on_event)
+    except ThinkingError as exc:
+        # Обрыв туннеля, 524 или ошибка модели на середине потока (живой
+        # прогон 04.10: сервер додумал план за 5 с, а байты до клиента не
+        # доехали). Раньше здесь падал трейсбек прямо из http.client.
+        # Передаём причину: при обрыве транспорта обычный /plan съел бы
+        # те же 120 с, поэтому дальше сразу шаблон-план.
+        _out("")
+        _out(f"! поток не прошёл ({exc}) → пробую обычный запрос")
+        plan, is_fallback = client.plan_with_fallback(
+            task, stream_error=exc, context=context, constraints=constraints,
+            max_steps=max_steps)
+        _out("--- конец потока ---")
+        return plan, is_fallback
     _out("--- конец потока ---")
-    return plan
+    return plan, False
 
 
 def cmd_ask_multi(client: ThinkingClient, args: argparse.Namespace) -> int:
@@ -570,7 +591,14 @@ def _dev_run(client: ThinkingClient, name: str, stdin_text: str = "") -> dict:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", "replace")
         out_ = raw
-        err_ = "интерпретатор остановлен: превышен таймаут 30 с"
+        # stderr тоже читаем (аудит C-8): причина зависания обычно там,
+        # а без неё человек видит только «превышен таймаут» и не знает, что
+        # делать
+        raw_err = exc.stderr or ""
+        if isinstance(raw_err, bytes):
+            raw_err = raw_err.decode("utf-8", "replace")
+        err_ = (str(raw_err).rstrip() + "\n" if str(raw_err).strip() else "")
+        err_ += "интерпретатор остановлен: превышен таймаут 30 с"
     except OSError as exc:
         raise ValueError(f"не удалось запустить интерпретатор: {exc}")
     # input() без переданного stdin даёт EOFError — объясняем по-человечески,
@@ -600,7 +628,11 @@ def _dev_dump(client: ThinkingClient) -> Path:
         if logs.is_dir():
             for p in sorted(logs.rglob("*")):
                 if p.is_file() and p.stat().st_size < 20 * 1024 * 1024:
-                    zf.write(p, arcname=str(p).replace("\\", "/"))
+                    # относительный путь: абсолютный Windows-arcname
+                    # раскидывает файлы по дереву диска при распаковке
+                    # (аудит C-7)
+                    arc = "logs/" + str(p.relative_to(logs)).replace("\\", "/")
+                    zf.write(p, arcname=arc)
     _dev_log(client, "dump", "user", "", str(target))
     return target
 
@@ -715,12 +747,58 @@ def _cache_journal(client: ThinkingClient, message: str, reply: dict) -> None:
     которого в журнале нет, — человек видит ответ секунду и он исчезает.
     """
     try:
+        # тот же обмен уже лежит в журнале — вторая копия рядом с оригиналом
+        # попадает в историю дважды и второй раз в хвостовой скан кэша
+        # (аудит C-3). Перерисовка, ради которой писался дубль, находит
+        # оригинал: он и есть первая запись.
+        want_q = str(message or "")[:2000]
+        want_r = str(reply.get("reply") or "")[:4000]
+        for rec in reversed(list(client.chat_log[-10:])):
+            if rec.get("question") == want_q and rec.get("reply") == want_r:
+                return
         client._remember_chat(                              # noqa: SLF001
             message, ChatReply.from_dict(
                 {k: v for k, v in reply.items() if k != "cached"}),
             cached=True)
     except Exception as exc:                                # noqa: BLE001
         _out(f"! кэш: не записал в журнал диалога: {exc}")
+
+
+def _local_name(name: str) -> bool:
+    """Хост, который имеет право трогать локальную панель."""
+    return str(name or "").strip("[]").lower() in ("127.0.0.1", "localhost", "::1")
+
+
+def host_allowed(host: str, origin: str = "", port: object = "") -> bool:
+    """AUD-17: запрос к панели пришёл от своего адреса?
+
+    Панель отдаёт память, журналы, состояние и умеет менять настройки, при
+    этом слушает 127.0.0.1. DNS-подмена или запись в hosts превращает
+    «localhost» в чужой хост — тогда панель обслуживает чужого клиента.
+    Чужой `Host` → 403. Чужой `Origin` у POST → 403 (страховка от форм
+    на чужих страницах: на no-cors-запрос заголовок Origin всё равно идёт).
+    """
+    host = str(host or "").strip().lower()
+    if ":" in host:
+        name, _, p = host.rpartition(":")
+    else:
+        name, p = host, ""
+    if not _local_name(name):
+        return False
+    if p and str(port) and p != str(port):
+        return False
+    origin = str(origin or "").strip()
+    if not origin or origin.lower() in ("null", "undefined"):
+        return True                       # curl/свой скрипт — Origin не шлёт
+    try:
+        u = urllib.parse.urlparse(origin)
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https") or not _local_name(u.hostname or ""):
+        return False
+    if u.port and str(port) and str(u.port) != str(port):
+        return False
+    return True
 
 
 def memory_action(client: ThinkingClient, data: dict) -> tuple[int, dict]:
@@ -860,8 +938,21 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
             except (ValueError, OSError):
                 return {}
 
+        def _deny_host(self, with_origin: bool = False) -> bool:
+            """AUD-17: отсекаем чужой Host, а у POST — и чужой Origin."""
+            port = self.server.server_address[1]
+            origin = str(self.headers.get("Origin") or "") if with_origin else ""
+            if host_allowed(str(self.headers.get("Host") or ""), origin, port):
+                return False
+            _out(f"[403] чужой Host/Origin отклонён: "
+                 f"{self.headers.get('Host')!r} origin={origin!r}")
+            self._json_out(403, {"error": "панель принимает только 127.0.0.1"})
+            return True
+
         def do_POST(self):  # noqa: N802
             _sync_target()
+            if self._deny_host(with_origin=True):
+                return
             """Действия панели: чат, память, удаление записей."""
             path = self.path.split("?")[0]
             data = self._body()
@@ -961,47 +1052,15 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                     pass                        # вкладку закрыли — это не ошибка
                 return
             if path == "/api/memory":
+                # одна логика на двоих (аудит B-6): раньше обработчик панели
+                # дублировал memory_action строка в строку, и правка лимитов
+                # в одной ветке не доходила до второй
                 try:
-                    act = str(data.get("action") or "")
-                    if act == "export":
-                        # «Поделиться памятью»: обычный JSON с профилем и фактами
-                        self._json_out(200, {"memory": client.memory(),
-                                             "exported": utcnow()})
-                        return
-                    if act == "import":
-                        raw = data.get("memory")
-                        if not isinstance(raw, dict):
-                            self._json_out(400, {"error": "импорт: нужен объект memory"})
-                            return
-                        # ввозим только известные поля, с лимитами схемы
-                        turns = [t for t in (raw.get("turns") or [])
-                                 if isinstance(t, dict) and str(t.get("text") or "").strip()]
-                        clean = {"profile": str(raw.get("profile") or "")[:800],
-                                 "facts": [str(f)[:300] for f in (raw.get("facts") or [])
-                                           if str(f).strip()][-MAX_MEMORY_FACTS:],
-                                 "turns": turns[-MAX_MEMORY_TURNS:],
-                                 "updated": utcnow()}
-                        client._write_memory(clean)  # noqa: SLF001 — свой же метод
-                        _out(f"[память] импорт: фактов {len(clean['facts'])}, "
-                             f"реплик {len(clean['turns'])}")
-                        self._json_out(200, {"memory": client.memory()})
-                        return
-                    if act == "forget":
-                        mem = client.forget(facts=bool(data.get("facts", True)),
-                                            turns=bool(data.get("turns", True)))
-                    elif act == "remove" and data.get("fact"):
-                        mem = client.memory()
-                        mem["facts"] = [f for f in mem["facts"]
-                                        if f != str(data["fact"])]
-                        client._write_memory(mem)  # noqa: SLF001 — свой же метод
-                        mem = client.memory()
-                    else:
-                        mem = client.remember(fact=str(data.get("fact") or ""),
-                                              profile=str(data.get("profile") or ""))
+                    code, payload = memory_action(client, data)
                 except (SchemaError, ThinkingError) as exc:
                     self._json_out(400, {"error": str(exc)[:200]})
                     return
-                self._json_out(200, {"memory": mem})
+                self._json_out(code, payload)
                 return
             if path == "/api/delete":
                 kind = str(data.get("kind") or "report")
@@ -1026,6 +1085,11 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
             # ---- токен: панель подставляет его сама, здесь только сохранение
             if path == "/api/token":
                 tok = str(data.get("token") or "")
+                if not tok:
+                    # пустой токен не затирает сохранённый (аудит B-8):
+                    # поле в панели теперь не подставляется автоматически
+                    self._json_out(400, {"error": "пустой токен не сохраняется"})
+                    return
                 try:
                     cfg_path = client.set_token(tok)
                 except OSError as exc:
@@ -1124,6 +1188,8 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
 
         def do_GET(self):  # noqa: N802
             _sync_target()
+            if self._deny_host():
+                return
             path = self.path.split("?")[0]
             query = urllib.parse.parse_qs(self.path.partition("?")[2])
             if path in ("/", "/index.html"):
@@ -1148,6 +1214,9 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 if not data:
                     data = {"error": "Colab-сервер не знает /models (старый ноутбук)",
                             "models": []}
+                # параллельные движки — какие модели отвечают на /ask/multi
+                # прямо сейчас (маршрут /parallel есть, вкладка его показывает)
+                data["parallel"] = client.parallel_models()
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(data, ensure_ascii=False).encode("utf-8"))
             elif path == "/api/dev/files":
