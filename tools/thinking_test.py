@@ -733,6 +733,50 @@ def test_dev_reports() -> None:
     check(reps[0].get("code") == "x = 42", "отчёты: код в отчёте")
 
 
+def test_chat_author() -> None:
+    """Видно, кто спрашивал субагента: человек (панель) или агент (CLI)."""
+    c = make_client(chat_path=str(TMP / "author_chat.jsonl"),
+                    memory_path=str(TMP / "author_mem.json"),
+                    interactions_path=str(TMP / "author_inter.jsonl"),
+                    reports_path=str(TMP / "author_reps.jsonl"))
+    c.base = "http://127.0.0.1:1"        # мёртвый сервер -> заглушка, сеть не трогаем
+    c.chat("вопрос человека", use_memory=False, author="human")
+    c.chat("вопрос агента", use_memory=False, author="agent")
+    c.chat("вопрос без метки", use_memory=False)
+    rows = [json.loads(l) for l in
+            open(TMP / "author_chat.jsonl", encoding="utf-8") if l.strip()]
+    who = [r.get("author") for r in rows]
+    check(who == ["human", "agent", "agent"],
+          f"автор реплики пишется в журнал чата (получено {who})")
+    check(rows[0].get("question") == "вопрос человека",
+          "автор не путает реплики — вопрос на месте")
+    # по умолчанию программный вызов = агент: забытый параметр не врёт
+    check(rows[2].get("author") == "agent",
+          "автор по умолчанию — агент (CLI/программа), не человек")
+
+    # то же в ленте обращений: _record пишет автора
+    c2 = make_client(interactions_path=str(TMP / "author2_inter.jsonl"),
+                     reports_path=str(TMP / "author2_reps.jsonl"))
+    c2._record("plan", "задача от человека", time.time(), ok=True,
+               summary="ок", author="human")
+    c2._record("plan", "задача от агента", time.time(), ok=True,
+               summary="ок", author="agent")
+    inter = c2.status()["interactions"]
+    authors = [i.get("author") for i in inter if i.get("kind") == "plan"]
+    check(authors == ["human", "agent"],
+          f"автор виден в ленте обращений (получено {authors})")
+
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    check('t.author === "agent"' in html and '"агент" : "я"' in html,
+          "панель: чат подписывает реплику агента иначе, чем вашу")
+    check("m.author === \"agent\" ? \"агент\" : \"человек\"" in html,
+          "панель: в ленте обращений видна метка человек/агент")
+    # панель объявляет себя человеком
+    cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    check(cli_src.count('author="human"') >= 3,
+          "панель: её вызовы чата и разработки помечены как человеческие")
+
+
 def test_dev_layout_vertical() -> None:
     """«Разработка» идёт сверху вниз: чат → код → вывод → журнал → дамп."""
     html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
@@ -1266,6 +1310,7 @@ def main() -> int:
     test_reflect_async_spawns_process()
     test_devsave_args()
     test_dev_reports()
+    test_chat_author()
     test_dev_layout_vertical()
     test_dev_run_stdin()
     test_chat_autoscroll()

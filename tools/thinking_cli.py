@@ -793,7 +793,8 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                 try:
                     reply = client.chat(message,
                                         use_memory=bool(data.get("memory", True)),
-                                        max_steps=int(data.get("max_steps") or 4))
+                                        max_steps=int(data.get("max_steps") or 4),
+                                        author="human")   # запрос из панели, не из CLI
                 except SchemaError as exc:
                     self._json_out(400, {"error": str(exc)})
                     return
@@ -859,7 +860,8 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                                                                    "text": piece}),
                             on_retry=lambda n, total: _emit(
                                 {"type": "retry", "attempt": n, "of": total}),
-                            use_memory=bool(data.get("memory", True)))
+                            use_memory=bool(data.get("memory", True)),
+                            author="human")   # запрос из панели, не из CLI
                         _cache_put(client, kind, message, reply)
                     done = {"type": "done", **reply}
                     _emit(done)
@@ -980,7 +982,8 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                         active_code=code,
                         on_token=None,
                         on_retry=lambda n, total: _out(
-                            f"[разработка] поток оборвался, повтор {n}/{total}"))
+                            f"[разработка] поток оборвался, повтор {n}/{total}"),
+                        author="human")   # запрос из панели, не из CLI
                 except SchemaError as exc:
                     self._json_out(400, {"error": str(exc)})
                     return

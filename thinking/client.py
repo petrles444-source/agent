@@ -348,7 +348,8 @@ class ThinkingClient:
                               "значение (оставьте ссылку вида os.getenv(...))")
 
     def plan(self, task: str, context: Optional[dict] = None,
-             constraints: Optional[list[str]] = None, max_steps: int = 12) -> dict:
+             constraints: Optional[list[str]] = None, max_steps: int = 12,
+             author: str = "agent") -> dict:
         self._check_secrets(task, json.dumps(context or {}, ensure_ascii=False),
                             json.dumps(constraints or [], ensure_ascii=False))
         t0 = time.time()
@@ -361,13 +362,15 @@ class ThinkingClient:
             }, timeout=max(self.timeout, float(self.cfg.get("plan_timeout", 360))))
         except Exception as exc:
             self.stats["errors"] += 1
-            self._record("plan", task, t0, ok=False, summary=f"не ответил: {exc}"[:400])
+            self._record("plan", task, t0, ok=False, summary=f"не ответил: {exc}"[:400],
+                         author=author)
             raise
         if isinstance(out, dict):
-            self._account_plan(out, task, t0)
+            self._account_plan(out, task, t0, author=author)
         return out
 
-    def _account_plan(self, plan: dict, task: str, t0: float) -> None:
+    def _account_plan(self, plan: dict, task: str, t0: float,
+                      author: str = "agent") -> None:
         """Единый учёт успешного плана — для обычного и потокового вызова.
 
         Раньше plan_stream не вызывал этот блок (аудит AUD-06): успешный
@@ -379,14 +382,16 @@ class ThinkingClient:
         self.stats["plans"] += 1
         self.stats["blocked_ms"] += int((time.time() - t0) * 1000)
         self._record("plan", task, t0, ok=True,
-                     summary=self._plan_summary(plan), plan_id=plan.get("plan_id"))
+                     summary=self._plan_summary(plan), plan_id=plan.get("plan_id"),
+                     author=author)
 
     def ask(self, question: str, max_steps: int = 4) -> dict:
         return self.plan(question, max_steps=max_steps)
 
     def plan_stream(self, task: str, context: Optional[dict] = None,
                     constraints: Optional[list[str]] = None, max_steps: int = 12,
-                    on_event: Optional[Callable[[dict], None]] = None) -> dict:
+                    on_event: Optional[Callable[[dict], None]] = None,
+                    author: str = "agent") -> dict:
         """POST /plan/stream: отдаёт токены по мере генерации, возвращает план."""
         self._check_secrets(task, json.dumps(context or {}, ensure_ascii=False))
         t0 = time.time()
@@ -431,13 +436,13 @@ class ThinkingClient:
                         except Exception as exc:
                             log.debug("обработчик потока упал: %s", exc)
         if plan:
-            self._account_plan(plan, task, t0)
+            self._account_plan(plan, task, t0, author=author)
             return plan
         raise ThinkingError("поток завершился без итогового плана")
 
     def reflect(self, plan_id: str, step_id: int, result: str,
                 observation: Optional[str] = None, error: Optional[str] = None,
-                timeout: Optional[float] = None) -> dict:
+                timeout: Optional[float] = None, author: str = "agent") -> dict:
         self._check_secrets(result, observation or "", error or "")
         if timeout is None:
             timeout = max(self.timeout, float(self.cfg.get("reflect_timeout", 180)))
@@ -453,7 +458,8 @@ class ThinkingClient:
         except Exception as exc:
             self.stats["errors"] += 1
             self._record("reflect", f"шаг {step_id}: {result[:300]}", t0,
-                         ok=False, summary=f"не ответил: {exc}"[:400], plan_id=plan_id)
+                         ok=False, summary=f"не ответил: {exc}"[:400],
+                         plan_id=plan_id, author=author)
             raise
         if isinstance(out, dict):
             self._remember_json("reflect", out)
@@ -461,7 +467,7 @@ class ThinkingClient:
             self.stats["reflects"] += 1
             self._record("reflect", f"шаг {step_id}: {result[:300]}", t0, ok=True,
                          summary=f"[{out.get('status')}] {out.get('advice', '')}"[:400],
-                         plan_id=plan_id)
+                         plan_id=plan_id, author=author)
         return out
 
     # ------------------------------------------------------------------ #
@@ -754,11 +760,14 @@ class ThinkingClient:
 
     def _record(self, kind: str, request: str, t0: float, ok: bool,
                 summary: str, plan_id: Optional[str] = None,
-                fallback: bool = False, background: bool = False) -> None:
+                fallback: bool = False, background: bool = False,
+                author: str = "agent") -> None:
+        who = str(author or "agent")[:20]
         rec = {
             "n": len(self.interactions) + 1, "rid": new_rid(),
             "kind": kind,
             "at": utcnow(),
+            "author": who,
             "request": request[:700],
             "duration_ms": int((time.time() - t0) * 1000),
             "ok": bool(ok),
@@ -774,8 +783,10 @@ class ThinkingClient:
         if fallback:
             self.stats["fallbacks"] += 1
         _append_jsonl(self._inter_path, rec)
+        # в живой ленте сразу видно, чей это вызов — человек или агент
+        who_ru = "человек" if who == "human" else "агент"
         self._append_log({"seq": int(time.time() * 1000), "type": "interaction",
-                          "text": f"[{kind}] {request[:200]} -> {summary[:300]}",
+                          "text": f"[{kind}/{who_ru}] {request[:200]} -> {summary[:300]}",
                           "ts": rec["at"]})
 
     def _report_plan(self, plan: dict, task: str) -> None:
@@ -862,7 +873,8 @@ class ThinkingClient:
     #  ЧАТ: человек ↔ субагент, с памятью и учётом токенов
     # ------------------------------------------------------------------ #
     def chat(self, message: str, use_memory: bool = True,
-             max_steps: int = 4, timeout: Optional[float] = None) -> dict:
+             max_steps: int = 4, timeout: Optional[float] = None,
+             author: str = "agent") -> dict:
         """Живой диалог с субагентом.
 
         Сначала пробует серверный /chat (в нём есть память и честный usage).
@@ -918,10 +930,10 @@ class ThinkingClient:
                     tokens_in=0, tokens_out=0,
                     tokens_estimate=False)
                 reply.duration_ms = int((time.time() - t0) * 1000)
-                self._remember_chat(text, reply)
+                self._remember_chat(text, reply, author=author)
                 self.stats["chats"] += 1
                 self.stats["fallbacks"] += 1
-                self._record_chat(text, reply.reply, t0, fallback=True)
+                self._record_chat(text, reply.reply, t0, fallback=True, author=author)
                 self.token_stats.record(reply)
                 return reply.to_dict()
         if not out:
@@ -938,7 +950,7 @@ class ThinkingClient:
             reply.memory_used = bool(mem.get("facts") or turns)
         if not reply.reply:
             reply.reply = "Субагент промолчал — задача не разобрана."
-        self._remember_chat(text, reply)
+        self._remember_chat(text, reply, author=author)
         if use_memory and not reply.fallback:
             self._safe_remember_turn(text, reply)
         self.stats["chats"] += 1
@@ -1052,6 +1064,7 @@ class ThinkingClient:
         raise ThinkingError(f"{label} оборвался после {total} попыток: {last}")
 
     def chat_stream(self, message: str, on_token: Optional[Callable[[str], None]] = None,
+                     author: str = "agent",
                     use_memory: bool = True, max_steps: int = 4,
                     timeout: Optional[float] = None,
                     on_retry: Optional[Callable[[int, int], None]] = None) -> dict:
@@ -1111,14 +1124,14 @@ class ThinkingClient:
             reply.at = utcnow()
         if use_memory:
             reply.memory_used = bool(mem.get("facts") or mem.get("turns"))
-        self._remember_chat(text, reply)
+        self._remember_chat(text, reply, author=author)
         if use_memory and not reply.fallback:
             self._safe_remember_turn(text, reply)
         self.stats["chats"] += 1
         self._record_chat(text, reply.reply, t0, fallback=reply.fallback,
                           plan_id=reply.plan_id, tokens_in=reply.tokens_in,
                           tokens_out=reply.tokens_out,
-                          estimate=reply.tokens_estimate)
+                          estimate=reply.tokens_estimate, author=author)
         self.token_stats.record(reply)
         return reply.to_dict()
 
@@ -1162,7 +1175,8 @@ class ThinkingClient:
             active_name: str = "", active_code: str = "",
             on_token: Optional[Callable[[str], None]] = None,
             timeout: Optional[float] = None,
-            on_retry: Optional[Callable[[int, int], None]] = None) -> dict:
+            on_retry: Optional[Callable[[int, int], None]] = None,
+            author: str = "agent") -> dict:
         """Запрос в режиме разработчика: модель предлагает изменение файла.
 
         Ничего не пишет на диск — только возвращает предложение
@@ -1185,7 +1199,7 @@ class ThinkingClient:
                 # Сервер сам ответил отказом — повторять бессмысленно.
                 self.stats["errors"] += 1
                 self._record("dev", body["message"], t0, ok=False,
-                             summary=f"не ответил: {exc}"[:400])
+                             summary=f"не ответил: {exc}"[:400], author=author)
                 raise
             if not _looks_like_missing_route(exc):
                 # Поток оборвался после попыток: короткий не-потоковый
@@ -1203,7 +1217,7 @@ class ThinkingClient:
                         "пересобери ноутбук ver3 и выполни ячейки C+D") from exc2
                 self.stats["errors"] += 1
                 self._record("dev", body["message"], t0, ok=False,
-                             summary=f"не ответил: {exc2}"[:400])
+                             summary=f"не ответил: {exc2}"[:400], author=author)
                 raise
         if not done:
             raise ThinkingError("режим разработчика не вернул ответа")
@@ -1213,7 +1227,7 @@ class ThinkingClient:
         self._remember_json("dev", {"request": body["message"], **proposal})
         self._record("dev", body["message"], t0, ok=True,
                      summary=f"[{proposal['action']}] {proposal['filename']}: "
-                             f"{proposal['comment']}"[:400])
+                             f"{proposal['comment']}"[:400], author=author)
         self._report_dev(proposal, body["message"])
         return proposal
 
@@ -1358,9 +1372,14 @@ class ThinkingClient:
         _write_json(self._mem_path, mem)
 
     def _remember_chat(self, question: str, reply: ChatReply,
-                       cached: bool = False) -> None:
+                       cached: bool = False, author: str = "agent") -> None:
+        # author: кто спрашивал — "human" (панель) или "agent" (агент через CLI).
+        # Без этого в истории не отличить мой вопрос от вашего: оба лежали
+        # рядом с подписью «я», и вкладка «Связь агентов» вводила в
+        # заблуждение, чей это был вызов.
         self.chat_log.append({"at": reply.at, "question": question[:2000],
                               "reply": reply.reply[:4000],
+                              "author": str(author or "human")[:20],
                               "fallback": reply.fallback,
                               "tokens_in": reply.tokens_in,
                               "tokens_out": reply.tokens_out,
@@ -1374,9 +1393,11 @@ class ThinkingClient:
     def _record_chat(self, question: str, reply: str, t0: float,
                      fallback: bool, error: str = "", plan_id: str = "",
                      tokens_in: int = 0, tokens_out: int = 0,
-                     estimate: bool = True) -> None:
+                     estimate: bool = True, author: str = "agent") -> None:
+        who = str(author or "human")[:20]
         rec = {"n": len(self.interactions) + 1, "rid": new_rid(), "kind": "chat", "at": utcnow(),
                "request": question[:700],
+               "author": who,
                "duration_ms": int((time.time() - t0) * 1000),
                "ok": bool(reply) or bool(error), "fallback": bool(fallback),
                "background": False, "source": "local-fallback" if fallback else "colab",

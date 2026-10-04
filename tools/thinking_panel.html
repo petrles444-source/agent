@@ -290,6 +290,9 @@
   .line .bub:hover { box-shadow: var(--glow-blue); }
   .line.me .bub { background: rgba(157,78,221,.16); border:1px solid rgba(157,78,221,.55);
                   color:#e6d9ff; }
+  /* реплика агента (вызов из CLI) — жёлтой подписью, чтобы не спутать с моей */
+  .line.me.agent .who { color: var(--neon-yellow); }
+  .line.me.agent .bub { border-style: dashed; }
   .line.ai .bub { background: rgba(0,243,255,.10); border:1px solid rgba(0,243,255,.45);
                   color:#c9e4ff; }
   .line.ai.fb .bub { background: rgba(255,106,0,.12); border:1px solid rgba(255,106,0,.5);
@@ -624,10 +627,11 @@
 
   <!-- ============ СВЯЗЬ АГЕНТОВ ============ -->
   <section class="pane" id="pane-live">
-    <p class="hint">Что я отправляю субагенту: задачи на план, рефлексии,
-      реплики чата и запросы режима «Разработка» — лента обращений за выбранный
-      период, без вмешательства. Технические события и команды — во вкладке
-      «Журнал».</p>
+    <p class="hint">Все обращения к субагенту за выбранный период: задачи на
+      план, рефлексии, реплики чата и запросы режима «Разработка». У каждой
+      строки метка <b>человек</b> (ваш запрос из панели) или <b>агент</b>
+      (вызов из CLI или из программы) — чтобы было видно, кто спрашивал.
+      Технические события и команды — во вкладке «Журнал».</p>
     <div class="scroll" id="live"><div class="empty">ожидание обращений…</div></div>
   </section>
 
@@ -1074,8 +1078,12 @@ function renderChat(list) {
     return;
   }
   list.slice(-40).forEach(t => {
-    const me = el("div", "line me");
-    me.appendChild(el("span", "who", "я"));
+    /* Кто спрашивал: человек (панель) или агент (вызов из CLI/скрипта).
+       Раньше оба случая подписывались «я», и по журналу нельзя было
+       понять, чей это был вопрос. */
+    const byAgent = t.author === "agent";
+    const me = el("div", "line me" + (byAgent ? " agent" : ""));
+    me.appendChild(el("span", "who", byAgent ? "агент" : "я"));
     me.appendChild(el("div", "bub", t.question || ""));
     box.appendChild(me);
     const ai = el("div", "line ai" + (t.fallback ? " fb" : ""));
@@ -1781,6 +1789,12 @@ function renderSviz(list) {
     d.appendChild(el("span", "t", dttm(m.at)));
     const tail = (m.ok ? "" : " — ошибка")
                + (m.fallback ? " (заглушка)" : "");
+    /* Подпись автора обязательна: вкладка называется «Связь агентов», но
+       сюда попадают и мои вопросы из панели — без метки человек не понимает,
+       что это его собственный вызов, а не трафик агента. */
+    const who = m.author === "agent" ? "агент" : "человек";
+    d.appendChild(el("span", "chip " + (m.author === "agent" ? "chip-dev" : "chip-plan"),
+                     who));
     d.appendChild(el("span", "txt",
       kindLabel(m.kind) + ": " + String(m.request || "").slice(0, 300) + tail));
     box.appendChild(d);
