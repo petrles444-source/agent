@@ -2743,6 +2743,33 @@ def test_colab_defs_before_use() -> None:
                    f"({bad[:4]})")
 
 
+def test_tunnel_failure_is_visible() -> None:
+    """Провал туннеля не должен оставаться без объяснения.
+
+    Живой случай 04.10: ячейка D отработала, туннеля не было, и в выводе
+    не оказалось ни одной строки о причине — адрес искали вручную, два
+    запуска Colab подряд. Теперь причина пишется в `thinking_url.txt` и
+    печатается в ячейке 7/7 вместе с хвостом лога.
+    """
+    d = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    b = (ROOT / "scripts" / "build_colab.py").read_text(encoding="utf-8")
+    nb = (ROOT / "colab" / "thinking_agent_ver3.ipynb").read_text(encoding="utf-8")
+    check("THINKING_TUNNEL_ERROR=" in d,
+          "ячейка D: причина провала туннеля пишется в thinking_url.txt")
+    check("ТУННЕЛЬ НЕ ПОДНЯЛСЯ" in d and "_dump_tunnel_log()" in d,
+          "ячейка D: о провале печатается блок с причиной и хвостом лога")
+    check("rounds: int = 3" in d,
+          "ячейка D: туннель поднимается с повторами, а не одной попыткой")
+    check('"localhost" not in candidate' in d,
+          "ячейка D: прокси Colab с localhost-адресом отбрасывается")
+    check("tunnel_retry_after" in d,
+          "ячейка D: сторож не долбит Cloudflare каждую минуту")
+    check("THINKING_TUNNEL_ERROR" in b and "tunnel.log" in b,
+          "ячейка 7/7: показывает причину провала и хвост tunnel.log")
+    check("НЕ ПОДНЯЛСЯ" in nb and "ПРИЧИНА" in nb,
+          "ноутбук: пересобран с ячейкой 7/7, которая объясняет провал")
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2774,6 +2801,7 @@ def main() -> int:
     test_panel_http_layer()
     test_breaker_and_rotation()
     test_colab_defs_before_use()
+    test_tunnel_failure_is_visible()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

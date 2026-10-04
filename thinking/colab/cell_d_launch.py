@@ -24,11 +24,13 @@ def _token_from_file() -> str:
         return ""
 
 
-def _remember(url: str, token: str) -> None:
+def _remember(url: str, token: str, error: str = "") -> None:
     try:
         with open(URL_FILE, "w", encoding="utf-8") as fh:
             fh.write(f"THINKING_URL={url}\nTHINKING_TOKEN={token}\n"
-                     f"THINKING_PANEL={url}\nupdated={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                     f"THINKING_PANEL={url}\n"
+                     f"THINKING_TUNNEL_ERROR={error}\n"
+                     f"updated={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     except OSError:
         pass
 
@@ -208,61 +210,70 @@ def _dump_tunnel_log() -> None:
           "CLOUDFLARE_TUNNEL_TOKEN (постоянный адрес).")
 
 
-def _start_tunnel() -> str:
+def _start_tunnel(rounds: int = 3, pause: int = 45) -> str:
     """Поднимает быстрый cloudflared и возвращает публичный URL (или "").
 
     Вынесено из основного потока: сторож обязан уметь перезапускать туннель
     сам, иначе мёртвый cloudflared не замечали до перезапуска ноутбука.
 
-    Два важных отличия от прежней версии:
+    Три важных отличия от прежней версии:
     * лог ЧИСТИМ на каждую попытку — раньше он дописывался, и если адрес
       прошлого запуска уже лежал в файле, неудачный старт возвращал мёртвый
       адрес (и сторож затем бесконечно «поднимал» тот же туннель);
+    * ПОВТОРЫ: Cloudflare режет частые quick-туннели с одного адреса, и
+      лимит снимается за минуты. Одна попытка — значит ручной перезапуск
+      ноутбука вместо пары минут ожидания;
     * при провале печатаем хвост лога и подсказку — раньше в выводе ячейки
       было пусто, и причину приходилось угадывать.
     """
     log = "/content/tunnel.log"
     if not _ensure_cloudflared():
         return ""
-    for proto in ("http2", "quic"):
-        open(log, "w", encoding="utf-8").close()      # лог только этой попытки
-        with open(log, "a", encoding="utf-8") as fh:
-            fh.write(f"--- попытка, протокол {proto}, "
-                     f"{time.strftime('%H:%M:%S')}\n")
-        # --protocol http2: quick-туннель по умолчанию ходит по QUIC/UDP, а на
-        # Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted 7168 kiB,
-        # got 416 kiB») — SSE-потоки посреди передачи замирали, done не доходил.
-        # HTTP/2 идёт по TCP и этих потерь не видит.
-        # --edge-ip-version 4: на части рантаймов IPv6 до edge Cloudflare не
-        # поднимается, и туннель молча не стартует.
-        try:
+    for rnd in range(1, rounds + 1):
+        for proto in ("http2", "quic"):
+            open(log, "w", encoding="utf-8").close()   # лог только этой попытки
             with open(log, "a", encoding="utf-8") as fh:
-                proc = subprocess.Popen(
-                    ["cloudflared", "tunnel", "--no-autoupdate",
-                     "--protocol", proto, "--edge-ip-version", "4",
-                     "--url", "http://localhost:8000"],
-                    stdout=fh, stderr=subprocess.STDOUT,
-                    start_new_session=True)
-        except Exception as exc:
-            print("cloudflared не запустился:", type(exc).__name__, str(exc)[:200])
-            continue
-        for _ in range(30):
+                fh.write(f"--- попытка {rnd}/{rounds}, протокол {proto}, "
+                         f"{time.strftime('%H:%M:%S')}\n")
+            # --protocol http2: quick-туннель по умолчанию ходит по QUIC/UDP,
+            # а на Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted
+            # 7168 kiB, got 416 kiB») — SSE-потоки посреди передачи замирали,
+            # done не доходил. HTTP/2 идёт по TCP и этих потерь не видит.
+            # --edge-ip-version 4: на части рантаймов IPv6 до edge Cloudflare
+            # не поднимается, и туннель молча не стартует.
             try:
-                txt = open(log, encoding="utf-8", errors="replace").read()
-            except OSError:
-                txt = ""
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", txt)
-            if m:
-                print(time.strftime("%H:%M:%S"), "туннель:", m.group(0),
-                      f"({proto})")
-                return m.group(0)
-            if proc.poll() is not None:
-                break               # cloudflared умер — пробуем другой протокол
-            time.sleep(2)
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+                with open(log, "a", encoding="utf-8") as fh:
+                    proc = subprocess.Popen(
+                        ["cloudflared", "tunnel", "--no-autoupdate",
+                         "--protocol", proto, "--edge-ip-version", "4",
+                         "--url", "http://localhost:8000"],
+                        stdout=fh, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+            except Exception as exc:
+                print("cloudflared не запустился:",
+                      type(exc).__name__, str(exc)[:200])
+                continue
+            for _ in range(20):
+                try:
+                    txt = open(log, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    txt = ""
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", txt)
+                if m:
+                    print(time.strftime("%H:%M:%S"), "туннель:", m.group(0),
+                          f"({proto}, попытка {rnd}/{rounds})")
+                    return m.group(0)
+                if proc.poll() is not None:
+                    break            # cloudflared умер — другой протокол
+                time.sleep(2)
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        print(time.strftime("%H:%M:%S"),
+              f"попытка {rnd}/{rounds} без адреса — жду {pause} с и повторяю")
+        if rnd < rounds:
+            time.sleep(pause)
     _dump_tunnel_log()
     return ""
 
@@ -588,50 +599,85 @@ if health_api is None:
 print("API ready:", health_api.text[:300])
 
 # ---- 5) публичные URL ------------------------------------------------------
-try:
-    panel_url = output.serve_kernel_port_as_window(8000)
-except Exception as exc:
-    panel_url = None
-    print("proxy window:", exc)
+# Сначала пробуем встроенный прокси Colab: он бесплатен и не зависит от
+# Cloudflare. Прежние версии Colab отдавали здесь случайный адрес
+# *.googleusercontent.com; если отдали localhost — такой URL с ПК не годен,
+# и раньше он молча попадал в THINKING_URL.
+panel_url = ""
+for _fn in ("serve_kernel_port_as_iframe", "serve_kernel_port_as_window"):
+    try:
+        candidate = str(getattr(output, _fn)(8000) or "").strip()
+    except Exception as exc:
+        print(f"прокси Colab ({_fn}):", type(exc).__name__, str(exc)[:120])
+        continue
+    if candidate.startswith("https://") and "localhost" not in candidate:
+        panel_url = candidate.rstrip("/")
+        print("прокси Colab:", panel_url)
+        break
+    print(f"прокси Colab ({_fn}) вернул {candidate!r} — с ПК не подходит")
 
 tunnel = None
 tunnel_kind = "нет"
+tunnel_error = ""
 try:
-    if not os.path.exists("/usr/local/bin/cloudflared"):
-        subprocess.run(["wget", "-q",
-                        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-                        "-O", "/usr/local/bin/cloudflared"], check=True)
-        os.chmod("/usr/local/bin/cloudflared", 0o755)
-    open("/content/tunnel.log", "w", encoding="utf-8").close()
-
     # 1) ИМЕНОВАННЫЙ туннель Cloudflare — постоянный адрес на сутки и дольше.
     #    Задайте переменную CLOUDFLARE_TUNNEL_TOKEN (dashboard → tunnels → token)
     #    или вставьте токен ниже: CF_TOKEN = "eyJhIjoi..."
     CF_TOKEN = os.environ.get("CLOUDFLARE_TUNNEL_TOKEN", "")
     if CF_TOKEN:
-        with open("/content/tunnel.log", "w", encoding="utf-8") as _fh:
-            subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate", "run",
+        open("/content/tunnel.log", "w", encoding="utf-8").close()
+        with open("/content/tunnel.log", "a", encoding="utf-8") as _fh:
+            _fh.write("--- именованный туннель "
+                      + time.strftime("%H:%M:%S") + "\n")
+            subprocess.Popen(["cloudflared", "tunnel", "--no-autoupdate", "run",
                               "--token", CF_TOKEN],
                              stdout=_fh, stderr=subprocess.STDOUT,
                              start_new_session=True)
-        time.sleep(12)
-        txt = open("/content/tunnel.log", encoding="utf-8", errors="replace").read()
-        m = re.search(r"https://[a-z0-9.-]+\.(?:trycloudflare\.com|"
-                      r"[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev|[a-z0-9.-]+\.cfargotunnel\.com)", txt)
-        if m:
-            tunnel, tunnel_kind = m.group(0), "именованный (постоянный)"
-        else:
-            print("ИМЕНОВАННЫЙ туннель: адрес не распознан в логе, смотрите /content/tunnel.log")
-    # 2) Быстрый туннель — бесплатно и без аккаунта, но адрес случайный на каждый запуск
+        for _ in range(20):
+            try:
+                txt = open("/content/tunnel.log", encoding="utf-8",
+                           errors="replace").read()
+            except OSError:
+                txt = ""
+            m = re.search(r"https://[a-z0-9.-]+\.(?:trycloudflare\.com|"
+                          r"[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev"
+                          r"|[a-z0-9.-]+\.cfargotunnel\.com)", txt)
+            if m:
+                tunnel, tunnel_kind = m.group(0), "именованный (постоянный)"
+                break
+            time.sleep(2)
+        if not tunnel:
+            tunnel_error = ("именованный туннель не дал адрес — "
+                            "смотрите /content/tunnel.log")
+            print(tunnel_error)
+    # 2) Быстрый туннель — бесплатно и без аккаунта, но адрес случайный
     if not tunnel:
         tunnel = _start_tunnel()
         if tunnel:
             tunnel_kind = "быстрый (случайный адрес)"
+        else:
+            tunnel_error = tunnel_error or "быстрый туннель не поднялся"
 except Exception as exc:
-    print("tunnel error:", exc)
+    tunnel_error = f"{type(exc).__name__}: {exc}"[:300]
+    print("tunnel error:", tunnel_error)
 
-url = tunnel or (str(panel_url) if panel_url else "")
-_remember(url, TOKEN)
+url = tunnel or panel_url
+_remember(url, TOKEN, error="" if url else tunnel_error)
+if not url:
+    # Молчаливый провал стоил нам запусков Colab: адреса нет, и в выводе нет
+    # ни одной строки о причине. Печатаем блок с причиной и хвостом лога.
+    print("=" * 72)
+    print("  ТУННЕЛЬ НЕ ПОДНЯЛСЯ — адреса для ПК нет")
+    print("=" * 72)
+    if tunnel_error:
+        print("причина:", tunnel_error)
+    _dump_tunnel_log()
+    print("Что делать:")
+    print("  1) подождать 5-15 минут (Cloudflare режет частые quick-туннели")
+    print("     с одного адреса) и выполнить эту ячейку заново;")
+    print("  2) либо задать CLOUDFLARE_TUNNEL_TOKEN — адрес будет постоянным;")
+    print("  3) либо выполнить ячейку 7/7 ещё раз через минуту: сторож мог")
+    print("     поднять туннель со второй попытки.")
 
 # ---- 6) проверка через публичный URL --------------------------------------
 if url:
@@ -647,10 +693,12 @@ if url:
         time.sleep(3)
 
 print("=" * 72)
-print("THINKING_URL=", url)
+print("THINKING_URL=", url or "(нет — см. блок «ТУННЕЛЬ НЕ ПОДНЯЛСЯ» выше)")
 print("THINKING_TOKEN=", TOKEN)
-print("THINKING_PANEL=", url)
+print("THINKING_PANEL=", url or "(нет)")
 print("ТУННЕЛЬ:", tunnel_kind)
+if not url:
+    print("ПРИЧИНА:", tunnel_error or "неизвестна, смотрите /content/tunnel.log")
 print("=" * 72)
 
 # ---- 7) сторож: если LLM/API умрёт — поднимем сами (ноутбук не ждёт вас) ----
@@ -660,9 +708,28 @@ import threading                                          # noqa: E402
 def _watch() -> None:
     global url
     api_fail = llm_fail = 0
+    tunnel_retry_after = time.time() + 300   # не долбим Cloudflare чаще раза в 5 мин
     while True:
         time.sleep(60)
         try:
+            if not url:
+                # Адреса нет вовсе: проверять нечего, а повторять попытки
+                # каждую минуту бессмысленно — Cloudflare режет частые
+                # quick-туннели. Пробуем раз в 5 минут.
+                if _alive("http://127.0.0.1:8000") and time.time() >= tunnel_retry_after:
+                    print(time.strftime("%H:%M:%S"),
+                          "адреса туннеля нет — пробую поднять заново")
+                    new_url = _start_tunnel(rounds=1)
+                    tunnel_retry_after = time.time() + 300
+                    if new_url:
+                        url = new_url
+                        _remember(url, TOKEN)
+                        print("=" * 72)
+                        print("НОВЫЙ THINKING_URL=", url)
+                        print("на ПК:  python tools/thinking_cli.py set-url",
+                              url, TOKEN)
+                        print("=" * 72)
+                continue
             if _alive("http://127.0.0.1:8000") and _tunnel_alive(url):
                 api_fail = llm_fail = 0
                 continue
@@ -670,9 +737,12 @@ def _watch() -> None:
                 # Локально всё живо, а снаружи нет — умер cloudflared.
                 # Раньше сторож смотрел только на локальный /health и такой
                 # туннель считался здоровым до перезапуска ноутбука (аудит B)
+                if time.time() < tunnel_retry_after:
+                    continue
                 print(time.strftime("%H:%M:%S"),
                       "туннель недоступен снаружи — перезапускаю cloudflared")
-                new_url = _start_tunnel()
+                new_url = _start_tunnel(rounds=1)
+                tunnel_retry_after = time.time() + 300
                 if new_url:
                     # адрес сменился: записываем его, иначе ПК продолжит ходить
                     # в мёртвый, а ячейка 7/7 покажет старый

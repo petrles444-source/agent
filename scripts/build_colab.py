@@ -182,8 +182,9 @@ f = pathlib.Path("/content/thinking_url.txt")
 data = f.read_text(encoding="utf-8") if f.exists() else ""
 url = (re.search(r"THINKING_URL=(\\S+)", data) or [None, ""])[1]
 token = (re.search(r"THINKING_TOKEN=(\\S+)", data) or [None, ""])[1]
+err = (re.search(r"THINKING_TUNNEL_ERROR=(.*)", data) or [None, ""])[1]
 print("=" * 66)
-print("  АДРЕС ТУННЕЛЯ:", url or "не найден — выполни ячейку 4/7 (D)")
+print("  АДРЕС ТУННЕЛЯ:", url or "НЕ ПОДНЯЛСЯ")
 print("=" * 66)
 print()
 if url:
@@ -206,8 +207,25 @@ if url:
     print("       он выполнит set-url и прогонит полный тест (план, рефлексия,")
     print("       отчёт, память). Отдельно ничего настраивать не нужно.")
 else:
-    print("Адреса пока нет. Выполни ячейку 4/7 (D) — она поднимает туннель,")
-    print("потом вернись сюда и выполни эту ячейку ещё раз.")
+    print("ТУННЕЛЬ НЕ ПОДНЯЛСЯ — адреса для ПК нет.")
+    print()
+    print("ПРИЧИНА:", err or "не записана — выполни ячейку 4/7 (D) заново")
+    print()
+    print("Последние строки /content/tunnel.log:")
+    try:
+        for line in pathlib.Path("/content/tunnel.log").read_text(
+                encoding="utf-8", errors="replace").splitlines()[-25:]:
+            print("   |", line)
+    except Exception as exc:
+        print("   | лог недоступен:", exc)
+    print()
+    print("Что делать:")
+    print("  1) подождать 5-15 минут — Cloudflare режет частые quick-туннели")
+    print("     с одного адреса рантайма;")
+    print("  2) выполнить ячейку 4/7 (D) заново: теперь она делает три попытки")
+    print("     (http2 и quic) сама и печатает причину, если не вышло;")
+    print("  3) если адрес нужен надёжно — задайте CLOUDFLARE_TUNNEL_TOKEN,")
+    print("     тогда адрес будет постоянным и не зависит от лимитов.")
 """
 
 FINISH = """---
