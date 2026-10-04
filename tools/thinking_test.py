@@ -2594,6 +2594,11 @@ def test_panel_http_layer() -> None:
                     interactions_path=str(TMP / "http_int.jsonl"),
                     chat_path=str(TMP / "http_chat.jsonl"),
                     log_path=str(TMP / "http_log.jsonl"))
+    # Панель на каждом запросе сверяется с config/thinking.local.json — если
+    # он настоящий, тестовый сервер ушёл бы в живой Colab через туннель.
+    # Подменяем путь на пустой файл: тест обязан быть герметичным.
+    saved_local = client_mod.LOCAL_PATH
+    client_mod.LOCAL_PATH = TMP / "no_such_local.json"
     threading.Thread(target=mod.cmd_panel,
                      args=(c, argparse.Namespace(port=port, open=False)),
                      daemon=True).start()
@@ -2704,6 +2709,40 @@ def _capture(fn) -> str:
     return ""
 
 
+def test_colab_defs_before_use() -> None:
+    """Ячейка D: вызов `_start_tunnel()` стоял ВЫШЕ его определения.
+
+    Ошибка поймалась только в Colab — «tunnel error: name '_start_tunnel'
+    is not defined» — и тихо съедалась `except`: туннель не поднимался,
+    а в выводе ячейки была одна строчка. Проверяем статически, что на
+    верхнем уровне ячеек нет вызовов функций, определённых ниже.
+    """
+    import ast as _ast
+
+    bad: list[str] = []
+    for cell in ("cell_a_setup.py", "cell_c_server.py", "cell_d_launch.py",
+                 "cell_e_background.py", "cell_f_stop.py"):
+        src = (ROOT / "thinking" / "colab" / cell).read_text(encoding="utf-8")
+        src_py = "\n".join(ln for ln in src.splitlines()
+                           if not ln.startswith("%%"))
+        tree = _ast.parse(src_py)
+        defined = {node.name: node.lineno for node in tree.body
+                   if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                                       _ast.ClassDef))}
+        for node in tree.body:
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                                 _ast.ClassDef)):
+                continue          # внутри функции порядок не важен
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Call) and isinstance(sub.func, _ast.Name):
+                    name = sub.func.id
+                    if name in defined and sub.lineno < defined[name]:
+                        bad.append(f"{cell}:{sub.lineno} вызывает {name} "
+                                   f"(определено в строке {defined[name]})")
+    check(not bad, f"ячейки: функция не вызывается до своего определения "
+                   f"({bad[:4]})")
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2734,6 +2773,7 @@ def main() -> int:
     test_journals_redacted_on_disk()
     test_panel_http_layer()
     test_breaker_and_rotation()
+    test_colab_defs_before_use()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

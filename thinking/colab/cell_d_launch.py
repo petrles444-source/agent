@@ -141,6 +141,220 @@ def _avail_gb() -> float:
     return 0.0
 
 
+
+
+def _alive(url_: str) -> bool:
+    """Жив ли API. 401/429 — жив, но не пускает/перегружен: перезапуск тут
+    не поможет и только убьёт здоровый процесс (аудит B, 03-colab)."""
+    try:
+        code = requests.get(url_.rstrip("/") + "/health",
+                            headers={"X-Agent-Token": TOKEN},
+                            timeout=6).status_code
+    except Exception:
+        return False
+    return code == 200 or code in (401, 429)
+
+
+def _tunnel_alive(url_: str) -> bool:
+    """Доступен ли туннель снаружи.
+
+    Сторож проверял только локальный /health: убитый cloudflared выглядел
+    «всё хорошо», а снаружи туннель молча отдавал 530 — и это не
+    детектировалось вообще (аудит B, 03-colab).
+    """
+    if not url_:
+        return False
+    try:
+        return requests.get(url_.rstrip("/") + "/health",
+                            headers={"X-Agent-Token": TOKEN},
+                            timeout=6).status_code == 200
+    except Exception:
+        return False
+
+
+def _ensure_cloudflared() -> bool:
+    """Есть ли рабочий cloudflared; если нет — скачиваем."""
+    binp = "/usr/local/bin/cloudflared"
+    try:
+        if os.path.exists(binp):
+            out = subprocess.run([binp, "--version"], capture_output=True,
+                                 timeout=30).stdout.decode("utf-8", "replace")
+            if "cloudflared" in out:
+                return True
+    except Exception:
+        pass
+    try:
+        subprocess.run(["wget", "-q",
+                        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+                        "-O", binp], check=True, timeout=300)
+        os.chmod(binp, 0o755)
+        return True
+    except Exception as exc:
+        print("cloudflared не скачался:", type(exc).__name__, str(exc)[:200])
+        return False
+
+
+def _dump_tunnel_log() -> None:
+    """Показываем, ПОЧЕМУ туннель не поднялся: иначе в выводе ячейки пусто."""
+    print(time.strftime("%H:%M:%S"), "туннель не поднялся, последние строки лога:")
+    try:
+        for line in open("/content/tunnel.log", encoding="utf-8",
+                         errors="replace").readlines()[-30:]:
+            print("   |", line.rstrip())
+    except OSError as exc:
+        print("   | лог недоступен:", exc)
+    print("Частые quick-туннели с одного адреса Cloudflare режет: подожди "
+          "5-15 минут и запусти ячейку D заново. Надёжнее — задать "
+          "CLOUDFLARE_TUNNEL_TOKEN (постоянный адрес).")
+
+
+def _start_tunnel() -> str:
+    """Поднимает быстрый cloudflared и возвращает публичный URL (или "").
+
+    Вынесено из основного потока: сторож обязан уметь перезапускать туннель
+    сам, иначе мёртвый cloudflared не замечали до перезапуска ноутбука.
+
+    Два важных отличия от прежней версии:
+    * лог ЧИСТИМ на каждую попытку — раньше он дописывался, и если адрес
+      прошлого запуска уже лежал в файле, неудачный старт возвращал мёртвый
+      адрес (и сторож затем бесконечно «поднимал» тот же туннель);
+    * при провале печатаем хвост лога и подсказку — раньше в выводе ячейки
+      было пусто, и причину приходилось угадывать.
+    """
+    log = "/content/tunnel.log"
+    if not _ensure_cloudflared():
+        return ""
+    for proto in ("http2", "quic"):
+        open(log, "w", encoding="utf-8").close()      # лог только этой попытки
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(f"--- попытка, протокол {proto}, "
+                     f"{time.strftime('%H:%M:%S')}\n")
+        # --protocol http2: quick-туннель по умолчанию ходит по QUIC/UDP, а на
+        # Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted 7168 kiB,
+        # got 416 kiB») — SSE-потоки посреди передачи замирали, done не доходил.
+        # HTTP/2 идёт по TCP и этих потерь не видит.
+        # --edge-ip-version 4: на части рантаймов IPv6 до edge Cloudflare не
+        # поднимается, и туннель молча не стартует.
+        try:
+            with open(log, "a", encoding="utf-8") as fh:
+                proc = subprocess.Popen(
+                    ["cloudflared", "tunnel", "--no-autoupdate",
+                     "--protocol", proto, "--edge-ip-version", "4",
+                     "--url", "http://localhost:8000"],
+                    stdout=fh, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+        except Exception as exc:
+            print("cloudflared не запустился:", type(exc).__name__, str(exc)[:200])
+            continue
+        for _ in range(30):
+            try:
+                txt = open(log, encoding="utf-8", errors="replace").read()
+            except OSError:
+                txt = ""
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", txt)
+            if m:
+                print(time.strftime("%H:%M:%S"), "туннель:", m.group(0),
+                      f"({proto})")
+                return m.group(0)
+            if proc.poll() is not None:
+                break               # cloudflared умер — пробуем другой протокол
+            time.sleep(2)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _dump_tunnel_log()
+    return ""
+
+
+def _restart_extra() -> None:
+    """Поднимает умершие параллельные движки (llm2, llm3…).
+
+    Иначе /ask/multi молча отвечает меньшим числом моделей, чем просили, и
+    ни панель, ни клиент этого не показывают (аудит C-5). Команды
+    собираем заново из манифеста — там путь, порт и ключ процесса.
+    """
+    try:
+        with open(PARALLEL_FILE, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except Exception:
+        return                      # параллельные модели не запускались
+    if not isinstance(manifest, list):
+        return
+    for idx, item in enumerate(manifest, start=2):
+        if not isinstance(item, dict) or not str(item.get("path") or ""):
+            continue
+        key = str(item.get("key") or f"llm{idx}")
+        proc = PROCS.get(key)
+        if proc is not None and proc.poll() is None:
+            continue
+        cmd = list(llm_cmd)
+        cmd[cmd.index("--model") + 1] = str(item["path"])
+        cmd[cmd.index("--port") + 1] = str(item.get("port") or (8000 + idx))
+        cmd[cmd.index("--model_alias") + 1] = f"thinking{idx}"
+        try:
+            with open(LOG_LLM, "a", encoding="utf-8") as fh:
+                PROCS[key] = subprocess.Popen(cmd, stdout=fh,
+                                              stderr=subprocess.STDOUT)
+            print(time.strftime("%H:%M:%S"),
+                  f"{key} ({item.get('label') or item['path']}) поднимаю заново")
+        except Exception as exc:
+            print(time.strftime("%H:%M:%S"),
+                  f"{key}: не поднялся: {type(exc).__name__} {exc}")
+
+
+def _port_free(port: int) -> bool:
+    import socket as _socket
+    with _socket.socket() as s:
+        s.settimeout(1)
+        return s.connect_ex(("127.0.0.1", port)) != 0
+
+
+def _restart_api() -> None:
+    """Перезапускает API, сначала убив прежний процесс.
+
+    Раньше просто Popen: зависший, но живой uvicorn держит :8000, новый
+    падает с bind-ошибкой, а печать «API перезапущен» врёт — и цикл
+    повторялся каждые 3 минуты бесконечно (аудит B, 03-colab, AUD-10
+    закрыт был только для LLM).
+    """
+    old = PROCS.get("api")
+    if old is not None and old.poll() is None:
+        print(time.strftime("%H:%M:%S"), "api: убиваю прежний процесс",
+              old.pid)
+        try:
+            old.terminate()
+            old.wait(timeout=10)
+        except Exception:
+            try:
+                old.kill()
+                old.wait(timeout=5)
+            except Exception:
+                pass
+        # порт мог остаться в TIME_WAIT — ждём освобождения
+        for _ in range(20):
+            if _port_free(8000):
+                break
+            time.sleep(1)
+    with open(LOG_API, "a", encoding="utf-8") as _fh:
+        proc = subprocess.Popen(api_cmd, cwd="/content",
+                                stdout=_fh, stderr=subprocess.STDOUT)
+    PROCS["api"] = proc
+    time.sleep(3)
+    if proc.poll() is not None:
+        # не выдаём успех, которого нет: новый процесс уже умер
+        print(time.strftime("%H:%M:%S"),
+              "API не поднялся, последние строки лога:")
+        try:
+            for line in open(LOG_API, encoding="utf-8",
+                             errors="replace").readlines()[-20:]:
+                print("   |", line.rstrip())
+        except OSError:
+            pass
+        return
+    print(time.strftime("%H:%M:%S"), "API перезапущен", proc.pid)
+
+
 # ---- 2) LLM backend на :8001 ----------------------------------------------
 # Контекст 4096 на CPU (быстрее считать) и 8192 на GPU — качество не страдает.
 GPU = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
@@ -443,158 +657,8 @@ print("=" * 72)
 import threading                                          # noqa: E402
 
 
-def _alive(url_: str) -> bool:
-    """Жив ли API. 401/429 — жив, но не пускает/перегружен: перезапуск тут
-    не поможет и только убьёт здоровый процесс (аудит B, 03-colab)."""
-    try:
-        code = requests.get(url_.rstrip("/") + "/health",
-                            headers={"X-Agent-Token": TOKEN},
-                            timeout=6).status_code
-    except Exception:
-        return False
-    return code == 200 or code in (401, 429)
-
-
-def _tunnel_alive(url_: str) -> bool:
-    """Доступен ли туннель снаружи.
-
-    Сторож проверял только локальный /health: убитый cloudflared выглядел
-    «всё хорошо», а снаружи туннель молча отдавал 530 — и это не
-    детектировалось вообще (аудит B, 03-colab).
-    """
-    if not url_:
-        return False
-    try:
-        return requests.get(url_.rstrip("/") + "/health",
-                            headers={"X-Agent-Token": TOKEN},
-                            timeout=6).status_code == 200
-    except Exception:
-        return False
-
-
-def _start_tunnel() -> str:
-    """Поднимает быстрый cloudflared и возвращает публичный URL (или "").
-
-    Вынесено из основного потока: сторож обязан уметь перезапускать туннель
-    сам, иначе мёртвый cloudflared не замечали до перезапуска ноутбука.
-    """
-    try:
-        if not os.path.exists("/usr/local/bin/cloudflared"):
-            subprocess.run(["wget", "-q",
-                            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-                            "-O", "/usr/local/bin/cloudflared"], check=True)
-            os.chmod("/usr/local/bin/cloudflared", 0o755)
-        # --protocol http2: quick-туннель по умолчанию ходит по QUIC/UDP, а на
-        # Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted 7168 kiB,
-        # got 416 kiB») — SSE-потоки посреди передачи замирали, done не доходил.
-        # HTTP/2 идёт по TCP и этих потерь не видит.
-        with open("/content/tunnel.log", "a", encoding="utf-8") as _fh:
-            subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate",
-                              "--protocol", "http2",
-                              "--url", "http://localhost:8000"],
-                             stdout=_fh, stderr=subprocess.STDOUT,
-                             start_new_session=True)
-        for _ in range(40):
-            txt = open("/content/tunnel.log", encoding="utf-8",
-                       errors="replace").read()
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", txt)
-            if m:
-                return m.group(0)
-            time.sleep(2)
-    except Exception as exc:
-        print("tunnel error:", exc)
-    return ""
-
-
-def _restart_extra() -> None:
-    """Поднимает умершие параллельные движки (llm2, llm3…).
-
-    Иначе /ask/multi молча отвечает меньшим числом моделей, чем просили, и
-    ни панель, ни клиент этого не показывают (аудит C-5). Команды
-    собираем заново из манифеста — там путь, порт и ключ процесса.
-    """
-    try:
-        with open(PARALLEL_FILE, encoding="utf-8") as fh:
-            manifest = json.load(fh)
-    except Exception:
-        return                      # параллельные модели не запускались
-    if not isinstance(manifest, list):
-        return
-    for idx, item in enumerate(manifest, start=2):
-        if not isinstance(item, dict) or not str(item.get("path") or ""):
-            continue
-        key = str(item.get("key") or f"llm{idx}")
-        proc = PROCS.get(key)
-        if proc is not None and proc.poll() is None:
-            continue
-        cmd = list(llm_cmd)
-        cmd[cmd.index("--model") + 1] = str(item["path"])
-        cmd[cmd.index("--port") + 1] = str(item.get("port") or (8000 + idx))
-        cmd[cmd.index("--model_alias") + 1] = f"thinking{idx}"
-        try:
-            with open(LOG_LLM, "a", encoding="utf-8") as fh:
-                PROCS[key] = subprocess.Popen(cmd, stdout=fh,
-                                              stderr=subprocess.STDOUT)
-            print(time.strftime("%H:%M:%S"),
-                  f"{key} ({item.get('label') or item['path']}) поднимаю заново")
-        except Exception as exc:
-            print(time.strftime("%H:%M:%S"),
-                  f"{key}: не поднялся: {type(exc).__name__} {exc}")
-
-
-def _port_free(port: int) -> bool:
-    import socket as _socket
-    with _socket.socket() as s:
-        s.settimeout(1)
-        return s.connect_ex(("127.0.0.1", port)) != 0
-
-
-def _restart_api() -> None:
-    """Перезапускает API, сначала убив прежний процесс.
-
-    Раньше просто Popen: зависший, но живой uvicorn держит :8000, новый
-    падает с bind-ошибкой, а печать «API перезапущен» врёт — и цикл
-    повторялся каждые 3 минуты бесконечно (аудит B, 03-colab, AUD-10
-    закрыт был только для LLM).
-    """
-    old = PROCS.get("api")
-    if old is not None and old.poll() is None:
-        print(time.strftime("%H:%M:%S"), "api: убиваю прежний процесс",
-              old.pid)
-        try:
-            old.terminate()
-            old.wait(timeout=10)
-        except Exception:
-            try:
-                old.kill()
-                old.wait(timeout=5)
-            except Exception:
-                pass
-        # порт мог остаться в TIME_WAIT — ждём освобождения
-        for _ in range(20):
-            if _port_free(8000):
-                break
-            time.sleep(1)
-    with open(LOG_API, "a", encoding="utf-8") as _fh:
-        proc = subprocess.Popen(api_cmd, cwd="/content",
-                                stdout=_fh, stderr=subprocess.STDOUT)
-    PROCS["api"] = proc
-    time.sleep(3)
-    if proc.poll() is not None:
-        # не выдаём успех, которого нет: новый процесс уже умер
-        print(time.strftime("%H:%M:%S"),
-              "API не поднялся, последние строки лога:")
-        try:
-            for line in open(LOG_API, encoding="utf-8",
-                             errors="replace").readlines()[-20:]:
-                print("   |", line.rstrip())
-        except OSError:
-            pass
-        return
-    print(time.strftime("%H:%M:%S"), "API перезапущен", proc.pid)
-
-
 def _watch() -> None:
+    global url
     api_fail = llm_fail = 0
     while True:
         time.sleep(60)
@@ -608,7 +672,17 @@ def _watch() -> None:
                 # туннель считался здоровым до перезапуска ноутбука (аудит B)
                 print(time.strftime("%H:%M:%S"),
                       "туннель недоступен снаружи — перезапускаю cloudflared")
-                _start_tunnel()
+                new_url = _start_tunnel()
+                if new_url:
+                    # адрес сменился: записываем его, иначе ПК продолжит ходить
+                    # в мёртвый, а ячейка 7/7 покажет старый
+                    url = new_url
+                    _remember(url, TOKEN)
+                    print("=" * 72)
+                    print("НОВЫЙ THINKING_URL=", url)
+                    print("на ПК:  python tools/thinking_cli.py set-url",
+                          url, TOKEN)
+                    print("=" * 72)
                 api_fail = llm_fail = 0
                 continue
             api_fail += 1
