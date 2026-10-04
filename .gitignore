@@ -11,6 +11,10 @@ thinking_url.txt
 # === Локальная история (переписка, события, отчёты) — только на ПК ===
 logs/
 
+# === Личный ноутбук Colab: внутри зафиксирован токен доступа ===
+colab/thinking_agent_personal.ipynb
+*personal*.ipynb
+
 # === Артефакты Python ===
 __pycache__/
 *.py[cod]

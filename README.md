@@ -414,6 +414,27 @@ python tools/thinking_cli.py panel                        # http://127.0.0.1:876
 python scripts/build_colab.py --name thinking_agent_ver3.ipynb --ver ver3
 ```
 
+**Личный ноутбук (рекомендуется).** Обычный ноутбук генерирует на Colab
+**новый токен при каждом запуске**, поэтому после перезапуска Colab связь
+падает с 401, пока токен не перенесён вручную. Личный ноутбук решает это
+раз и навсегда — токен фиксируется внутри:
+
+```bash
+python scripts/build_colab.py --personal
+```
+
+Команда берёт токен из `config/thinking.local.json` (создаёт, если его нет) и
+пишет `colab/thinking_agent_personal.ipynb`. **Этот файл в git не попадает**
+(в `.gitignore`): внутри токен доступа. Обычный ноутбук из репозитория
+токена не содержит вовсе — это проверяет тест.
+
+С личным ноутбуком после перезапуска Colab меняется только адрес туннеля,
+а на ПК достаточно одной команды без токена:
+
+```bash
+python tools/thinking_cli.py set-url "https://…trycloudflare.com"   # токен подставится сам
+```
+
 Дальше в браузере:
 
 1. Открыть <https://colab.research.google.com> → **Upload notebook** → выбрать

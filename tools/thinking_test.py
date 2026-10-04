@@ -2795,6 +2795,55 @@ def test_tunnel_failure_is_visible() -> None:
           "ноутбук: пересобран с ячейкой 7/7, которая объясняет провал")
 
 
+def test_personal_notebook_not_committed() -> None:
+    """Токен доступа к Colab не должен попадать в репозиторий.
+
+    Личный ноутбук содержит зафиксированный токен — из-за этого Colab больше
+    не генерирует новый при каждом запуске и на ПК не нужно вводить токен
+    руками. Значит, такой ноутбук обязан остаться в `.gitignore`, а обычный
+    (репозиторный) — не содержать токена вообще.
+    """
+    import subprocess                                   # noqa: PLC0415
+
+    cfg_path = ROOT / "config" / "thinking.local.json"
+    token = ""
+    if cfg_path.exists():
+        token = str(json.loads(cfg_path.read_text(encoding="utf-8"))
+                    .get("token") or "")
+    nb = ROOT / "colab" / "thinking_agent_ver3.ipynb"
+    if token and nb.exists():
+        check(token not in nb.read_text(encoding="utf-8"),
+              "ноутбук из репозитория НЕ содержит локальный токен")
+    b = (ROOT / "scripts" / "build_colab.py").read_text(encoding="utf-8")
+    check('add_argument("--personal"' in b and "def _personal_token()" in b,
+          "сборка: есть режим личного ноутбука с зафиксированным токеном")
+    rc = subprocess.run(["git", "check-ignore", "-q",
+                         "colab/thinking_agent_personal.ipynb"],
+                        cwd=str(ROOT), capture_output=True).returncode
+    check(rc == 0, "git: личный ноутбук с токеном не коммитится")
+
+
+def test_set_url_keeps_token() -> None:
+    """Токен зафиксирован в ноутбуке — при смене адреса вводить его не нужно."""
+    import thinking.client as _cm
+
+    saved = _cm.LOCAL_PATH
+    tmp = TMP / "keep_token.json"
+    _cm.LOCAL_PATH = tmp
+    try:
+        _cm.ThinkingClient.set_url("http://127.0.0.1:1", "секрет-один")
+        _cm.ThinkingClient.set_url("http://127.0.0.1:2")
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        check(data["token"] == "секрет-один",
+              "set-url без токена сохраняет прежний")
+        check(data["base_url"] == "http://127.0.0.1:2"
+              and data.get("prev", {}).get("base_url") == "http://127.0.0.1:1",
+              "set-url без токена всё равно запоминает предыдущий адрес")
+    finally:
+        _cm.LOCAL_PATH = saved
+        tmp.unlink(missing_ok=True)
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2827,6 +2876,8 @@ def main() -> int:
     test_breaker_and_rotation()
     test_colab_defs_before_use()
     test_tunnel_failure_is_visible()
+    test_personal_notebook_not_committed()
+    test_set_url_keeps_token()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import secrets
 import sys
 import time
 import urllib.request
@@ -28,6 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 CELLS_DIR = ROOT / "thinking" / "colab"
 ZIP_PATH = ROOT / "_thinking_colab.zip"
 IPYNB_PATH = ROOT / "colab" / "thinking_colab.ipynb"
+# Личный ноутбук: в нём токен зафиксирован, поэтому в git он не попадает
+# (иначе публичный репозиторий раздавал бы доступ к модели).
+PERSONAL_NB_NAME = "thinking_agent_personal.ipynb"
+LOCAL_CFG = ROOT / "config" / "thinking.local.json"
 
 CELL_FILES = [
     "cell_a_setup.py",
@@ -269,7 +274,8 @@ python tools/thinking_cli.py panel                     # открыть пане
 """
 
 
-def make_notebook(url: str, inline: bool = True, ver: str = "") -> dict:
+def make_notebook(url: str, inline: bool = True, ver: str = "",
+                 token: str = "") -> dict:
     """Самодостаточный ноутбук (код внутри, ссылки не нужны) либо zip-вариант."""
     row1 = ("| — | этот ноутбук самодостаточен: весь код внутри | — |"
             if inline else
@@ -318,7 +324,9 @@ def make_notebook(url: str, inline: bool = True, ver: str = "") -> dict:
                              "print('записан /content/thinking_server.py:', len(src.read_text(encoding='utf-8').splitlines()), 'строк')"),
             _nb_cell("code", "#@title 4/7 · Ячейка D — LLM + API + туннель + сторож\n"
                              "import os, runpy\n"
-                             "os.environ.setdefault('THINKING_TOKEN', '')   # впишите токен, чтобы адрес не менялся\n"
+                             "os.environ.setdefault('THINKING_TOKEN', "
+                             + (repr(token) if token else "''")
+                             + ")   # токен зафиксирован: адрес меняется, доступ — нет\n"
                              "runpy.run_path('/content/tc/cell_d_launch.py', run_name='__main__')"),
             _nb_cell("code", "#@title 5/7 · Ячейка E — фон (снапшот + keep-alive)\n"
                              "import runpy; runpy.run_path('/content/tc/cell_e_background.py', run_name='__main__')"),
@@ -377,16 +385,37 @@ def _wrap(cells: list[dict], name: str = "thinking_colab.ipynb") -> dict:
 
 
 def write_notebook(url: str, inline: bool = True, name: str = "",
-                   ver: str = "") -> Path:
+                   ver: str = "", token: str = "") -> Path:
     nb_name = name or (IPYNB_PATH.name if inline
                        else "thinking_colab_zip.ipynb")
     target = IPYNB_PATH.with_name(nb_name)
     target.parent.mkdir(parents=True, exist_ok=True)
-    nb = make_notebook(url, inline=inline, ver=ver)
+    nb = make_notebook(url, inline=inline, ver=ver, token=token)
     nb = _retitle(nb, nb_name)
     target.write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding="utf-8")
     say(f"  ноутбук: {target}")
     return target
+
+
+def _personal_token() -> str:
+    """Токен для личного ноутбука: берём из локального конфига, иначе создаём.
+
+    Токен живёт только в config/thinking.local.json (в git его нет) и
+    вшивается в ЛИЧНЫЙ ноутбук, который тоже не коммитится. Из-за этого
+    перезапуск Colab больше не ломает доступ: адрес меняется, токен — нет,
+    и на ПК не нужно ничего вводить руками.
+    """
+    cfg = json.loads(LOCAL_CFG.read_text(encoding="utf-8")) \
+        if LOCAL_CFG.exists() else {}
+    token = str(cfg.get("token") or "").strip()
+    if not token:
+        token = secrets.token_urlsafe(24)
+        cfg["token"] = token
+        LOCAL_CFG.parent.mkdir(parents=True, exist_ok=True)
+        LOCAL_CFG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        say(f"  создан новый токен в {LOCAL_CFG.name} (в git его нет)")
+    return token
 
 
 def _retitle(nb: dict, name: str) -> dict:
@@ -407,8 +436,17 @@ def main(argv: list[str] | None = None) -> int:
                     help="имя выходного ноутбука (по умолчанию thinking_colab.ipynb)")
     ap.add_argument("--ver", default="",
                     help="подпись версии в заголовке, например ver3")
+    ap.add_argument("--personal", action="store_true",
+                    help="личный ноутбук с ЗАФИКСИРОВАННЫМ токеном: адрес "
+                         "туннеля меняется при каждом запуске, а доступ — нет, "
+                         "и на ПК больше не нужно вводить токен руками. "
+                         "Такой ноутбук НЕ коммитится (в нём токен)")
     args = ap.parse_args(argv)
     inline = not args.zip
+    name, token = args.name, ""
+    if args.personal:
+        token = _personal_token()
+        name = args.name or PERSONAL_NB_NAME
 
     say("[1/3] собираю zip с исходниками ячеек (уходит в архив проекта)…")
     data = build_zip()
@@ -427,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
 
     say("[3/3] генерирую ноутбук…")
     nb_path = write_notebook(url or "ВСТАВЬТЕ_СЮДА_ССЫЛКУ_НА_ZIP", inline=inline,
-                             name=args.name, ver=args.ver)
+                             name=name, ver=args.ver, token=token)
 
     say("")
     say("Чек-лист:")
@@ -435,9 +473,19 @@ def main(argv: list[str] | None = None) -> int:
     say(f"     → выбрать {nb_path.name}")
     say("  2) Runtime → Change runtime type → T4 GPU (можно и CPU)")
     say("  3) Runtime → Run all")
-    say("  4) из вывода ячейки 4 скопировать THINKING_URL / THINKING_TOKEN")
-    say("  5) на ПК:  python tools/thinking_cli.py set-url <URL> <TOKEN>")
-    say("             python tools/thinking_cli.py doctor")
+    if token:
+        say("  4) из вывода ячейки 7/7 скопировать ТОЛЬКО адрес "
+            "(строка «АДРЕС ТУННЕЛЯ»)")
+        say("  5) на ПК выполнить одну команду с этим адресом — токен уже "
+            "зафиксирован в ноутбуке и в конфиге ПК:")
+        say("             python tools/thinking_cli.py set-url <АДРЕС>")
+        say("             python tools/thinking_cli.py doctor")
+        say("  ВНИМАНИЕ: этот ноутбук содержит токен — не выкладывайте его "
+            "в открытый репозиторий.")
+    else:
+        say("  4) из вывода ячейки 4 скопировать THINKING_URL / THINKING_TOKEN")
+        say("  5) на ПК:  python tools/thinking_cli.py set-url <URL> <TOKEN>")
+        say("             python tools/thinking_cli.py doctor")
     if url and not inline:
         say(f"  Ссылка на zip действует ~60 минут: {url}")
     if inline:
