@@ -803,6 +803,39 @@ def test_budget_matches_running_model() -> None:
           "ячейка D: большая модель ждёт подъёма дольше (17 ГБ не успевает за 90 с)")
 
 
+def test_failure_diagnostics() -> None:
+    """Причину отказа модели видно по коду возврата, а отказ от остановки
+    в ячейке F не выглядит аварией.
+
+    Найдено на живом прогоне 04.10: лог модели был ПУСТ (только строка команды),
+    поэтому пришлось гадать — память или архитектура. Код возврата отвечает
+    однозначно: -9 это OOM-киллер, -11 это segfault (старый llama.cpp без Qwen3).
+    """
+    launch = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    check("rc = llm_proc.poll()" in launch,
+          "ячейка D: при отказе модели читается код возврата процесса")
+    check("ПРОЦЕСС УБИТ" in launch and "-9" in launch and "-11" in launch,
+          "ячейка D: по сигналу различается нехватка памяти и segfault")
+    check("OOM-киллер" in launch, "ячейка D: сигнал -9 объясняется как нехватка памяти")
+    check("segfault" in launch and "архитектуру" in launch,
+          "ячейка D: segfault объясняется неизвестной архитектурой модели")
+    check("версию определить не удалось" in
+          (ROOT / "thinking" / "colab" / "cell_a_setup.py").read_text(encoding="utf-8"),
+          "ячейка A: печатает версию движка (от неё зависит поддержка Qwen3)")
+
+    # SystemExit внутри ячейки Colab IPython принимает за просьбу выключить ядро:
+    # «Run all» печатал «An exception has occurred» и «To exit; use 'exit'».
+    stop = (ROOT / "thinking" / "colab" / "cell_f_stop.py").read_text(encoding="utf-8")
+    # ловим именно вызов, а не упоминание в комментарии (о нём там написано
+    # намеренно — чтобы было видно, что было и почему убрали)
+    check("raise SystemExit" not in stop and "sys.exit(" not in stop,
+          "ячейка F: отказ от остановки не выходит через SystemExit")
+    check("return" in stop and "def stop()" in stop,
+          "ячейка F: отказ — обычный return внутри функции")
+    check("THINKING_STOP" in stop,
+          "ячейка F: остановка по-прежнему требует явного разрешения")
+
+
 def test_instructions_present() -> None:
     """Инструкция «как поднять» есть в ноутбуке, README и быстром старте.
 
@@ -1406,6 +1439,7 @@ def main() -> int:
     test_dev_reports()
     test_chat_author()
     test_budget_matches_running_model()
+    test_failure_diagnostics()
     test_instructions_present()
     test_dev_layout_vertical()
     test_dev_run_stdin()
