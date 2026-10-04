@@ -2871,6 +2871,41 @@ def test_set_url_keeps_token() -> None:
         tmp.unlink(missing_ok=True)
 
 
+def test_token_batches() -> None:
+    """Токены склеиваются в пачки — так их проносит прокси (живой замер 05.10).
+
+    Сервер отдавал 917 мелких SSE-кадров за шесть планов, а клиент видел
+    первые ~30 символов: поток из сотен мелких кадров прокси буферизует.
+    Проверяем поведение функции, вырезанной из ячейки: ничего не теряется,
+    кадры крупные, но поток не копится целиком до конца генерации.
+    """
+    import ast as _ast
+    import asyncio                                     # noqa: PLC0415
+
+    src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    src_py = "\n".join(ln for ln in src.splitlines() if not ln.startswith("%%"))
+    tree = _ast.parse(src_py)
+    keep = [n for n in tree.body
+            if isinstance(n, _ast.AsyncFunctionDef) and n.name == "_token_batches"]
+    ns: dict = {"time": time}
+    exec(compile(_ast.Module(body=keep, type_ignores=[]), "<cell_c>", "exec"), ns)
+
+    async def _src():
+        for _ in range(30):
+            yield "a" * 10
+
+    async def _run():
+        return [chunk async for chunk in ns["_token_batches"](
+            _src(), min_chars=48, max_wait=0.5)]
+
+    out = asyncio.run(_run())
+    check("".join(out) == "a" * 300, "сервер: склейка токенов ничего не теряет")
+    check(len(out) < 30,
+          f"сервер: токены склеены в пачки ({len(out)} кадров вместо 30)")
+    check(all(len(c) >= 48 for c in out[:-1]),
+          "сервер: пачка держит размер, а не копится до конца генерации")
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2905,6 +2940,7 @@ def main() -> int:
     test_tunnel_failure_is_visible()
     test_personal_notebook_not_committed()
     test_set_url_keeps_token()
+    test_token_batches()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

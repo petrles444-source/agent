@@ -566,6 +566,30 @@ async def chat_json_usage(system: str, user: str,
     return data["choices"][0]["message"]["content"], (usage if isinstance(usage, dict) else {})
 
 
+async def _token_batches(src, min_chars: int = 48, max_wait: float = 0.5):
+    """Склеивает токены в пачки — так они доходят через туннель.
+
+    Живой замер 05.10: сервер отдал 917 SSE-сообщений и шесть планов, а
+    клиент увидел первые ~30 символов и умер по таймауту чтения. Прокси
+    буферизует поток из сотен мелких кадров; крупные кадры проходят
+    заметно лучше. Пачка по ~48 символов или раз в 0,5 с — компромисс
+    между задержкой первого символа (она и так большая на CPU) и размером
+    кадра, который умеет пронести прокси.
+    """
+    pending: list[str] = []
+    size = 0
+    t_last = time.monotonic()
+    async for piece in src:
+        pending.append(piece)
+        size += len(piece)
+        now = time.monotonic()
+        if size >= min_chars or (now - t_last) >= max_wait:
+            yield "".join(pending)
+            pending, size, t_last = [], 0, now
+    if pending:
+        yield "".join(pending)
+
+
 async def with_heartbeat(src, gap: float = 15.0):
     """Отдаёт SSE-комментарии, пока модель молчит.
 
@@ -1020,9 +1044,10 @@ async def plan_stream(req: PlanRequest, x_agent_token: str = Header(default=""),
         buf: list[str] = []
         try:
             async with sem_slot():
-                async for piece in chat_stream(SYSTEM_PLAN, build_plan_prompt(req)):
-                    buf.append(piece)
-                    yield f"data: {json.dumps({'type': 'token', 'text': piece}, ensure_ascii=False)}\n\n"
+                async for chunk in _token_batches(chat_stream(SYSTEM_PLAN,
+                                                         build_plan_prompt(req))):
+                    buf.append(chunk)
+                    yield f"data: {json.dumps({'type': 'token', 'text': chunk}, ensure_ascii=False)}\n\n"
             data = await plan_data("".join(buf), req.task)
             p = Plan(**data)
             _store(p)
@@ -1143,11 +1168,11 @@ async def reflect_stream(req: ReflectRequest, x_agent_token: str = Header(defaul
         buf: list[str] = []
         try:
             async with sem_slot():
-                async for piece in chat_stream(SYSTEM_REFLECT,
-                                               _reflect_user(req, plan_json),
-                                               min(500, _ctx_limit())):
-                    buf.append(piece)
-                    yield ("data: " + json.dumps({"type": "token", "text": piece},
+                async for chunk in _token_batches(chat_stream(SYSTEM_REFLECT,
+                                                             _reflect_user(req, plan_json),
+                                                             min(500, _ctx_limit()))):
+                    buf.append(chunk)
+                    yield ("data: " + json.dumps({"type": "token", "text": chunk},
                                                  ensure_ascii=False) + "\n\n")
             out = await reflect_payload(req, "".join(buf))
             S.stats["reflects"] += 1
@@ -1520,10 +1545,10 @@ async def chat_stream_ep(req: ChatRequest, x_agent_token: str = Header(default="
         buf: list[str] = []
         try:
             async with sem_slot():
-                async for piece in chat_stream(SYSTEM_CHAT,
-                                               build_chat_prompt(req), max_tokens):
-                    buf.append(piece)
-                    yield ("data: " + json.dumps({"type": "token", "text": piece},
+                async for chunk in _token_batches(chat_stream(SYSTEM_CHAT,
+                                                         build_chat_prompt(req), max_tokens)):
+                    buf.append(chunk)
+                    yield ("data: " + json.dumps({"type": "token", "text": chunk},
                                                  ensure_ascii=False) + "\n\n")
             raw = "".join(buf)
             data = await guard_reply(raw)
@@ -1598,10 +1623,10 @@ async def dev_stream(req: DevRequest, x_agent_token: str = Header(default=""),
         buf: list[str] = []
         try:
             async with sem_slot():
-                async for piece in chat_stream(SYSTEM_DEV, build_dev_prompt(req),
-                                               max_tokens):
-                    buf.append(piece)
-                    yield ("data: " + json.dumps({"type": "token", "text": piece},
+                async for chunk in _token_batches(chat_stream(SYSTEM_DEV, build_dev_prompt(req),
+                                                             max_tokens)):
+                    buf.append(chunk)
+                    yield ("data: " + json.dumps({"type": "token", "text": chunk},
                                                  ensure_ascii=False) + "\n\n")
             data = await dev_data("".join(buf))
             yield ("data: " + json.dumps({
