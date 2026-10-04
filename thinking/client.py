@@ -308,6 +308,15 @@ class ThinkingClient:
         self._cb_open_until = 0.0
         self._cb_stream_errors = 0
         self._cb_stream_until = 0.0
+        # Тихий период потока: когда транспорт подряд теряет длинные живые
+        # ответы (живой замер 05.10 на туннеле Cloudflare), поток на пару
+        # минут не пробуют вовсе — иначе на каждый план уходят минуты на
+        # заведомо обрезанные попытки. Сбрасывается сменой (base, token).
+        self._stream_fail_streak = 0
+        self._stream_quiet_until = 0.0
+        # "__нет__" — заведомо не реальный адрес: состояние прочитается при
+        # первом же обращении, уже зная настоящий base.
+        self._stream_state_base = "__нет__"
         self.health_data: dict = {}
 
     # ------------------------------------------------------------------ #
@@ -378,6 +387,9 @@ class ThinkingClient:
         # URL. Ошибки старого адреса к новому отношения не имеют.
         self._cb_errors = self._cb_stream_errors = 0
         self._cb_open_until = self._cb_stream_until = 0.0
+        # Статистику обрывов потока не трогаем: она привязана к адресу и
+        # перечитается сама при первом обращении (свежий туннель начнёт с нуля,
+        # а возврат на прежний вспомнит свои обрывы).
         # Живой SSE держит соединение со СТАРЫМ туннелем: без перезапуска
         # панель получала события с мёртвого адреса, а REST уже ходил на
         # новый — split-brain «REST новый / события старые» (аудит B).
@@ -404,8 +416,89 @@ class ThinkingClient:
         return LOCAL_PATH
 
     # ------------------------------------------------------------------ #
+    #  тихий период потока (живой замер 05.10)
+    # ------------------------------------------------------------------ #
+    def _stream_state_file(self) -> Path:
+        return Path(self.cfg.get("state_path", "logs/thinking/state.json"))
+
+    def _ensure_stream_state(self) -> None:
+        """Держит статистику обрывов потока в актуальном состоянии.
+
+        Состояние лежит в logs/thinking/state.json и привязано к адресу.
+        Читается лениво и перечитывается при смене адреса — так смена туннеля
+        сама подхватывает статистику нового (или чистит её, если свежего
+        адреса ещё не было в файле), а ничего не остаётся в памяти от прежнего.
+
+        Отдельный файл нужен потому, что CLI — процесс на каждый вызов: в
+        памяти счётчик обнулялся бы при каждом запуске, и каждая команда
+        снова платила бы по полторы минуты за заведомо обрезанные попытки.
+        """
+        if self._stream_state_base == self.base:
+            return
+        self._stream_state_base = self.base
+        self._stream_fail_streak = 0
+        self._stream_quiet_until = 0.0
+        data = _read_json(self._stream_state_file())
+        if str(data.get("base") or "") != self.base:
+            return                      # статистика чужого адреса
+        self._stream_fail_streak = max(0, int(data.get("streak") or 0))
+        try:
+            self._stream_quiet_until = float(data.get("quiet_until") or 0.0)
+        except (TypeError, ValueError):
+            self._stream_quiet_until = 0.0
+
+    def _save_stream_state(self) -> None:
+        try:
+            _write_json(self._stream_state_file(),
+                        {"base": self.base,
+                         "streak": self._stream_fail_streak,
+                         "quiet_until": self._stream_quiet_until})
+        except OSError as exc:
+            log.debug("не сохранить состояние потока: %s", exc)
+
+    # ------------------------------------------------------------------ #
     #  транспорт
     # ------------------------------------------------------------------ #
+    def _note_stream(self, exc: Optional[BaseException]) -> None:
+        """Учитывает исход потокового маршрута и утихает после серии обрывов.
+
+        Живой замер 05.10: туннель Cloudflare теряет длинные живые ответы —
+        поток рвётся подряд, а обычный маршрут через тот же туннель
+        отвечает (замер: /plan за 86 с). Без этого счёта на каждый план
+        уходили три попытки по полторы минуты, каждая из которых заведомо
+        обрезается: минуты ожидания впустую перед результатом, который
+        был доступен всё это время.
+
+        Считаются **только таймауты чтения**: именно их оставляет потеря
+        длинного ответа. Ошибка сервера, отсутствие маршрута или незаданный
+        адрес ничего не говорят о том, пронесут ли длинные байты, — за их счёт
+        поток затыкался бы на ровном месте (а с незаданным адресом тишина
+        была бы вечной).
+        """
+        self._ensure_stream_state()
+        if exc is None:
+            self._stream_fail_streak = 0
+            self._stream_quiet_until = 0.0
+            self._save_stream_state()
+            return
+        if not _is_read_timeout(exc):
+            return
+        self._stream_fail_streak += 1
+        need = max(1, int(self.cfg.get("stream_first_streak", 2)))
+        if self._stream_fail_streak >= need:
+            pause = max(60.0, float(self.cfg.get("stream_first_pause", 600)))
+            self._stream_quiet_until = max(self._stream_quiet_until,
+                                           time.time() + pause)
+            log.warning("поток оборвался %d раз(а) подряд — на %.0f с "
+                        "иду сразу обычным маршрутом",
+                        self._stream_fail_streak, pause)
+        self._save_stream_state()
+
+    def stream_quiet(self) -> bool:
+        """Стоит ли сейчас не пробовать поток вовсе (тихий период)."""
+        self._ensure_stream_state()
+        return time.time() < self._stream_quiet_until
+
     def _open(self, method: str, path: str, body: Optional[dict] = None,
               timeout: Optional[float] = None, stream: bool = False):
         if not self.base:
@@ -673,15 +766,18 @@ class ThinkingClient:
         # Поток — основной путь: человек видит мысли по мере генерации.
         # stream_first=false — сразу обычный /reflect (для моделей, которые
         # считают дольше лимита прокси в 120 с).
-        if self.cfg.get("stream_first", True):
+        if (self.cfg.get("stream_first", True)
+                    and not self.stream_quiet()):
             try:
                 out = self._reflect_stream(body)
+                self._note_stream(None)
             except SchemaError:
                 raise
             except Exception as exc:
                 first = exc
                 log.warning("поток рефлексии не прошёл: %s", exc)
                 self.last_error = str(exc)[:200]
+                self._note_stream(exc)
         # К не-потоковому маршруту идём при любой отказе, кроме ошибки самого
         # сервера (404 у старого ноутбука, мусорный JSON — повтор не поможет).
         # Прежний отказ от маршрута на обрыве потока был основан на гипотезе
@@ -837,15 +933,19 @@ class ThinkingClient:
             # Поток — основной путь: человек видит мысли по мере генерации.
             # stream_first=false в конфиге — прямой путь к обычному /plan
             # для тех, у кого модель считает дольше 120 с (524 на не-потоковом).
-            if stream_error is None and self.cfg.get("stream_first", True):
+            if (stream_error is None and self.cfg.get("stream_first", True)
+                    and not self.stream_quiet()):
                 try:
-                    return self.plan_stream(task, **stream_kw), False
+                    plan = self.plan_stream(task, **stream_kw)
+                    self._note_stream(None)
+                    return plan, False
                 except SchemaError:
                     raise  # секреты в задаче — не повод молча уходить в fallback
                 except Exception as exc:
                     log.warning("поток плана не прошёл: %s", exc)
                     self.last_error = str(exc)[:200]
                     stream_error = exc
+                    self._note_stream(exc)
             if stream_error is not None and _is_read_timeout(stream_error):
                 log.warning("поток плана оборван (%s) — пробую обычный /plan: "
                             "короткий ответ туннель проносит целиком", stream_error)
@@ -1532,12 +1632,22 @@ class ThinkingClient:
         if use_memory and mem.get("profile"):
             body["profile"] = str(mem["profile"])[:800]
 
+        if self.stream_quiet():
+            # Тихий период: поток на этом транспорте уже рвался подряд
+            # (живой замер 05.10), и каждая попытка — это минуты ожидания
+            # перед ответом, который /chat отдаёт целиком. Сразу без потока.
+            out = self.chat(text, use_memory=use_memory, max_steps=max_steps,
+                            timeout=timeout, author=author)
+            out["stream_fallback"] = True     # панель покажет «без потока»
+            out["stream_quiet"] = True
+            return out
         try:
             pieces, done = self._stream_read(
                 "/chat/stream", body, on_token=on_token, on_retry=on_retry,
                 label="поток чата")
             if not done:
                 raise ThinkingError("поток чата завершился без ответа")
+            self._note_stream(None)
         except ThinkingError as exc:
             # Запасной транспорт (решение от 03.10): при обрывах «окнами»
             # короткий не-потоковый /chat проходит там, где SSE умирает.
@@ -1552,6 +1662,7 @@ class ThinkingClient:
                               error=f"поток чата не прошёл: {exc}"[:400],
                               author=author)
             log.warning("поток чата не прошёл (%s) — пробую /chat без потока", exc)
+            self._note_stream(exc)
             # author пробрасываем: диалог человека, спасённый фолбэком,
             # иначе уходит в журнал как агентский (аудит B-2)
             out = self.chat(text, use_memory=use_memory, max_steps=max_steps,

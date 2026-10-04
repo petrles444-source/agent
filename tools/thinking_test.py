@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import itertools
 import json
 import re
 import sys
@@ -92,6 +93,9 @@ def _cli_subcommands(mod) -> list[str]:
     return []
 
 
+_CLIENT_SEQ = itertools.count(1)
+
+
 def make_client(**kw) -> ThinkingClient:
     cfg = {
         "log_path": str(TMP / "thoughts.jsonl"),
@@ -102,6 +106,11 @@ def make_client(**kw) -> ThinkingClient:
         # test_chat_memory_tokens стирал пользовательские факты.
         "memory_path": str(TMP / "memory.json"),
         "chat_path": str(TMP / "chat.jsonl"),
+        # Тихий период потока — в TMP и УНИКАЛЬНЫЙ на клиента: по умолчанию
+        # он жил бы в рабочем logs/thinking/state.json, а общий на всех
+        # тестовый файл снова давал бы коллизии — порты заглушек переиспользуются,
+        # и клиент из одного теста утаивал бы поток в другом.
+        "state_path": str(TMP / f"state_{next(_CLIENT_SEQ)}.json"),
         "retry": {"max_attempts": 1, "backoff_base": 1.0},
         "enabled": True,
         "fallback_on_error": True,
@@ -1396,6 +1405,49 @@ def test_mock_llm_stub() -> None:
         p3, fb4 = cn3.plan_with_fallback("без потока вовсе")
         check(fb4 is False and bool(p3.get("steps")),
               "stream_first=false: план получен без единой попытки потока")
+
+        # --- тихий период: после серии обрывов поток не трогаем ------------
+        # Живой замер 05.10: туннель теряет длинные живые ответы, а обычный
+        # маршрут через него отвечает. Три попытки по полторы минуты перед
+        # заведомо доступным результатом — это минуты ожидания впустую.
+        state = TMP / "stream_state.json"
+        cq = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+                         stream_retries=0, stream_first_streak=2,
+                         stream_first_pause=600, state_path=str(state),
+                         log_path=str(TMP / "q_log.jsonl"),
+                         reports_path=str(TMP / "q_rep.jsonl"))
+        cq.base = serve(mode="slow", first_delay=2.5, ping=0)
+        # Считаем попытки потока напрямую: проверка «поток не трогали» по
+        # времени была бы хрупкой — а здесь она точная.
+        tries: list[int] = []
+        real_stream = cq.plan_stream                              # noqa: SLF001
+
+        def counting(*a, **kw):
+            tries.append(1)
+            return real_stream(*a, **kw)
+
+        cq.plan_stream = counting                                 # noqa: SLF001
+        for i in range(2):
+            cq.plan_with_fallback(f"план с обрывом {i}")
+        check(len(tries) == 2, f"тихий период: до утихания было 2 попытки потока "
+                               f"(было {len(tries)})")
+        check(cq.stream_quiet() is True,
+              "тихий период: после 2 обрывов поток утихает")
+        cq.plan_with_fallback("план в тихий период")
+        check(len(tries) == 2,
+              f"тихий период: в тихий период поток не трогают вовсе "
+              f"(попыток {len(tries)})")
+
+        # состояние переживает процесс: CLI — отдельный вызов на каждую команду
+        cq2 = make_client(**fast, state_path=str(state))
+        cq2.base = cq.base
+        check(cq2.stream_quiet() is True,
+              "тихий период переживает перезапуск процесса (читается с диска)")
+        # ... и не переносится на другой адрес: у свежего туннеля своя статистика
+        cq3 = make_client(**fast, state_path=str(state))
+        cq3.base = "http://127.0.0.1:2"
+        check(cq3.stream_quiet() is False,
+              "тихий период не переносится на другой адрес")
     finally:
         for srv in running:
             srv.shutdown()
