@@ -15,6 +15,13 @@
   "panel_poll": 5,
   "plan_timeout": 360,
   "reflect_timeout": 180,
+  "stream_stall": 45,
+  "stream_retries": 2,
+  "chat_json_timeout": 300,
+  "chat_timeout": 600,
+  "dev_timeout": 600,
+  "breaker_pause": 600,
+  "answer_cache_ttl": 1800,
   "log_path": "logs/thinking/thoughts.jsonl",
   "log_max_bytes": 5242880,
   "interactions_path": "logs/thinking/interactions.jsonl",
@@ -22,5 +29,5 @@
   "panel_host": "127.0.0.1",
   "panel_port": 8765,
   "source": "colab",
-  "comment": "Секреты сюда НЕ пишутся: base_url/token берутся из config/thinking.local.json либо из переменных THINKING_URL / THINKING_TOKEN. plan_timeout/reflect_timeout большие из-за CPU-инференса в Colab без GPU-ускорения. stream_timeout обязан быть больше интервала ping сервера (25 с), иначе поток событий рвётся по таймауту."
+  "comment": "Секреты сюда НЕ пишутся: base_url/token берутся из config/thinking.local.json либо из переменных THINKING_URL / THINKING_TOKEN. plan_timeout/reflect_timeout большие из-за CPU-инференса в Colab без GPU-ускорения. stream_timeout обязан быть больше интервала ping сервера (25 с), иначе поток событий рвётся по таймауту. Транспортные лимиты (stream_stall, stream_retries, chat_json_timeout, chat_timeout, dev_timeout, breaker_pause, answer_cache_ttl) вынесены из кода сюда: раньше они были зашиты дефолтами, но выглядели настраиваемыми."
 }

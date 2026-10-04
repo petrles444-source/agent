@@ -277,7 +277,7 @@ class ReflectResponse:
             advice=redact_secrets(str(data.get("advice") or ""))[:800],
             rationale=redact_secrets(str(data.get("rationale") or ""))[:400],
             next_steps=steps,
-            updated_goal_stack=_str_list(data.get("updated_goal_stack"), 12),
+            updated_goal_stack=_redact_list(data.get("updated_goal_stack"), 12),
         )
 
     @classmethod
@@ -361,7 +361,8 @@ class ChatReply:
             else:
                 desc = str(item).strip()
             if desc:
-                steps.append(desc[:400])
+                # шаги ответа тоже могут нести секрет (аудит B)
+                steps.append(_redact(desc, 400))
         try:
             dur = max(0, int(data.get("duration_ms") or 0))
         except (TypeError, ValueError):

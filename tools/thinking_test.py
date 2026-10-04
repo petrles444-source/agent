@@ -74,6 +74,16 @@ def count_lines(path: object) -> int:
         return 0
 
 
+def _cli_subcommands(mod) -> list[str]:
+    """Список подкоманд CLI — прямо из парсера, а не ручным списком в тесте."""
+    import argparse as _ap
+
+    for action in mod.build_parser()._actions:
+        if isinstance(action, _ap._SubParsersAction):
+            return sorted(action.choices)
+    return []
+
+
 def make_client(**kw) -> ThinkingClient:
     cfg = {
         "log_path": str(TMP / "thoughts.jsonl"),
@@ -297,6 +307,11 @@ def test_files() -> None:
         check(label in html, f"панель: подпись «{label}» есть")
     check("Мысли в реальном времени" not in html,
           "панель: старая подпись вкладки убрана")
+    # Вкладка называется «Связь агентов» — вопросы человека из панели в неё
+    # не должны попадать (их место — «Чат с субагентом»)
+    check("function isHumanCall" in html
+          and 'm.author !== "human"' in html,
+          "панель: «Связь агентов» показывает только вызовы агентов")
     check('"/api/state"' in html and 'EventSource("/events")' in html,
           "панель: подключена к /api/state и /events")
     check("СУБАГЕНТ НА СВЯЗИ" in html, "панель: бейдж связи по-русски")
@@ -309,6 +324,19 @@ def test_files() -> None:
           "панель: текст событий вставляется через textContent")
 
     cli = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    readme_text = (ROOT / "README.md").read_text(encoding="utf-8")
+    # Список команд берём из самого парсера, а не пишем руками: ручной список
+    # повторял 9 команд из 14, и дрейф (ask-multi, dump, models, use-model)
+    # никем не ловился (аудит B, 05-secrets-docs)
+    cli_mod = _load_cli_module()
+    sub_choices = _cli_subcommands(cli_mod)
+    check(len(sub_choices) >= 14,
+          f"CLI: парсер объявляет все команды ({len(sub_choices)})")
+    for cmd in sub_choices:
+        check(f"`{cmd}" in readme_text or f"| {cmd} " in readme_text
+              or f"`{cmd}`" in readme_text,
+              f"CLI/README: команда {cmd} описана в README")
+        check(f'"{cmd}"' in cli, f"CLI: команда {cmd} объявлена")
     for cmd in ("doctor", "set-url", "plan", "ask", "reflect", "tail", "panel",
                 "metrics", "reflect-metrics"):
         check(f'"{cmd}"' in cli, f"CLI: команда {cmd} объявлена")
@@ -798,8 +826,9 @@ def test_chat_author() -> None:
     html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
     check('t.author === "agent"' in html and '"агент" : "я"' in html,
           "панель: чат подписывает реплику агента иначе, чем вашу")
-    check("m.author === \"agent\" ? \"агент\" : \"человек\"" in html,
-          "панель: в ленте обращений видна метка человек/агент")
+    check("m.author !== \"human\"" in html
+          and 'el("span", "chip chip-dev", "агент")' in html,
+          "панель: «Связь агентов» показывает только агентские строки")
     # панель объявляет себя человеком
     cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
     check(cli_src.count('author="human"') >= 3,
@@ -2492,6 +2521,40 @@ def test_plan_redacts_all_text_fields() -> None:
           "план: поля не опустели после редактирования")
 
 
+def test_journals_redacted_on_disk() -> None:
+    """Аудит B: три журнала писались без редактирования.
+
+    `thoughts.jsonl` чистился через redact_secrets, а `reports.jsonl`,
+    `interactions.jsonl` и `chat.jsonl` — сырыми: один и тот же объект
+    попадал в журналы по-разному. Проверяем и диск, и память (её отдаёт
+    `/api/state` панели).
+    """
+    secret = "api_key=sk-LEAKED123456"
+    paths = {k: TMP / f"red_{k}.jsonl" for k in ("rep", "int", "chat", "log")}
+    c = make_client(reports_path=str(paths["rep"]),
+                    interactions_path=str(paths["int"]),
+                    chat_path=str(paths["chat"]),
+                    log_path=str(paths["log"]))
+    c._record("plan", f"задача {secret}", time.time(), ok=True,
+              summary=f"итог {secret}")
+    c._record_chat(f"вопрос {secret}", f"ответ {secret}", time.time(),
+                   fallback=False)
+    c._report_plan({"goal": f"цель {secret}",
+                    "steps": [{"id": 1, "action": "verify",
+                               "desc": f"шаг {secret}"}],
+                    "rationale": f"почему {secret}"}, f"задача {secret}")
+    c._report_dev({"action": "edit", "filename": "a.py",
+                   "comment": f"заметка {secret}",
+                   "code": f"KEY = '{secret}'"}, f"правка {secret}")
+    blob = "".join(p.read_text(encoding="utf-8")
+                   for p in paths.values() if p.exists())
+    check(bool(blob) and "sk-LEAKED123456" not in blob,
+          "журналы: секрет вычищен из reports/interactions/chat/thoughts на диске")
+    mem = json.dumps([c.reports, c.interactions], ensure_ascii=False, default=str)
+    check("sk-LEAKED123456" not in mem,
+          "журналы: секрет вычищен и из in-memory копий, что отдаёт /api/state")
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2519,6 +2582,7 @@ def main() -> int:
     test_coerce_plan_hardening()
     test_server_resource_fixes()
     test_plan_redacts_all_text_fields()
+    test_journals_redacted_on_disk()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

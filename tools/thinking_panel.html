@@ -629,11 +629,10 @@
 
   <!-- ============ СВЯЗЬ АГЕНТОВ ============ -->
   <section class="pane" id="pane-live">
-    <p class="hint">Все обращения к субагенту за выбранный период: задачи на
-      план, рефлексии, реплики чата и запросы режима «Разработка». У каждой
-      строки метка <b>человек</b> (ваш запрос из панели) или <b>агент</b>
-      (вызов из CLI или из программы) — чтобы было видно, кто спрашивал.
-      Технические события и команды — во вкладке «Журнал».</p>
+    <p class="hint">Обращения <b>агентов</b> к субагенту за выбранный период:
+      задачи на план, рефлексии, реплики чата и запросы режима «Разработка».
+      Свои вопросы из панели здесь не показываются — их видно во вкладке
+      «Чат с субагентом». Технические события и команды — во вкладке «Журнал».</p>
     <div class="scroll" id="live"><div class="empty">ожидание обращений…</div></div>
   </section>
 
@@ -1823,7 +1822,16 @@ async function devConfirmAnswer(kind) {
 }
 
 /* ---------- живые события: связь и журнал ---------- */
+/* Вкладка «Связь агентов» — только общение агентов: вопросы человека из
+   панели сюда не попадают (их видно во вкладке «Чат с субагентом»).
+   Поле author присылает сервер; у событий, записанных до его появления,
+   остаётся префикс «[вид/человек]» в тексте. */
+function isHumanCall(ev) {
+  if (ev && ev.author) return ev.author !== "agent";
+  return /\[[a-zа-яё]+\/человек\]/i.test(String((ev && ev.text) || ""));
+}
 function addSviz(ev) {
+  if (isHumanCall(ev)) return;
   const box = clearBox("live");
   const d = el("div", "ev " + (ev.type || "interaction"));
   d.appendChild(el("span", "t", hhmm(ev.ts)));
@@ -1836,24 +1844,21 @@ function addSviz(ev) {
 function renderSviz(list) {
   const box = document.getElementById("live");
   box.innerHTML = "";
-  document.getElementById("c-live").textContent = (list || []).length;
-  if (!list || !list.length) {
+  const agents = (list || []).filter(m => m && m.author !== "human");
+  document.getElementById("c-live").textContent = agents.length;
+  if (!agents.length) {
     box.appendChild(el("div", "empty",
-      "обращений за период нет: планы, рефлексии, чат и запросы «Разработки» "
-      + "появятся здесь"));
+      "обращений агентов за период нет: планы, рефлексии, чат и запросы "
+      + "«Разработки» появятся здесь"));
     return;
   }
-  list.slice().reverse().forEach(m => {
+  agents.slice().reverse().forEach(m => {
     const d = el("div", "ev interaction");
     d.appendChild(el("span", "t", dttm(m.at)));
     const tail = (m.ok ? "" : " — ошибка")
                + (m.fallback ? " (заглушка)" : "");
-    /* Подпись автора обязательна: вкладка называется «Связь агентов», но
-       сюда попадают и мои вопросы из панели — без метки человек не понимает,
-       что это его собственный вызов, а не трафик агента. */
-    const who = m.author === "agent" ? "агент" : "человек";
-    d.appendChild(el("span", "chip " + (m.author === "agent" ? "chip-dev" : "chip-plan"),
-                     who));
+    /* Человеческие вызовы отфильтрованы выше, поэтому строка всегда агентская. */
+    d.appendChild(el("span", "chip chip-dev", "агент"));
     d.appendChild(el("span", "txt",
       kindLabel(m.kind) + ": " + String(m.request || "").slice(0, 300) + tail));
     box.appendChild(d);

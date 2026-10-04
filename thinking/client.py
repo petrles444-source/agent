@@ -100,14 +100,53 @@ def _write_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
+# Ключи, само значение которых и есть секрет (не ссылка на переменную).
+_SECRET_KEYS = ("password", "passwd", "secret", "api_key", "apikey",
+                "access_token", "private_key", "token")
+
+
+def _redact_obj(obj: Any, key: str = "") -> Any:
+    """Рекурсивно маскирует секреты в объекте перед записью на диск.
+
+    `redact_secrets` ловит только вид «ключ = значение», поэтому в словаре
+    с настоящим секретом (`{"password": "hunter2"}`) нужен обход по ключу —
+    ровно тот случай, из-за которого JSON-секреты уезжали в журналы мимо
+    редьюсера. Списки и вложенные словари (steps[].inputs) проходятся целиком.
+    """
+    if isinstance(obj, dict):
+        out: dict = {}
+        for k, v in obj.items():
+            kk = str(k)
+            if (kk.lower().replace("-", "_") in _SECRET_KEYS
+                    and not isinstance(v, (dict, list, tuple))
+                    and str(v or "").strip()):
+                out[k] = "[скрыто]"
+            else:
+                out[k] = _redact_obj(v, kk)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_redact_obj(v, key) for v in obj]
+    if isinstance(obj, str):
+        return redact_secrets(obj)
+    return obj
+
+
 def _append_jsonl(path: Path, obj: dict) -> None:
-    """Дозапись одной записи в JSONL (журнал отчётов/взаимодействий)."""
+    """Дозапись одной записи в JSONL (журнал отчётов/взаимодействий).
+
+    Редактирование — здесь, в единственной точке записи на диск. Раньше
+    `thoughts.jsonl` чистился через redact_secrets, а `reports.jsonl`,
+    `interactions.jsonl` и `chat.jsonl` писались сырыми: один и тот же объект
+    попадал в журналы по-разному, и `goal`/`desc`/`request`/`question` с
+    секретом уезжали в файлы (аудит B).
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > 8 * 1024 * 1024:
             path.replace(path.with_name(path.name + ".1"))
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+            fh.write(json.dumps(_redact_obj(obj), ensure_ascii=False,
+                                default=str) + "\n")
     except Exception as exc:
         log.debug("не дописался %s: %s", path, exc)
 
@@ -949,7 +988,11 @@ class ThinkingClient:
             if self._log_path.exists() and self._log_path.stat().st_size > self._log_max:
                 self._log_path.replace(self._log_path.with_name(self._log_path.name + ".1"))
             with open(self._log_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(ev, ensure_ascii=False, default=str) + "\n")
+                # редактирование здесь же: этот путь минует _remember_ev
+                # (например, событие «interaction»), и раньше писал сырой
+                # текст запроса (аудит B)
+                fh.write(json.dumps(_redact_obj(ev), ensure_ascii=False,
+                                    default=str) + "\n")
         except Exception as exc:
             log.debug("журнал не дописался: %s", exc)
 
@@ -1006,6 +1049,9 @@ class ThinkingClient:
             "plan_id": plan_id or "",
             "summary": summary[:900],
         }
+        # редактирование до попадания и в память, и на диск: status() отдаёт
+        # эти записи панели, и секрет в request/summary уезжал бы наружу
+        rec = _redact_obj(rec)
         self.interactions.append(rec)
         if len(self.interactions) > 200:
             del self.interactions[:-200]
@@ -1015,6 +1061,7 @@ class ThinkingClient:
         # в живой ленте сразу видно, чей это вызов — человек или агент
         who_ru = "человек" if who == "human" else "агент"
         self._append_log({"seq": int(time.time() * 1000), "type": "interaction",
+                          "author": who,
                           "text": f"[{kind}/{who_ru}] {request[:200]} -> {summary[:300]}",
                           "ts": rec["at"]})
 
@@ -1045,6 +1092,7 @@ class ThinkingClient:
             "unknown_files": plan.get("unknown_files") or [],
             "steps": steps,
         }
+        rep = _redact_obj(rep)      # и в память, и на диск (аудит B)
         self.reports.append(rep)
         if len(self.reports) > 60:
             del self.reports[:-60]
@@ -1069,6 +1117,7 @@ class ThinkingClient:
             "action": proposal.get("action", "none"),
             "code": proposal.get("code", "")[:4000],
         }
+        rep = _redact_obj(rep)      # в коде модели тоже бывает ключ (аудит B)
         self.reports.append(rep)
         if len(self.reports) > 60:
             del self.reports[:-60]
@@ -1093,6 +1142,7 @@ class ThinkingClient:
                       for s in out.get("next_steps") or []],
             "goal_stack": out.get("updated_goal_stack") or [],
         }
+        rep = _redact_obj(rep)
         self.reports.append(rep)
         if len(self.reports) > 60:
             del self.reports[:-60]
@@ -1771,6 +1821,7 @@ class ThinkingClient:
                "summary": (f"чат: {reply[:400]}" if reply else f"ошибка чата: {error}")[:900],
                "tokens_in": int(tokens_in), "tokens_out": int(tokens_out),
                "tokens_estimate": bool(estimate)}
+        rec = _redact_obj(rec)          # в память и на диск — уже чисто
         self.interactions.append(rec)
         if len(self.interactions) > 200:
             del self.interactions[:-200]
