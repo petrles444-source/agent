@@ -670,24 +670,28 @@ class ThinkingClient:
                 "error": error}
         out: Optional[dict] = None
         first: Optional[BaseException] = None
-        # Поток — основной путь: на CPU рефлексия живёт 100-200 с, а
-        # не-потоковый /reflect прокси обрезает на 120-й секунде, и раньше
-        # результат просто не доезжал до ПК (аудит B-5).
-        try:
-            out = self._reflect_stream(body)
-        except SchemaError:
-            raise
-        except Exception as exc:
-            first = exc
-            log.warning("поток рефлексии не прошёл: %s", exc)
-            self.last_error = str(exc)[:200]
-        # К не-потоковому маршруту идём только когда в этом есть смысл:
-        # обрыв транспорта даст тот же лимит (524 = 120 с впустую), а ответ
-        # самого сервера будет тем же. Идём, если поток просто не знает
-        # маршрута (старый ноутбук) или упал по чужой причине.
-        if out is None and first is not None \
-                and not _is_read_timeout(first) \
-                and not str(first).startswith("сервер:"):
+        # Поток — основной путь: человек видит мысли по мере генерации.
+        # stream_first=false — сразу обычный /reflect (для моделей, которые
+        # считают дольше лимита прокси в 120 с).
+        if self.cfg.get("stream_first", True):
+            try:
+                out = self._reflect_stream(body)
+            except SchemaError:
+                raise
+            except Exception as exc:
+                first = exc
+                log.warning("поток рефлексии не прошёл: %s", exc)
+                self.last_error = str(exc)[:200]
+        # К не-потоковому маршруту идём при любой отказе, кроме ошибки самого
+        # сервера (404 у старого ноутбука, мусорный JSON — повтор не поможет).
+        # Прежний отказ от маршрута на обрыве потока был основан на гипотезе
+        # «прокси обрезает на 120-й секунде» — живой замер 05.10 её не подтвердил:
+        # Cloudflare рвёт длинные живые ответы, но обычный /plan отработал за
+        # 86 с и вернул валидный план. Так что обрыв потока — не причина
+        # отказываться от обычного маршрута: если тот не уложится в лимит
+        # прокси, вернётся 524, и это уже честный отказ, а не молчание.
+        if out is None and (first is None
+                                or not str(first).startswith("сервер:")):
             try:
                 out = self._json("POST", "/reflect", body, timeout=timeout)
             except Exception as exc:
@@ -815,20 +819,25 @@ class ThinkingClient:
         """(план, is_fallback). Никогда не бросает исключение, кроме SchemaError.
 
         stream_error — вызывающий уже пробовал /plan/stream и получил эту
-        ошибку: её причина решает, есть ли смысл в не-потоковом маршруте
-        (при обрыве транспорта его ждёт тот же лимит Cloudflare — 120 с).
+        ошибку.
+
+        Живой замер 05.10 перевернул прежнее решение «обрыв потока = мёртвый
+        транспорт, идём в шаблон»: обычный `/plan` через тот же туннель
+        отработал за 86 с и вернул валидный план, тогда как поток того же
+        плана обрывался на середине (сервер отдавал 917 сообщений, клиент
+        получал ноль байт за 191 с ожидания). То есть Cloudflare рвёт
+        ДЛИННЫЕ ЖИВЫЕ ОТВЕТЫ, а короткие и средние проносят нормально.
+        Поэтому при обрыве потока сначала пробуем обычный маршрут: он
+        укладывается в лимит 120 с, и только если не повезло — шаблон.
         """
         t0 = time.time()
         stream_kw = {k: v for k, v in kw.items()
                      if k in ("context", "constraints", "max_steps", "author")}
         if self.cfg.get("enabled", True):
-            # Поток — основной путь. Первый байт тела уходит сразу, пинги
-            # каждые 15 с не дают Cloudflare дать 524, а генерация на CPU
-            # спокойно живёт дольше его лимита в 120 с. Не-потоковый /plan
-            # при этом гарантированно ловил 524 и сжигал 120 с впустую
-            # (живой прогон 04.10: сервер додумал план за 5 с, а клиент успел
-            # получить 524 и оборванный поток).
-            if stream_error is None:
+            # Поток — основной путь: человек видит мысли по мере генерации.
+            # stream_first=false в конфиге — прямой путь к обычному /plan
+            # для тех, у кого модель считает дольше 120 с (524 на не-потоковом).
+            if stream_error is None and self.cfg.get("stream_first", True):
                 try:
                     return self.plan_stream(task, **stream_kw), False
                 except SchemaError:
@@ -837,23 +846,18 @@ class ThinkingClient:
                     log.warning("поток плана не прошёл: %s", exc)
                     self.last_error = str(exc)[:200]
                     stream_error = exc
-            if _is_read_timeout(stream_error):
-                # Транспорт мёртв или обрезан прокси: обычный маршрут упрётся
-                # в тот же лимит (524 = 120 с ожидания впустую) — сразу
-                # локальный план. А ошибку самого сервера (404 у старого
-                # ноутбука, мусорный JSON) имеет смысл отдать ему.
-                log.warning("транспорт не отвечает (%s) — беру локальный план, "
-                            "не-потоковый /plan не повторяю", stream_error)
-            else:
-                # путь для старых ноутбуков без /plan/stream и для случаев,
-                # когда поток упал по причине, а не по транспорту
-                try:
-                    return self.plan(task, **kw), False
-                except SchemaError:
-                    raise  # секреты в задаче — не повод молча уходить в fallback
-                except Exception as exc:
-                    log.warning("plan через субагента не прошёл: %s", exc)
-                    self.last_error = str(exc)[:200]
+            if stream_error is not None and _is_read_timeout(stream_error):
+                log.warning("поток плана оборван (%s) — пробую обычный /plan: "
+                            "короткий ответ туннель проносит целиком", stream_error)
+            # путь для старых ноутбуков без /plan/stream, для stream_first=false
+            # и для случаев, когда поток упал по причине, а не по транспорту
+            try:
+                return self.plan(task, **kw), False
+            except SchemaError:
+                raise  # секреты в задаче — не повод молча уходить в fallback
+            except Exception as exc:
+                log.warning("plan через субагента не прошёл: %s", exc)
+                self.last_error = str(exc)[:200]
         if self.cfg.get("fallback_on_error", True):
             plan = local_plan(task)
             self._report_plan(plan, task)

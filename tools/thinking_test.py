@@ -1367,6 +1367,35 @@ def test_mock_llm_stub() -> None:
         np2 = cn2.chat_stream("нет терпения")
         check(np2.get("stream_fallback") is True,
               "контроль: с равными таймаутами поток без пингов всё-таки рвётся")
+
+        # --- обрыв потока НЕ значит «мёртвый транспорт» ------------------
+        # Живой замер 05.10: поток того же плана рвался на середине, а
+        # обычный /plan через тот же туннель отработал за 86 с. Прежний код
+        # после обрыва потока шёл сразу в шаблон («не-потоковый /plan не
+        # повторяю») — и живой план не доезжал до ПК, хотя был доступен.
+        cs2 = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+                          stream_retries=0)
+        cs2.base = serve(mode="slow", first_delay=2.5, ping=0)
+        p2, fb2 = cs2.plan_with_fallback("план после обрыва потока")
+        check(fb2 is False and str(p2.get("goal")).startswith("план после обрыва"),
+              "обрыв потока: клиент идёт в обычный /plan, а не в шаблон")
+        # контроль: настоящий мёртвый транспорт по-прежнему даёт шаблон,
+        # иначе «лечение» просто убрало бы честный отказ
+        cd2 = make_client(**fast, stream_stall=1.0, stream_retries=0,
+                          log_path=str(TMP / "dead_log.jsonl"),
+                          reports_path=str(TMP / "dead_rep.jsonl"))
+        cd2.base = "http://127.0.0.1:1"
+        _, fb3 = cd2.plan_with_fallback("смерть транспорта")
+        check(fb3 is True,
+              "контроль: мёртвый транспорт по-прежнему даёт шаблон-план")
+
+        # --- stream_first=false: сразу обычный маршрут -------------------
+        cn3 = make_client(**fast, stream_first=False,
+                          log_path=str(TMP / "nosf_log.jsonl"))
+        cn3.base = serve(mode="ok")
+        p3, fb4 = cn3.plan_with_fallback("без потока вовсе")
+        check(fb4 is False and bool(p3.get("steps")),
+              "stream_first=false: план получен без единой попытки потока")
     finally:
         for srv in running:
             srv.shutdown()

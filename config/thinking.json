@@ -9,6 +9,7 @@
     "max_backoff": 15
   },
   "stream": true,
+  "stream_first": true,
   "stream_timeout": 40,
   "fallback_on_error": true,
   "reconnect_delay": 5,
@@ -30,5 +31,5 @@
   "panel_host": "127.0.0.1",
   "panel_port": 8765,
   "source": "colab",
-  "comment": "Секреты сюда НЕ пишутся: base_url/token берутся из config/thinking.local.json либо из переменных THINKING_URL / THINKING_TOKEN. plan_timeout/reflect_timeout большие из-за CPU-инференса в Colab без GPU-ускорения. stream_timeout обязан быть больше интервала ping сервера (25 с), иначе поток событий рвётся по таймауту. Транспортные лимиты (stream_stall, stream_retries, chat_json_timeout, chat_timeout, dev_timeout, breaker_pause, answer_cache_ttl) вынесены из кода сюда: раньше они были зашиты дефолтами, но выглядели настраиваемыми."
+  "comment": "Секреты сюда НЕ пишутся: base_url/token берутся из config/thinking.local.json либо из переменных THINKING_URL / THINKING_TOKEN. plan_timeout/reflect_timeout большие из-за CPU-инференса в Colab без GPU-ускорения. stream_timeout обязан быть больше интервала ping сервера (25 с), иначе поток событий рвётся по таймауту. Транспортные лимиты (stream_stall, stream_stall_first, stream_retries, chat_json_timeout, chat_timeout, dev_timeout, breaker_pause, answer_cache_ttl) вынесены из кода сюда: раньше они были зашиты дефолтами, но выглядели настраиваемыми. stream_first=false — сразу обычный (не-потоковый) маршрут: полезно моделям, которые считают дольше лимита прокси в 120 с (живой замер 05.10: обычный /plan отработал за 86 с, а поток того же плана рвался на середине)."
 }
