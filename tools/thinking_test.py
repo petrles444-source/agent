@@ -909,6 +909,36 @@ def test_sse_heartbeat() -> None:
           "клиент: сторож молчания есть и не сработает на пингах")
 
 
+def test_watchdog_and_ram_guard() -> None:
+    """Сторож не убивает медленную модель, а нехватка памяти видна сразу.
+
+    Найдено на живом прогоне 04.10 с 14B: 3 токена за 62 с = 0.05 ток/с при
+    свободных 3.0 ГБ. Две опасные вещи:
+    — сторож проверял движок HTTP-запросом с таймаутом 6 с, поэтому занятая
+      модель выглядела мёртвой и её перезапускали каждые пару минут: на
+      медленной модели ответ не доехал бы никогда;
+    — ничто не предупреждало, что модель не помещается в RAM.
+    """
+    launch = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    watch = launch[launch.index("def _watch()"):]
+    check('PROCS.get("llm")' in watch and "proc.poll() is None" in watch,
+          "сторож: медленную модель отличает по процессу, а не по HTTP-таймауту")
+    check("занят, но процесс жив" in watch,
+          "сторож: о медленной, но живой модели сообщает и не трогает её")
+    check('PROCS["llm"] = subprocess.Popen' in watch,
+          "сторож: после перезапуска запоминает новый процесс")
+    check("timeout=20" in watch,
+          "сторож: если процесса нет, проверяет HTTP с терпимым таймаутом")
+
+    check("_avail_gb()" in launch and "MemAvailable" in launch,
+          "ячейка D: свободная память читается по факту, а не по памятке")
+    warn = launch[launch.index("ВНИМАНИЕ: весам нужно"):launch.index("Модель всё равно")]
+    check("подкачка страниц" in warn and "0.05 ток/с" in warn,
+          "ячейка D: предупреждает о подкачке страниц и называет замеренную скорость")
+    check("Профиль gpu (7B" in warn,
+          "ячейка D: при нехватке памяти советует профиль, который влезет")
+
+
 def test_instructions_present() -> None:
     """Инструкция «как поднять» есть в ноутбуке, README и быстром старте.
 
@@ -1533,6 +1563,7 @@ def main() -> int:
     test_budget_matches_running_model()
     test_failure_diagnostics()
     test_sse_heartbeat()
+    test_watchdog_and_ram_guard()
     test_instructions_present()
     test_dev_layout_vertical()
     test_dev_run_stdin()

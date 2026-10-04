@@ -120,6 +120,22 @@ def wait_http(url, tries=150, gap=2, payload=None):
     return None
 
 
+def _avail_gb() -> float:
+    """Сколько памяти реально свободно (ГБ) — по факту, а не по памятке.
+
+    Colab-железо меняется, и модель, которая влезла вчера, может не влезть
+    сегодня. Смотрим MemAvailable, потому что после загрузки модели сами
+    страницы весов и есть «занятая» память.
+    """
+    try:
+        for line in open("/proc/meminfo", encoding="utf-8"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1024 ** 2
+    except Exception:
+        pass
+    return 0.0
+
+
 # ---- 2) LLM backend на :8001 ----------------------------------------------
 # Контекст 4096 на CPU (быстрее считать) и 8192 на GPU — качество не страдает.
 GPU = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
@@ -153,8 +169,20 @@ for attempt, cand in enumerate(MODELS, 1):
     # KV-кэш (около 10% весов при n_ctx 4096). Иначе приходилось ждать
     # несколько минут, чтобы потом увидеть отказ.
     kv_gb = size_gb * 0.10 * (int(CTX) / 4096)
+    need_gb = size_gb + kv_gb
     print(f"  ждём подъёма до {tries * 2 // 60} мин "
-          f"(размер {size_gb:.1f} ГБ, веса+KV ≈ {size_gb + kv_gb:.1f} ГБ при RAM ~12 ГБ)")
+          f"(размер {size_gb:.1f} ГБ, веса+KV ≈ {need_gb:.1f} ГБ при RAM ~12 ГБ)")
+    # Память проверяем по факту, а не по памятке: Colab даёт разное железо.
+    # Модель, которая не помещается, не «не поднимется» — она поднимется и
+    # будет работать в подкачке страниц, то есть в десятки раз медленнее.
+    # Прогон 04.10: 14B (8.4 ГБ) при свободных 3.0 ГБ дала 0.05 ток/с,
+    # то есть 20 раз медленнее 3B. Молча мириться с этим нельзя.
+    if _avail_gb() and need_gb > _avail_gb() * 1.1:
+        print(f"  (!) ВНИМАНИЕ: весам нужно ≈{need_gb:.1f} ГБ, а свободно только "
+              f"{_avail_gb():.1f} ГБ. Будет подкачка страниц с диска — скорость "
+              "упадёт в десятки раз (замерено 0.05 ток/с на 14B).")
+        print("      Профиль gpu (7B, 4.7 ГБ) или light (3B, 1.8 ГБ) влезут "
+              "свободно. Модель всё равно попробуем — но ответ будет долгим.")
     health = wait_http("http://127.0.0.1:8001/v1/models", tries=tries, gap=2)
     if health is not None:
         MODEL = cand
@@ -220,6 +248,8 @@ print("ЛИМИТ ОТВЕТА (по модели в работе):", os.environ
 # сторож в конце ячейки перезапускает llm_cmd — значит в нём должна быть
 # та модель, которая реально поднялась, а не первая из списка
 llm_cmd[llm_cmd.index("--model") + 1] = MODEL
+# хвосты процессов для сторожа: он отличает «процесс жив» от «процесса нет»
+PROCS: dict = {"llm": llm_proc}
 print("LLM ready:", health.text[:200])
 
 # ---- 3) смоук-тест генерации ----------------------------------------------
@@ -374,11 +404,24 @@ def _watch() -> None:
             api_fail += 1
             print(time.strftime("%H:%M:%S"), "API не отвечает,", api_fail, "/3")
             if api_fail >= 3:
-                try:
-                    r = requests.get("http://127.0.0.1:8001/v1/models", timeout=6)
+                # Жив ли движок — вопрос не к HTTP, а к ПРОЦЕССУ. Запрос к
+                # /v1/models с таймаутом 6 с врёт: занятая генерацией модель
+                # (или модель, которая подгружает страницы весов с диска) за
+                # 6 с не ответит, и сторож решил бы, что движок умер, и
+                # перезапустил его. На медленной модели ответ так и не доехал
+                # бы никогда — сторож убивал бы его каждые пару минут.
+                # poll() отвечает мгновенно и однозначно.
+                proc = PROCS.get("llm")
+                if proc is not None and proc.poll() is None:
                     llm_fail = 0
-                except Exception:
-                    llm_fail += 1
+                    print(time.strftime("%H:%M:%S"),
+                          "LLM занят, но процесс жив — не трогаю")
+                else:
+                    try:
+                        requests.get("http://127.0.0.1:8001/v1/models", timeout=20)
+                        llm_fail = 0
+                    except Exception:
+                        llm_fail += 1
                 if llm_fail >= 2:
                     print(time.strftime("%H:%M:%S"), "поднимаю LLM заново")
                     # ту модель, которую выбрали в панели, а не первоначальную
@@ -391,8 +434,9 @@ def _watch() -> None:
                         pass
                     cmd = list(llm_cmd)
                     cmd[cmd.index("--model") + 1] = active
-                    subprocess.Popen(cmd, stdout=open(LOG_LLM, "a", encoding="utf-8"),
-                                     stderr=subprocess.STDOUT)
+                    PROCS["llm"] = subprocess.Popen(
+                        cmd, stdout=open(LOG_LLM, "a", encoding="utf-8"),
+                        stderr=subprocess.STDOUT)
                     time.sleep(90)
                 subprocess.Popen(api_cmd, cwd="/content",
                                  stdout=open(LOG_API, "a", encoding="utf-8"),
