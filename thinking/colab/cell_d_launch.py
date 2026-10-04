@@ -89,14 +89,17 @@ os.environ.setdefault("THINKING_MAX_TOKENS", _match[1])
 os.environ.setdefault("THINKING_CHAT_MAX_TOKENS", _match[2])
 # Режим разработчика возвращает код целиком — тут обрезать нельзя.
 os.environ.setdefault("THINKING_DEV_MAX_TOKENS", _match[3])
+# ВНИМАНИЕ: это предварительный расчёт по ПЕРВОЙ кандидатуре. Если она не
+# поднимется и ячейка возьмёт запасную — бюджет пересчитается ниже, уже по
+# той модели, что реально работает.
 # Активная модель — в файле: его читает и сервер (вкладка «Модели» в панели),
 # и сторож, чтобы переключение не слетело после перезапуска движка.
 with open(ACTIVE_FILE, "w", encoding="utf-8") as fh:
     fh.write(MODEL)
-print("ЛИМИТ ОТВЕТА:", os.environ["THINKING_MAX_TOKENS"],
-      "токенов / чат-поток:", os.environ["THINKING_CHAT_MAX_TOKENS"],
-      "/ разработка:", os.environ["THINKING_DEV_MAX_TOKENS"],
-      "(признак модели:", _match[0] + ")")
+print("Бюджет по первой кандидатуре:", os.environ["THINKING_MAX_TOKENS"],
+      "/", os.environ["THINKING_CHAT_MAX_TOKENS"], "/",
+      os.environ["THINKING_DEV_MAX_TOKENS"],
+      "(признак:", _match[0] + ") — уточним после выбора модели")
 
 # ---- 1) остановка прошлых экземпляров -------------------------------------
 subprocess.run(["pkill", "-f", "llama_cpp.server"], capture_output=True)
@@ -135,16 +138,32 @@ open(LOG_LLM, "a", encoding="utf-8").write(f"\n--- {time.strftime('%H:%M:%S')} {
 llm_proc = None
 health = None
 for attempt, cand in enumerate(MODELS, 1):
+    size_gb = os.path.getsize(cand) / 1024 ** 3
     cmd = list(llm_cmd)
     cmd[cmd.index("--model") + 1] = cand
     llm_proc = subprocess.Popen(cmd, stdout=open(LOG_LLM, "a", encoding="utf-8"),
                                 stderr=subprocess.STDOUT)
-    print(f"llm pid {llm_proc.pid} ({attempt}/{len(MODELS)}: {os.path.basename(cand)})")
-    health = wait_http("http://127.0.0.1:8001/v1/models", tries=45, gap=2)
+    print(f"llm pid {llm_proc.pid} ({attempt}/{len(MODELS)}: "
+          f"{os.path.basename(cand)}, {size_gb:.1f} ГБ)")
+    # Большая модель читается с диска долго: 17 ГБ успевает не всегда за 90 с,
+    # и раньше мы отвергали её как «не поднялась», не дав дописать веса.
+    # Время ожидания растёт от размера файла.
+    tries = 45 + int(size_gb * 12)
+    print(f"  ждём подъёма до {tries * 2 // 60} мин "
+          f"(размер {size_gb:.1f} ГБ, RAM ~12 ГБ)")
+    health = wait_http("http://127.0.0.1:8001/v1/models", tries=tries, gap=2)
     if health is not None:
         MODEL = cand
         break
-    print(f"  {os.path.basename(cand)} не поднялась, пробуем следующую")
+    # Не молчим: показываем ПОЧЕМУ модель не поднялась. Раньше здесь
+    # печаталось только «не поднялась», и причину приходилось угадывать.
+    _why = open(LOG_LLM, encoding="utf-8", errors="replace").readlines()[-25:]
+    print(f"  {os.path.basename(cand)} не поднялась. Последние строки лога:")
+    for _line in _why:
+        print("   |", _line.rstrip())
+    if size_gb > 12:
+        print(f"  (!) модель {size_gb:.1f} ГБ при RAM ~12 ГБ: может не хватить "
+              "памяти. Возьми профиль strong (14B, 8 ГБ) или gpu.")
     try:
         llm_proc.kill()
     except Exception:
@@ -156,6 +175,18 @@ if health is None:
     print("\n".join(open(LOG_LLM, encoding="utf-8", errors="replace").readlines()[-60:]))
     raise RuntimeError("llama_cpp.server не стартовал")
 print("MODEL в работе:", os.path.basename(MODEL))
+# Бюджет пересчитываем ПОСЛЕ выбора модели: раньше он считался по первой
+# кандидатуре, и если поднималась запасная — работала с чужими лимитами
+# (прогон 04.10: поднялась 3B, а бюджеты остались от 30B — 1200/2400/3000).
+_name = os.path.basename(MODEL).lower()
+_match = next((b for b in MODEL_BUDGETS if b[0] in _name),
+              ("3b", "700", "1400", "2000"))
+os.environ["THINKING_MAX_TOKENS"] = _match[1]
+os.environ["THINKING_CHAT_MAX_TOKENS"] = _match[2]
+os.environ["THINKING_DEV_MAX_TOKENS"] = _match[3]
+print("ЛИМИТ ОТВЕТА (по модели в работе):", os.environ["THINKING_MAX_TOKENS"],
+      "/", os.environ["THINKING_CHAT_MAX_TOKENS"], "/",
+      os.environ["THINKING_DEV_MAX_TOKENS"], "признак:", _match[0])
 # сторож в конце ячейки перезапускает llm_cmd — значит в нём должна быть
 # та модель, которая реально поднялась, а не первая из списка
 llm_cmd[llm_cmd.index("--model") + 1] = MODEL

@@ -777,6 +777,32 @@ def test_chat_author() -> None:
           "панель: её вызовы чата и разработки помечены как человеческие")
 
 
+def test_budget_matches_running_model() -> None:
+    """Бюджет пересчитывается по модели, которая реально поднялась.
+
+    Найдено на живом прогоне 04.10: поднялась запасная 3B, а бюджеты
+    остались от первой кандидатуры (30B) — лимиты были чужими.
+    """
+    launch = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
+    # пересчёт обязан стоять ПОСЛЕ цикла выбора модели и писать без setdefault
+    loop = launch.index("for attempt, cand in enumerate(MODELS, 1):")
+    recalc = launch.index('os.environ["THINKING_MAX_TOKENS"] = _match[1]', loop)
+    check(recalc > loop, "ячейка D: бюджет пересчитывается после выбора модели")
+    tail = launch[recalc:recalc + 700]
+    check("MODEL = cand" in launch[loop:loop + 900],
+          "ячейка D: MODEL обновляется на ту, что поднялась")
+    check("setdefault" not in tail,
+          "ячейка D: пересчёт затирает бюджет, а не молчит из-за setdefault")
+    # причина отказа модели показывается, а не просто «не поднялась»
+    check("Последние строки лога" in launch,
+          "ячейка D: при отказе модели печатается причина из лога")
+    check("не хватить" in launch,
+          "ячейка D: при нехватке памяти подсказывает профиль strong")
+    # время ожидания растёт от размера модели
+    check("tries = 45 + int(size_gb * 12)" in launch,
+          "ячейка D: большая модель ждёт подъёма дольше (17 ГБ не успевает за 90 с)")
+
+
 def test_instructions_present() -> None:
     """Инструкция «как поднять» есть в ноутбуке, README и быстром старте.
 
@@ -1047,7 +1073,8 @@ def test_colab_cells() -> None:
     check("THINKING_URL=" in launch, "ячейка D: печатает THINKING_URL")
     check("THINKING_TOKEN=" in launch, "ячейка D: печатает THINKING_TOKEN")
     check("thinking_models.txt" in launch, "ячейка D: читает список моделей")
-    check("пробуем следующую" in launch, "ячейка D: переключает модель, если не поднялась")
+    check("пробуем следующую" in launch or "не поднялась" in launch,
+          "ячейка D: переключает модель, если не поднялась")
     check("thinking_env.sh" in launch, "ячейка D: подхватывает LD_LIBRARY_PATH из A")
     check('"--n_ctx", CTX' in launch, "ячейка D: контекст подстраивается под GPU/CPU")
 
@@ -1378,6 +1405,7 @@ def main() -> int:
     test_devsave_args()
     test_dev_reports()
     test_chat_author()
+    test_budget_matches_running_model()
     test_instructions_present()
     test_dev_layout_vertical()
     test_dev_run_stdin()
