@@ -9,6 +9,8 @@
     "max_backoff": 15
   },
   "stream": true,
+  "job_first": true,
+  "job_poll": 6,
   "stream_first": true,
   "stream_first_streak": 2,
   "stream_first_pause": 600,

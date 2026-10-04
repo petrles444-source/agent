@@ -887,6 +887,55 @@ def _store(plan: Plan) -> None:
             S.plans.pop(key, None)
 
 
+# ------------------------------------------------- асинхронные задания -----
+# Живой замер 05.10: Cloudflare рвёт длинные живые ответы (поток — на середине,
+# а обычный — 524 на 120-й секунде). Значит через прокси нельзя забрать
+# генерацию дольше 120 с НИ ОДНИМ маршрутом, и это упирается в чужой лимит.
+# Обход честный и простой: ответ приходит СРАЗУ (job id), а результат
+# забирается короткими опросами. Прокси тут ни при чём — ограничение на
+# ответ, а не на работу сервера.
+S.jobs: dict[str, dict] = {}
+MAX_JOBS = 40
+
+
+def _new_job(kind: str) -> str:
+    job_id = f"{kind}-{uuid.uuid4().hex[:10]}"
+    S.jobs[job_id] = {"status": "running", "kind": kind, "result": None,
+                      "error": "", "at": utcnow()}
+    if len(S.jobs) > MAX_JOBS:
+        for key in sorted(S.jobs, key=lambda k: S.jobs[k].get("at", ""))[:8]:
+            S.jobs.pop(key, None)
+    return job_id
+
+
+def _job_done(job_id: str, result: dict) -> None:
+    job = S.jobs.get(job_id)
+    if job is not None:
+        job.update(status="ok", result=result, at=utcnow())
+
+
+def _job_failed(job_id: str, error: str) -> None:
+    job = S.jobs.get(job_id)
+    if job is not None:
+        job.update(status="error", error=str(error)[:300], at=utcnow())
+
+
+@app.get("/job/{job_id}")
+async def job_state(job_id: str, x_agent_token: str = Header(default=""),
+                    token: str = ""):
+    """Состояние задания: running | ok | error.
+
+    Ответ короткий в любом случае — длинным может быть только результат в
+    момент готовности, и он всё равно умещается в лимит прокси (план на
+    килобайты).
+    """
+    _auth(x_agent_token, token)
+    job = S.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"задание {job_id} не найдено (сервер перезапущен?)")
+    return job
+
+
 # ---------------------------------------------------------- эндпоинты -----
 @app.get("/", response_class=HTMLResponse)
 async def index(token: str = ""):
@@ -1033,6 +1082,76 @@ async def plan(req: PlanRequest, x_agent_token: str = Header(default=""), token:
         S.stats["errors"] += 1
         await emit("error", str(exc)[:300])
         raise HTTPException(500, str(exc)[:300])
+
+
+@app.post("/plan/async")
+async def plan_async(req: PlanRequest, x_agent_token: str = Header(default=""),
+                     token: str = ""):
+    """POST /plan/async: ответ СРАЗУ с job id, результат — опросом /job/{id}.
+
+    Живой замер 05.10: через прокси Cloudflare не забирается ни поток
+    (рвётся на середине), ни обычный ответ (524 на 120-й секунде). Ограничение
+    прокси — на ДЛИННУЮ ОТВЕТ, а не на работу сервера: поэтому отдаём ответ
+    мгновенно, а план забираем короткими опросами. Генерация при этом идёт
+    ровно одна: повтор запроса её бы не удвоил.
+    """
+    _auth(x_agent_token, token)
+    job_id = _new_job("plan")
+
+    async def work() -> None:
+        try:
+            await emit("thought", f"Задача (асинхронно): {req.task[:150]}")
+            raw = await chat_json(SYSTEM_PLAN, build_plan_prompt(req))
+            data = await plan_data(raw, req.task)
+            p = Plan(**data)
+            _store(p)
+            S.stats["plans"] += 1
+            await emit("rationale", p.rationale or "(без объяснения)",
+                       plan_id=p.plan_id)
+            for c in p.contradictions:
+                await emit("contradiction", c, plan_id=p.plan_id)
+            for s in p.steps:
+                await emit("plan_step", f"[{s.id}] {s.desc}",
+                           plan_id=p.plan_id, step_id=s.id)
+            await emit("final", f"План {p.plan_id[:8]} готов: {len(p.steps)} шагов",
+                       plan_id=p.plan_id)
+            _job_done(job_id, p.model_dump())
+        except Exception as exc:                       # noqa: BLE001
+            S.stats["errors"] += 1
+            await emit("error", f"план (async): {str(exc)[:200]}")
+            _job_failed(job_id, exc)
+
+    asyncio.create_task(work())
+    return {"job": job_id, "status": "running", "at": utcnow()}
+
+
+@app.post("/reflect/async")
+async def reflect_async(req: ReflectRequest, x_agent_token: str = Header(default=""),
+                        token: str = ""):
+    """POST /reflect/async — то же для рефлексии (она на CPU ещё дольше)."""
+    _auth(x_agent_token, token)
+    job_id = _new_job("reflect")
+
+    async def work() -> None:
+        try:
+            await emit("thought", f"Рефлексия (асинхронно) шага {req.step_id}",
+                       plan_id=req.plan_id, step_id=req.step_id)
+            raw = await chat_json(SYSTEM_REFLECT,
+                                  _reflect_user(req, _reflect_plan_json(req)),
+                                  min(500, _ctx_limit()))
+            out = await reflect_payload(req, raw)
+            S.stats["reflects"] += 1
+            await emit("final" if out.status == "ok" else "contradiction",
+                       f"[{out.status}] {out.advice}",
+                       plan_id=req.plan_id, step_id=req.step_id)
+            _job_done(job_id, out.model_dump())
+        except Exception as exc:                       # noqa: BLE001
+            S.stats["errors"] += 1
+            await emit("error", f"рефлексия (async): {str(exc)[:200]}")
+            _job_failed(job_id, exc)
+
+    asyncio.create_task(work())
+    return {"job": job_id, "status": "running", "at": utcnow()}
 
 
 @app.post("/plan/stream")

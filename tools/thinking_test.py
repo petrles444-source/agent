@@ -1411,7 +1411,8 @@ def test_mock_llm_stub() -> None:
         # маршрут через него отвечает. Три попытки по полторы минуты перед
         # заведомо доступным результатом — это минуты ожидания впустую.
         state = TMP / "stream_state.json"
-        cq = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+        cq = make_client(**fast, job_first=False, stream_stall=1.0,
+                         stream_stall_first=1.0,
                          stream_retries=0, stream_first_streak=2,
                          stream_first_pause=600, state_path=str(state),
                          log_path=str(TMP / "q_log.jsonl"),
@@ -1455,7 +1456,8 @@ def test_mock_llm_stub() -> None:
         # туннеле обрезаются все. Тихий период тогда наступал бы только на
         # третью команду — первые две платили бы по полторы минуты впустую.
         state2 = TMP / "stream_state2.json"
-        cm = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+        cm = make_client(**fast, job_first=False, stream_stall=1.0,
+                         stream_stall_first=1.0,
                          stream_retries=2, stream_first_streak=3,
                          stream_first_pause=600, state_path=str(state2),
                          log_path=str(TMP / "m_log.jsonl"),
@@ -1470,7 +1472,8 @@ def test_mock_llm_stub() -> None:
         # Живой замер 05.10: план шёл 402 с, потому что тишина наступила
         # после второй попытки, а третья всё равно была потрачена.
         state3 = TMP / "stream_state3.json"
-        cs3 = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+        cs3 = make_client(**fast, job_first=False, stream_stall=1.0,
+                          stream_stall_first=1.0,
                           stream_retries=2, stream_first_streak=1,
                           stream_first_pause=600, state_path=str(state3),
                           log_path=str(TMP / "s3_log.jsonl"),
@@ -1488,6 +1491,49 @@ def test_mock_llm_stub() -> None:
         # RPS=5 (cell_c:695-704): 429 получает и опрос /health панели. Если бы
         # он копился в предохранителе, несколько минут работы панели положили
         # бы связь на 10 минут при живом туннеле.
+        # --- асинхронный маршрут: ответ мимо лимита прокси -----------------------
+        # Живой замер 05.10: план, который считается дольше 120 с, через
+        # туннель не забирается ни потоком (обрыв), ни обычным ответом (524).
+        # Асинхронный маршрут отвечает сразу и забирает результат опросом.
+        url_job = serve(mode="slow", first_delay=0.0)
+        cj = make_client(**fast, job_poll=1.0, plan_timeout=30)
+        cj.base = url_job
+        pj, fbj = cj.plan_with_fallback("план через задание")
+        check(fbj is False and bool(pj.get("steps")),
+              "async: план получен через задание (мимо лимита прокси)")
+        check("оборвался" not in cj.last_error,
+              "async: до обычных маршрутов дело не дошло — сразу результат")
+        rj = ReflectResponse.from_dict(
+            cj.reflect("plan-x", 1, "сделано через async"))
+        check(rj.status == "ok", "async: рефлексия тоже через задание")
+        # старый ноутбук без /plan/async — не поломка, а повод пойти дальше
+        cj2 = make_client(**fast, job_first=True)
+        cj2.base = url_job
+        real_json = cj2._json                                      # noqa: SLF001
+
+        def no_async(method, path, body=None, timeout=None):
+            if path.endswith("/async"):
+                raise ThinkingError("404: нет маршрута")
+            return real_json(method, path, body, timeout=timeout)
+
+        cj2._json = no_async                                      # noqa: SLF001
+        pj2, fbj2 = cj2.plan_with_fallback("старый ноутбук без async")
+        check(fbj2 is False and bool(pj2.get("steps")),
+              "async: старый ноутбук без /plan/async не ломает план")
+        # и сломанный async: 404 на /job/... обязан дойти до человека
+        cj3 = make_client(**fast, job_first=True, stream_first=False)
+        cj3.base = url_job
+
+        def bad_job(method, path, body=None, timeout=None):
+            if path.endswith("/async"):
+                raise ThinkingError("HTTP 500: сервер упал")
+            return real_json(method, path, body, timeout=timeout)
+
+        cj3._json = bad_job                                       # noqa: SLF001
+        pj3, fbj3 = cj3.plan_with_fallback("сломанный async")
+        check(fbj3 is False and bool(pj3.get("steps")),
+              "async: упавший асинхронный маршрут не съедает план")
+
         url_rate = serve(mode="rate", rps=100)      # лимит не мешает проверке
         srv_rate = running[-1]
         srv_rate.mock_state.rps = 1        # 429 начиная со второго запроса в секунду

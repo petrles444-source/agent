@@ -607,6 +607,102 @@ class ThinkingClient:
                             self._cb_errors, pause)
         raise ThinkingError(f"субагент недоступен: {last}")
 
+    def plan_async(self, task: str, context: Optional[dict] = None,
+                   constraints: Optional[list[str]] = None,
+                   max_steps: int = 12, timeout: Optional[float] = None,
+                   on_progress: Optional[Callable[[int], None]] = None,
+                   author: str = "agent") -> dict:
+        """POST /plan/async + опрос /job/{id}: ответ мимо лимита прокси.
+
+        Живой замер 05.10: через туннель Cloudflare не забирается ни поток
+        (рвётся на середине), ни обычный ответ (524 на 120-й секунде).
+        Ограничение прокси — на длину ответа, а не на работу сервера, поэтому
+        здесь ответ мгновенный (job id), а план забирается короткими опросами.
+
+        on_progress(done, total) сообщает, сколько секунд ждём, — интерфейсу
+        есть что показать человеку, пока идёт генерация.
+        """
+        self._check_secrets(task, json.dumps(context or {}, ensure_ascii=False))
+        t0 = time.time()
+        start = self._json("POST", "/plan/async", {
+            "task": task, "context": context or {},
+            "constraints": constraints or [],
+            "max_steps": max(1, min(30, int(max_steps))),
+        }, timeout=min(self.timeout, 30))
+        job = str((start or {}).get("job") or "")
+        if not job:
+            raise ThinkingError("сервер не вернул id задания")
+        budget = max(60.0, float(self.cfg.get("plan_timeout", 360)))
+        every = max(3.0, float(self.cfg.get("job_poll", 6)))
+        waited = 0.0
+        while True:
+            if time.time() - t0 > budget:
+                raise ThinkingError(
+                    f"план не дождался за {int(budget)} с (задание {job} "
+                    f"ещё считается на Colab — оно не пропадёт)")
+            state = self._json("GET", f"/job/{job}",
+                               timeout=min(self.timeout, 30))
+            status = str((state or {}).get("status") or "")
+            if status == "ok":
+                plan = dict(state.get("result") or {})
+                # Задание может отдать «ok» без плана: так делает прокси,
+                # подменивший ответ, или сервер, у которого сломалось
+                # разбора. Пустой план успехом считать нельзя — иначе вместо
+                # ответа человек увидит пустоту без единого слова о причине.
+                if not isinstance(plan, dict) or not plan.get("steps"):
+                    raise ThinkingError(
+                        f"задание {job} отдало ответ без шагов: "
+                        f"{str(plan)[:200]}")
+                self._account_plan(plan, task, t0, author=author)
+                return plan
+            if status == "error":
+                raise ThinkingError(f"задание {job} упало: {state.get('error')}")
+            time.sleep(every)
+            waited += every
+            if on_progress:
+                try:
+                    on_progress(int(time.time() - t0))
+                except Exception as exc:               # noqa: BLE001
+                    log.debug("on_progress упал: %s", exc)
+
+    def reflect_async(self, plan_id: str, step_id: int, result: str,
+                      observation: Optional[str] = None,
+                      error: Optional[str] = None,
+                      timeout: Optional[float] = None,
+                      author: str = "agent") -> dict:
+        """POST /reflect/async + опрос — то же для рефлексии."""
+        self._check_secrets(result, observation or "", error or "")
+        t0 = time.time()
+        start = self._json("POST", "/reflect/async", {
+            "plan_id": plan_id, "step_id": int(step_id), "result": str(result),
+            "observation": observation, "error": error,
+        }, timeout=min(self.timeout, 30))
+        job = str((start or {}).get("job") or "")
+        if not job:
+            raise ThinkingError("сервер не вернул id задания")
+        budget = max(60.0, float(self.cfg.get("reflect_timeout", 180)))
+        every = max(3.0, float(self.cfg.get("job_poll", 6)))
+        while True:
+            if time.time() - t0 > budget:
+                raise ThinkingError(f"рефлексия не дождалась за {int(budget)} с "
+                                    f"(задание {job} ещё считается)")
+            state = self._json("GET", f"/job/{job}",
+                               timeout=min(self.timeout, 30))
+            status = str((state or {}).get("status") or "")
+            if status == "ok":
+                out = dict(state.get("result") or {})
+                self._remember_json("reflect", out)
+                self._report_reflect(out, plan_id, step_id, result)
+                self.stats["reflects"] += 1
+                self._record("reflect", f"шаг {step_id}: {result[:300]}", t0,
+                             ok=True,
+                             summary=f"[{out.get('status')}] {out.get('advice', '')}"[:400],
+                             plan_id=plan_id, author=author)
+                return out
+            if status == "error":
+                raise ThinkingError(f"задание {job} упало: {state.get('error')}")
+            time.sleep(every)
+
     def _json(self, method: str, path: str, body: Optional[dict] = None,
               timeout: Optional[float] = None) -> Any:
         # Аудит A-3: resp.read() стоял вне try — socket.timeout и, главное,
@@ -779,9 +875,20 @@ class ThinkingClient:
                 "error": error}
         out: Optional[dict] = None
         first: Optional[BaseException] = None
-        # Поток — основной путь: человек видит мысли по мере генерации.
-        # stream_first=false — сразу обычный /reflect (для моделей, которые
-        # считают дольше лимита прокси в 120 с).
+        # Асинхронный маршрут — мимо лимита прокси (живой замер 05.10: рефлексия
+        # на CPU считается дольше 120 с, и обычный ответ ловит 524).
+        if self.cfg.get("job_first", True):
+            try:
+                out = self.reflect_async(plan_id, step_id, result,
+                                         observation=observation, error=error,
+                                         timeout=timeout, author=author)
+                return out
+            except SchemaError:
+                raise
+            except Exception as exc:
+                log.warning("асинхронная рефлексия не прошла (%s) — "
+                            "пробую обычные маршруты", exc)
+                first = exc
         if (self.cfg.get("stream_first", True)
                     and not self.stream_quiet()):
             try:
@@ -944,9 +1051,23 @@ class ThinkingClient:
         stream_kw = {k: v for k, v in kw.items()
                      if k in ("context", "constraints", "max_steps", "author")}
         if self.cfg.get("enabled", True):
-            # Поток — основной путь: человек видит мысли по мере генерации.
-            # stream_first=false в конфиге — прямой путь к обычному /plan
-            # для тех, у кого модель считает дольше 120 с (524 на не-потоковом).
+            # Асинхронный маршрут — мимо лимита прокси: ответ мгновенный,
+            # результат забирается опросом. Живой замер 05.10: и поток, и
+            # обычный /plan через туннель теряются на длинной генерации
+            # (обрыв на середине / 524 на 120-й секунде), поэтому это
+            # единственный маршрут, который переживает медленную модель.
+            if self.cfg.get("job_first", True):
+                try:
+                    return self.plan_async(task, **stream_kw), False
+                except SchemaError:
+                    raise  # секреты в задаче — не повод молча уходить в fallback
+                except Exception as exc:
+                    log.warning("асинхронный план не прошёл (%s) — "
+                                "пробую обычные маршруты", exc)
+                    self.last_error = str(exc)[:200]
+            # Поток — быстрый путь, когда прокси его проносит (локальный
+            # адрес Colab, короткие ответы): человек видит мысли по мере
+            # генерации. stream_first=false — сразу обычный /plan.
             if (stream_error is None and self.cfg.get("stream_first", True)
                     and not self.stream_quiet()):
                 try:
@@ -960,8 +1081,8 @@ class ThinkingClient:
             if stream_error is not None and _is_read_timeout(stream_error):
                 log.warning("поток плана оборван (%s) — пробую обычный /plan: "
                             "короткий ответ туннель проносит целиком", stream_error)
-            # путь для старых ноутбуков без /plan/stream, для stream_first=false
-            # и для случаев, когда поток упал по причине, а не по транспорту
+            # последний рубеж: обычный /plan. Упирается в 524 на длинной
+            # генерации, но на короткой (замер: 86 с) проходит.
             try:
                 return self.plan(task, **kw), False
             except SchemaError:

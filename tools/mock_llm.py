@@ -259,6 +259,10 @@ class MockState:
             "tokens_in": 0, "tokens_out": 0,
         }
         self.llm_ms: list[int] = []
+        # Асинхронные задания (/plan/async, /reflect/async, /job/{id}) —
+        # живой замер 05.10: длинный ответ через прокси не забирается,
+        # поэтому маршрут отвечает сразу, а результат ждёт опросом.
+        self.jobs: dict[str, dict] = {}
         # «Манифест» дополнительных движков — как его пишет ячейка D
         # (cell_c:1279-1293). Держим в состоянии, чтобы /parallel и
         # /ask/multi считали одно и то же: у настоящего сервера
@@ -485,9 +489,13 @@ def make_handler(state: MockState) -> type:
         def _content_route(self) -> Optional[str]:
             """Маршруты, которые генерируют текст (на них действуют режимы)."""
             p = self._route
-            return p if p in ("/plan", "/plan/stream", "/reflect",
-                              "/reflect/stream", "/chat",
-                              "/chat/stream", "/dev", "/dev/stream",
+            # /plan/async и /reflect/async тоже контентные: прокси, отдающий
+            # HTML вместо JSON, не разбирает, какой маршрут его спросили, и
+            # режим badjson обязан ломать их так же (иначе «честный отказ»
+            # на этих маршрутах был бы недостижим офлайн).
+            return p if p in ("/plan", "/plan/stream", "/plan/async",
+                              "/reflect", "/reflect/stream", "/reflect/async",
+                              "/chat", "/chat/stream", "/dev", "/dev/stream",
                               "/ask/multi") else None
 
         # ------------------------------------------------------------ ответы
@@ -561,7 +569,19 @@ def make_handler(state: MockState) -> type:
             # «health жив, контентные маршруты 503» должен быть воспроизводим
             # (аудит A-4, 04-tests-mock: раньше заглушка гасила всё, и тест
             # закреплял «сервер упал» вместо «LLM упала»).
-            if route == "/health":
+            if route.startswith("/job/"):
+                if not self._authorized():
+                    return
+                job_id = route.split("/job/", 1)[1]
+                with state.lock:
+                    job = state.jobs.get(job_id)
+                if job is None:
+                    self._send(404, {"error":
+                                     f"задание {job_id} не найдено "
+                                     "(сервер перезапущен?)"})
+                    return
+                self._send(200, dict(job))
+            elif route == "/health":
                 if self._maybe_rate_limit():
                     return
                 self._send(200, _health(state))
@@ -674,6 +694,12 @@ def make_handler(state: MockState) -> type:
                     self._dev_stream(body)
                 elif route == "/ask/multi":
                     self._ask_multi(body)
+                elif route == "/plan/async":
+                    # Живой замер 05.10: план дольше 120 с через прокси не
+                    # забирается (524). Здесь ответ сразу, результат — опросом.
+                    self._async_job("plan", self._plan, body)
+                elif route == "/reflect/async":
+                    self._async_job("reflect", self._reflect, body)
                 elif route == "/model":
                     # Настоящий сервер отвечает 404, если такой модели нет
                     # (cell_c:1181-1185) — клиент обязан это пережить и
@@ -705,6 +731,52 @@ def make_handler(state: MockState) -> type:
                 state.timed(int((time.time() - started) * 1000))
 
         # ------------------------------------------------------ маршруты
+        def _async_job(self, kind: str, work, body: dict) -> None:
+            """Ответ сразу с job id, результат — опросом GET /job/{id}.
+
+            Так же устроен настоящий сервер (cell_c: /plan/async, /job/{id}):
+            ответ приходит мгновенно, длинная генерация идёт отдельной
+            задачей, а лимит прокси на длину ответа не действует.
+            """
+            job_id = f"{kind}-{int(time.time() * 1000) % 10_000_000}"
+
+            def runner() -> None:
+                try:
+                    buf: dict = {}
+                    original = self._send
+
+                    def capture(code: int, payload, ctype=None):
+                        if code == 200 and isinstance(payload, dict):
+                            buf.setdefault("result", payload)
+                        else:
+                            buf.setdefault("error", f"HTTP {code}")
+
+                    self._send = capture                     # noqa: SLF001
+                    try:
+                        work(body)
+                    finally:
+                        self._send = original                # noqa: SLF001
+                    with state.lock:
+                        # «ok» без результата — не успех: клиент обязан это
+                        # отличить от плана, иначе вместо ответа человек
+                        # увидит пустоту (та же проверка в plan_async).
+                        got = buf.get("result")
+                        state.jobs[job_id] = {
+                            "status": "ok" if isinstance(got, dict) else "error",
+                            "kind": kind, "result": got,
+                            "error": "" if isinstance(got, dict)
+                            else (buf.get("error") or "задание не вернуло результат"),
+                            "at": utcnow()}
+                except Exception as exc:                      # noqa: BLE001
+                    with state.lock:
+                        state.jobs[job_id] = {
+                            "status": "error", "kind": kind, "result": None,
+                            "error": f"{type(exc).__name__}: {exc}"[:300],
+                            "at": utcnow()}
+
+            threading.Thread(target=runner, daemon=True).start()
+            self._send(200, {"job": job_id, "status": "running", "at": utcnow()})
+
         def _plan(self, body: dict) -> None:
             _mode, task = strip_hints(str(body.get("task") or ""))
             state.emit("thought", f"Задача: {task[:150]}")
