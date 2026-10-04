@@ -102,7 +102,11 @@ print("Бюджет по первой кандидатуре:", os.environ["THIN
       "(признак:", _match[0] + ") — уточним после выбора модели")
 
 # ---- 1) остановка прошлых экземпляров -------------------------------------
-subprocess.run(["pkill", "-f", "llama_cpp.server"], capture_output=True)
+# Убиваем только ОСНОВНОЙ движок (:8001): параллельные (llm2, llm3) живут
+# на 8002+, и широкий паттерн сносил их вместе с ним — /parallel продолжал
+# читать устаревший манифест (аудит B, 03-colab)
+subprocess.run(["pkill", "-f", "llama_cpp.server.*--port 8001"],
+               capture_output=True)
 subprocess.run(["pkill", "-f", "uvicorn thinking_server"], capture_output=True)
 subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
 time.sleep(2)
@@ -403,23 +407,9 @@ try:
             print("ИМЕНОВАННЫЙ туннель: адрес не распознан в логе, смотрите /content/tunnel.log")
     # 2) Быстрый туннель — бесплатно и без аккаунта, но адрес случайный на каждый запуск
     if not tunnel:
-        # --protocol http2: quick-туннель по умолчанию ходит по QUIC/UDP, а на
-        # Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted 7168 kiB,
-        # got 416 kiB») — SSE-потоки посреди передачи замирали, done не доходил.
-        # HTTP/2 идёт по TCP и этих потерь не видит.
-        with open("/content/tunnel.log", "a", encoding="utf-8") as _fh:
-            subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate",
-                              "--protocol", "http2",
-                              "--url", "http://localhost:8000"],
-                             stdout=_fh, stderr=subprocess.STDOUT,
-                             start_new_session=True)
-        for _ in range(40):
-            txt = open("/content/tunnel.log", encoding="utf-8", errors="replace").read()
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", txt)
-            if m:
-                tunnel, tunnel_kind = m.group(0), "быстрый (случайный адрес)"
-                break
-            time.sleep(2)
+        tunnel = _start_tunnel()
+        if tunnel:
+            tunnel_kind = "быстрый (случайный адрес)"
 except Exception as exc:
     print("tunnel error:", exc)
 
@@ -451,11 +441,66 @@ import threading                                          # noqa: E402
 
 
 def _alive(url_: str) -> bool:
+    """Жив ли API. 401/429 — жив, но не пускает/перегружен: перезапуск тут
+    не поможет и только убьёт здоровый процесс (аудит B, 03-colab)."""
     try:
-        return requests.get(url_.rstrip("/") + "/health",
-                            headers={"X-Agent-Token": TOKEN}, timeout=6).status_code == 200
+        code = requests.get(url_.rstrip("/") + "/health",
+                            headers={"X-Agent-Token": TOKEN},
+                            timeout=6).status_code
     except Exception:
         return False
+    return code == 200 or code in (401, 429)
+
+
+def _tunnel_alive(url_: str) -> bool:
+    """Доступен ли туннель снаружи.
+
+    Сторож проверял только локальный /health: убитый cloudflared выглядел
+    «всё хорошо», а снаружи туннель молча отдавал 530 — и это не
+    детектировалось вообще (аудит B, 03-colab).
+    """
+    if not url_:
+        return False
+    try:
+        return requests.get(url_.rstrip("/") + "/health",
+                            headers={"X-Agent-Token": TOKEN},
+                            timeout=6).status_code == 200
+    except Exception:
+        return False
+
+
+def _start_tunnel() -> str:
+    """Поднимает быстрый cloudflared и возвращает публичный URL (или "").
+
+    Вынесено из основного потока: сторож обязан уметь перезапускать туннель
+    сам, иначе мёртвый cloudflared не замечали до перезапуска ноутбука.
+    """
+    try:
+        if not os.path.exists("/usr/local/bin/cloudflared"):
+            subprocess.run(["wget", "-q",
+                            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+                            "-O", "/usr/local/bin/cloudflared"], check=True)
+            os.chmod("/usr/local/bin/cloudflared", 0o755)
+        # --protocol http2: quick-туннель по умолчанию ходит по QUIC/UDP, а на
+        # Colab ядра дают крошечный UDP-буфер (quic-go пишет «wanted 7168 kiB,
+        # got 416 kiB») — SSE-потоки посреди передачи замирали, done не доходил.
+        # HTTP/2 идёт по TCP и этих потерь не видит.
+        with open("/content/tunnel.log", "a", encoding="utf-8") as _fh:
+            subprocess.Popen(["nohup", "cloudflared", "tunnel", "--no-autoupdate",
+                              "--protocol", "http2",
+                              "--url", "http://localhost:8000"],
+                             stdout=_fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        for _ in range(40):
+            txt = open("/content/tunnel.log", encoding="utf-8",
+                       errors="replace").read()
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", txt)
+            if m:
+                return m.group(0)
+            time.sleep(2)
+    except Exception as exc:
+        print("tunnel error:", exc)
+    return ""
 
 
 def _restart_extra() -> None:
@@ -499,7 +544,16 @@ def _watch() -> None:
     while True:
         time.sleep(60)
         try:
+            if _alive("http://127.0.0.1:8000") and _tunnel_alive(url):
+                api_fail = llm_fail = 0
+                continue
             if _alive("http://127.0.0.1:8000"):
+                # Локально всё живо, а снаружи нет — умер cloudflared.
+                # Раньше сторож смотрел только на локальный /health и такой
+                # туннель считался здоровым до перезапуска ноутбука (аудит B)
+                print(time.strftime("%H:%M:%S"),
+                      "туннель недоступен снаружи — перезапускаю cloudflared")
+                _start_tunnel()
                 api_fail = llm_fail = 0
                 continue
             api_fail += 1

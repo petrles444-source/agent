@@ -1526,7 +1526,7 @@ async function runReflect() {
 }
 
 /* ---------- режим разработчика ---------- */
-let devCurrent = "", devBusy = false, devPending = null, devSaved = "";
+let devCurrent = "", devBusy = false, devPending = null, devSaved = null;
 /* Язык текущего файла — шапка говорит сразу, что открыто: Python по умолчанию,
    HTML для .html: файловая папка принимает любой текстовый код. */
 function devLang(name) {
@@ -1556,10 +1556,16 @@ async function devRefresh(keep) {
     const pick = files.some(f => f.name === cur) ? cur : (files[0] || {}).name || "";
     if (pick) {
       sel.value = pick;
-      await devOpen(pick, true);
+      // Несохранённые правки важнее свежести списка: перечитывание файла с
+      // диска затирало то, что набрано в редакторе (аудит B). Флаг «●» в
+      // шапке — чтобы было видно, что в окне есть неспасённое.
+      const dirty = document.getElementById("devcode").value !== devSaved;
+      if (!dirty) await devOpen(pick, true);
+      document.getElementById("devfname").textContent =
+        devCurrent + (dirty ? " ●" : "");
     } else {
       devCurrent = "";
-      devSaved = "";
+      devSaved = null;          // файла на диске нет — редактор считается грязным
       document.getElementById("devfname").textContent = "—";
       devLang("");
       // Пустая папка: показываем понятный пункт вместо пустого выпадающего списка
@@ -1617,8 +1623,9 @@ function devNewOk() {
   if (!name) return;
   devNewCancel();
   devCurrent = name;
-  devSaved = "";
-  document.getElementById("devfname").textContent = name + " (новый)";
+  // null = «на диске этого файла нет»: редактор считается грязным до сохранения
+  devSaved = null;
+  document.getElementById("devfname").textContent = name + " ●";
   document.getElementById("devsel").value = "";
   document.getElementById("devcode").value = "";
   devLang(name);

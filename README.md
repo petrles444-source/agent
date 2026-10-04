@@ -306,15 +306,22 @@ ThinkingAgent — это проектонезависимый субагент, 
 ```
 ThinkingAgent/
 ├─ README.md                    ← эта инструкция
+├─ CHANGELOG.md                 ← история изменений
 ├─ docs/
 │  ├─ TZ_thinking_subagent.md   ← полное ТЗ (контракты, промты, протоколы)
-│  └─ schema_plan.json          ← снимок схемы плана (сверяется тестом)
+│  ├─ БЫСТРЫЙ_СТАРТ.md          ← запуск за 5 минут
+│  ├─ ДИАГНОСТИКА_ПОТОКОВ.md    ← разбор обрывов SSE/туннеля
+│  ├─ ПЛАН_РАЗВИТИЯ.md          ← куда движемся
+│  ├─ АУДИТ_СТРАТЕГИЧЕСКИЙ.md   ← аудит и приоритеты
+│  ├─ plan_work_first.md        ← принцип «сначала план»
+│  ├─ schema_plan.json          ← снимок схемы плана (сверяется тестом)
+│  └─ subagent_advice_5.txt     ← пример ответа рефлексии
 ├─ thinking/                    ← пакет (чистая stdlib)
 │  ├─ schemas.py                ← контракты + валидация, «источник правды»
 │  ├─ client.py                 ← синхронный клиент, история, benefits()
 │  ├─ fallback.py               ← офлайн-заглушка
 │  └─ colab/                    ← исходники ячеек Colab (их же заливает zip)
-│     ├─ cell_a_setup.py        ← ячейка A: окружение + сборка + 6 моделей
+│     ├─ cell_a_setup.py        ← ячейка A: окружение + сборка + модели
 │     ├─ cell_c_server.py       ← ячейка C: сборка /content/thinking_server.py
 │     ├─ cell_d_launch.py       ← ячейка D: LLM + API + туннель → URL/токен
 │     ├─ cell_e_background.py   ← ячейка E: фоновый режим/снапшот
@@ -322,17 +329,19 @@ ThinkingAgent/
 ├─ tools/
 │  ├─ thinking_cli.py           ← CLI главного агента + панель (/api/state, SSE)
 │  ├─ thinking_panel.html       ← веб-интерфейс (9 вкладок, по-русски)
-│  ├─ thinking_test.py          ← 607 офлайн-проверок
+│  ├─ thinking_test.py          ← 672 офлайн-проверки
 │  ├─ thinking_online_test.py   ← онлайн-проверки против живого Colab
 │  └─ mock_llm.py               ← локальная заглушка: разработка без Colab
 ├─ config/
 │  ├─ thinking.json             ← опции (без секретов)
 │  └─ thinking.local.json       ← base_url + токен (создаёт set-url, не в git)
 ├─ scripts/
-│  └─ build_colab.py            ← zip исходников + загрузка + .ipynb за 1 команду
+│  ├─ build_colab.py            ← zip исходников + загрузка + .ipynb за 1 команду
+│  ├─ build_bats.py             ← ЗАПУСТИТЬ_МЫШЛЕНИЕ / ОСТАНОВИТЬ_МЫШЛЕНИЕ
+│  └─ smoke_chat.py             ← проверка чата без панели
 ├─ colab/
-│  └─ thinking_colab.ipynb      ← готовый ноутбук (генерируется build_colab.py)
-└─ logs/thinking/
+│  └─ thinking_agent_ver3.ipynb ← готовый ноутбук (генерируется build_colab.py)
+└─ logs/thinking/               ← история (в git не попадает)
    ├─ thoughts.jsonl            ← живой поток событий (вкладка «Мысли»)
    ├─ interactions.jsonl        ← история запросов/ответов (вкладка «Диалог»)
    └─ reports.jsonl             ← отчёты (вкладка «Отчёты», KPI, экспорт .md)
@@ -438,7 +447,11 @@ python tools/thinking_cli.py doctor
 | `url` | показать сохранённый адрес (токен маскируется) |
 | `plan "задача" [--files a,b] [--constraint …] [--context …] [--max-steps N] [--stream] [--json]` | декомпозиция задачи → отчёт с шагами |
 | `ask "вопрос" […]` | короткий совет (по умолчанию до 5 шагов) |
+| `ask-multi "вопрос"` | один вопрос нескольким моделям параллельно |
 | `reflect PLAN_ID --step N --result "…" [--observation …] [--error …] [--async]` | рефлексия после шага |
+| `reflect-metrics` | пересчёт KPI «выгоды» по журналу |
+| `models` / `use-model <путь>` | список моделей / переключение на лету |
+| `dump [llm.log]` | скачать серверный файл (логи, дампы) |
 | `tail [--n N] [--follow]` | журнал событий (живой поток) |
 | `metrics` | KPI: обращения, планы, шаги, время ответа, заглушка |
 | `panel [--port N]` | веб-панель (по умолчанию 127.0.0.1:8765) |
@@ -448,6 +461,7 @@ python tools/thinking_cli.py doctor
 | Код | Значение |
 |---|---|
 | 0 | успех |
+| 1 | общая ошибка: ни одна модель не ответила / запрос не прошёл |
 | 2 | Colab недоступен → ответ из заглушки (`fallback=True`) |
 | 3 | нарушен контракт (валидация JSON-схемы) |
 | 4 | сервер недоступен / ошибка соединения |
@@ -654,12 +668,13 @@ curl -s -X POST "$THINKING_URL/plan" -H "X-Agent-Token: $THINKING_TOKEN" \
 | `retry` | 3 попытки, экспоненциальная пауза | — |
 | `stream` | стримить ли мысли по SSE | `true` |
 | `fallback_on_error` | отдавать заглушку при недоступном Colab | `true` |
-| `plan_timeout` / `reflect_timeout` | лимиты ответа LLM | 180 / 180 с |
+| `plan_timeout` / `reflect_timeout` | лимиты ответа LLM (на CPU план живёт минуты) | 360 / 180 с |
 | `panel_host` / `panel_port` | адрес панели | 127.0.0.1:8765 |
 | `log_path` / `interactions_path` / `reports_path` | куда пишется история | `logs/thinking/*` |
 
 Секреты: `config/thinking.local.json` либо переменные окружения
-`THINKING_URL` и `THINKING_TOKEN` (имеют приоритет).
+`THINKING_URL` и `THINKING_TOKEN`. Приоритет у локального файла: он →
+`config/thinking.json` → переменные окружения (`client.py: reload_config`).
 
 > ⚠️ **Никогда не коммитьте `config/thinking.local.json`** — там адрес и токен
 > доступа к Colab. Файл внесён в `.gitignore`, шаблон без секретов —

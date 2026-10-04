@@ -334,6 +334,17 @@ async def emit(type_: str, text: str, **kw) -> dict:
             # переподключится через /events?since= и доберёт хвост (AUD-11).
             # Раньше очередь была без лимита и медленный клиент копил
             # события в памяти сервера бесконечно.
+            # Сентинел None обязателен: без него генератор подписчика вечно
+            # ждал q.get() и никогда не получал EOF — комментарий про
+            # «клиент переподключится» был неверен (аудит B).
+            try:
+                q.get_nowait()          # освобождаем место под сентинел
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                q.put_nowait(None)     # None = «закрыть поток»
+            except asyncio.QueueFull:
+                pass
             dead.append(q)
         except Exception:
             dead.append(q)
@@ -845,16 +856,36 @@ async def index(token: str = ""):
     return PANEL_HTML.replace("__TOKEN__", json.dumps(str(token)))
 
 
+# GPU/VRAM с кэшем на 30 с: `import torch` внутри обработчика — сотни мс
+# блокировки цикла событий, а /health панель дёргает каждые 2,5 с, и
+# тормозились вместе с ним пинги живых потоков (аудит B, 03-colab).
+_GPU_INFO: dict = {"gpu": "cpu", "vram": None, "at": 0.0}
+
+
+def _gpu_info() -> tuple:
+    """GPU/VRAM с кэшем на 30 с.
+
+    `import torch` внутри обработчика — сотни мс блокировки цикла событий,
+    а /health панель дёргает каждые 2,5 с: тормозились и пинги живых потоков
+    (аудит B, 03-colab).
+    """
+    if time.time() - _GPU_INFO["at"] > 30:
+        gpu, vram = "cpu", None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu = torch.cuda.get_device_name(0)
+                vram = round(torch.cuda.memory_allocated() / 2 ** 30, 2)
+        except Exception:
+            pass
+        _GPU_INFO.update(gpu=gpu, vram=vram, at=time.time())
+    return _GPU_INFO["gpu"], _GPU_INFO["vram"]
+
+
 @app.get("/health")
 async def health(x_agent_token: str = Header(default=""), token: str = ""):
     _auth(x_agent_token, token)
-    gpu, vram = "cpu", None
-    try:
-        import torch
-        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-        vram = round(torch.cuda.memory_allocated() / 2 ** 30, 2)
-    except Exception:
-        pass
+    gpu, vram = _gpu_info()
     return {"status": "ok", "model": MODEL_NAME, "upstream": UPSTREAM,
             "uptime_s": int(time.time() - S.t0), "plans": len(S.plans),
             "events": S.seq, "gpu": gpu, "vram_used_gb": vram}
@@ -913,6 +944,8 @@ async def events_stream(x_agent_token: str = Header(default=""), token: str = ""
                     # ping каждые 10 с: туннель и прокси рвут «тихое» соединение,
                     # а панель на ПК держит read-timeout потока 40 с
                     ev = await asyncio.wait_for(q.get(), timeout=10)
+                    if ev is None:     # сентинел от emit(): очередь переполнена
+                        return
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
@@ -1274,7 +1307,11 @@ async def _switch_to(path: str) -> dict:
     S.switching = True
     try:
         await emit("thought", f"Переключаю модель на {_model_label(path)}…")
-        subprocess.run(["pkill", "-f", "llama_cpp.server"], capture_output=True)
+        # Убиваем только ОСНОВНОЙ движок (:8001): широкий паттерн сносил
+        # параллельные llm2/llm3, а /parallel продолжал читать устаревший
+        # манифест — панель показывала модели, которых уже нет (аудит B)
+        subprocess.run(["pkill", "-f", f"llama_cpp.server.*--port {LLM_PORT}"],
+                       capture_output=True)
         await asyncio.sleep(2)
         # with закрывает родительскую копию хендлера — у процесса своя,
         # а хендлеров, утекающих на каждое переключение, больше нет (C-6)
@@ -1549,6 +1586,17 @@ async def dev_stream(req: DevRequest, x_agent_token: str = Header(default=""),
                                       "X-Accel-Buffering": "no"})
 
 
+def _read_dump(path: str) -> bytes:
+    """Чтение дампа в рабочем потоке.
+
+    Файл может быть многомегабайтным, а синхронный read() в обработчике
+    блокировал весь цикл событий — вместе с пингами живых потоков и
+    соседними запросами (аудит B, 03-colab).
+    """
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 @app.get("/dump/{name}")
 async def dump(name: str, x_agent_token: str = Header(default=""), token: str = ""):
     """Отдаёт серверный файл из белого списка — чтобы ПК мог снять логи
@@ -1558,8 +1606,7 @@ async def dump(name: str, x_agent_token: str = Header(default=""), token: str = 
     if not path:
         raise HTTPException(404, f"файл «{name}» не в списке: {', '.join(DUMP_FILES)}")
     try:
-        with open(path, "rb") as fh:
-            data = fh.read()
+        data = await asyncio.to_thread(_read_dump, path)
     except OSError as exc:
         raise HTTPException(404, f"нет файла: {exc}")
     await emit("thought", f"выгружен файл {name} ({len(data)} байт)")

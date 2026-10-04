@@ -100,6 +100,21 @@ def _str_list(value: Any, limit: int = 40) -> list[str]:
     return [str(v)[:500] for v in value if str(v).strip()][:limit]
 
 
+def _redact(value: Any, limit: int = 800) -> str:
+    """Редактирование любого текстового поля плана.
+
+    Аудит B: редактировался только `rationale`, а `goal`, `fallback`,
+    `sub_goals`, `constraints`, `contradictions`, `success_criteria`,
+    `unknown_files` и `steps[].desc` уходили в журнал и на панель сырыми —
+    секрет в любом из них утекал в logs/thinking/*.jsonl.
+    """
+    return redact_secrets(str(value or ""))[:limit]
+
+
+def _redact_list(value: Any, limit: int = 40) -> list[str]:
+    return [redact_secrets(str(v))[:500] for v in _str_list(value, limit)]
+
+
 def _norm_action(value: Any) -> str:
     """Неизвестный тег -> verify (косметика, не ошибка контракта)."""
     tag = str(value or "").strip().lower()
@@ -147,9 +162,9 @@ class PlanStep:
         return cls(
             id=sid,
             action=_norm_action(data.get("action")),
-            desc=desc[:400],
+            desc=_redact(data.get("desc"), 400),
             inputs=inputs if isinstance(inputs, dict) else {},
-            expected_output=str(exp)[:400] if exp else None,
+            expected_output=_redact(exp, 400) if exp else None,
             retry_policy=_norm_retry(data.get("retry_policy")),
             depends_on=[d for d in depends if d != sid],
         )
@@ -197,7 +212,6 @@ class Plan:
             # depends_on, указывающий на несуществующий шаг, — не фатально, но чистим
             for step in steps:
                 step.depends_on = [d for d in step.depends_on if d in set(ids)]
-        goal = str(data.get("goal") or "").strip() or "(без названия)"
         try:
             conf = float(data.get("confidence", 0.7))
         except Exception:
@@ -207,17 +221,17 @@ class Plan:
             source = "colab"
         return cls(
             plan_id=str(data.get("plan_id") or uuid.uuid4()),
-            goal=goal[:500],
+            goal=_redact(data.get("goal"), 500) or "(без названия)",
             steps=steps,
             source=source,
-            rationale=redact_secrets(str(data.get("rationale") or ""))[:800],
+            rationale=_redact(data.get("rationale"), 800),
             confidence=max(0.0, min(1.0, conf)),
-            sub_goals=_str_list(data.get("sub_goals"), 20),
-            constraints=_str_list(data.get("constraints")),
-            contradictions=_str_list(data.get("contradictions")),
-            success_criteria=_str_list(data.get("success_criteria"), 20),
-            unknown_files=_str_list(data.get("unknown_files"), 40),
-            fallback=str(data.get("fallback") or "выполнить напрямую, без субагента")[:400],
+            sub_goals=_redact_list(data.get("sub_goals"), 20),
+            constraints=_redact_list(data.get("constraints")),
+            contradictions=_redact_list(data.get("contradictions")),
+            success_criteria=_redact_list(data.get("success_criteria"), 20),
+            unknown_files=_redact_list(data.get("unknown_files"), 40),
+            fallback=_redact(data.get("fallback"), 400),
             created_at=str(data.get("created_at") or utcnow()),
         )
 

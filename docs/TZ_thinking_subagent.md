@@ -1438,7 +1438,7 @@ PANEL:    http://127.0.0.1:8765
 
 # ЧАСТЬ X. ТЕСТИРОВАНИЕ
 
-## 10.1. `tools/thinking_test.py` — офлайн (идёт в `tools/run_all.py`)
+## 10.1. `tools/thinking_test.py` — офлайн (идёт в CI и локально)
 
 Формат вывода — как в остальных тестах репо:
 `ПРОЙДЕНО: N   ПРОВАЛЕНО: N` + строки `  ! ...`, exit 1 при провалах.
@@ -1446,28 +1446,27 @@ PANEL:    http://127.0.0.1:8765
 Проверки (без сети, всегда зелёные на CI/локально):
 1. `thinking.schemas.Plan.model_json_schema()` == `docs/schema_plan.json` (снимок).
 2. Уникальность `step.id` валидируется; `>30` шагов отклоняется.
-3. `extract_json` (скопировать функцию в тест или импортировать из `thinking/json_util.py`): plain JSON, JSON в ```` ```json ````, JSON с хвостом-текстом, JSON с висячей запятой, отсутствие `{` → `ValueError`.
+3. `thinking.schemas.extract_json`: plain JSON, JSON в ```` ```json ````, JSON с хвостом-текстом, JSON с висячей запятой, отсутствие `{` → `ValueError`.
 4. `local_plan()` возвращает `source="local-fallback"`, ≥1 шаг, `plan_id` непустой.
 5. `ThinkingClient` без `base_url` → `plan_with_fallback()` возвращает `is_fallback=True`, а не исключение.
 6. Конфиг `config/thinking.json` парсится, содержит все обязательные ключи, `base_url` по умолчанию пуст.
 7. Фильтр секретов: `plan(task="пароль hunter2")` → ошибка, до сетевого вызова.
-8. Файл ноутбука `thinking/colab/cell_c_server.py` содержит все маршруты: `/health`, `/events`, `/events/stream`, `/plan`, `/plan/stream`, `/reflect`, `/cancel/` (ловит случайную правку).
+8. Файл ноутбука `thinking/colab/cell_c_server.py` содержит все маршруты: `/health`, `/events`, `/events/stream`, `/plan`, `/plan/stream`, `/reflect`, `/chat`, `/chat/stream`, `/dev`, `/dev/stream`, `/ask/multi`, `/models`, `/parallel`, `/dump/{name}` (ловит случайную правку).
 
-## 10.2. `tests_live` — по желанию, только при `THINKING_URL`
+## 10.2. `tools/thinking_online_test.py` — по желанию, только при `THINKING_URL`
 
 ```bash
-THINKING_URL=https://... THINKING_TOKEN=... python tools/thinking_test.py --live
+python tools/thinking_online_test.py            # полный прогон (LLM: план + рефлексия)
+python tools/thinking_online_test.py --quick    # без LLM: связь, токен, метрики, события
+python tools/thinking_online_test.py --stream   # полный + отдельная проверка /plan/stream
 ```
 `health < 200 мс`; `plan("проверка связи")` возвращает `steps` и `rationale` по-русски; `reflect` по несуществующему `plan_id` → не 500; `events?tail=5` → `last_seq` растёт; `tail` после `plan` содержит `final`.
 
-## 10.3. Нагрузочный тест — `tools/thinking_load.py` (Windows-совместимый, вместо `hey`)
+## 10.3. Нагрузочный тест
 
-```bash
-python tools/thinking_load.py --url https://... --token ... --workers 5 --requests 25
-# печатает: p50/p95 латентности, 429/5xx, bad_json, очередь
-```
-Потоки `concurrent.futures.ThreadPoolExecutor`, `urllib` — без внешних зависимостей.
-Ожидание: `p95 /plan < 30 с`, `0 bad_json`, `0 5xx` (429 допустимы, они учтены в rate limit).
+Отдельного скрипта в репозитории нет: нагрузку проверяют вручную через
+`tools/thinking_online_test.py --stream` и `curl` против живого туннеля.
+Ориентиры: `p95 /plan < 30 с`, `0 bad_json`, `0 5xx` (429 допустимы, они учтены в rate limit).
 
 ## 10.4. Чек-лист приёмки
 
@@ -1481,12 +1480,10 @@ python tools/thinking_load.py --url https://... --token ... --workers 5 --reques
 [ ] При выключенном Colab: план = fallback, код выхода 2, приложение работает
 [ ] Реконнект SSE после kill cloudflared ≤ 5 с, без потери журнала
 [ ] /plan/stream отдаёт токены до итогового JSON
-[ ] /cancel/{id} отвечает и не растит plans
 [ ] Без токена → 401; 20 запросов/с → 429
 [ ] logs/thinking/thoughts.jsonl растёт и ротируется на 5 МБ
-[ ] python tools/thinking_test.py → ПРОВАЛЕНО: 0; run_all не регрессирует (538/0 + новые)
+[ ] python tools/thinking_test.py → ПРОВАЛЕНО: 0
 [ ] OOM при одновременной генерации волн → перезапуск с n_gpu_layers=20 восстанавливает сервер
-[ ] Нагрузка 25 запросов: p95 < 30 с, 0 bad_json
 ```
 
 ---

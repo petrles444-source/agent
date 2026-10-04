@@ -209,6 +209,12 @@ class ThinkingClient:
         self._lock = threading.Lock()  # из одной миллисекунды (аудит C-2)
         self._stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
+        # Поколение потока событий: смена адреса (set-url) обязана разорвать
+        # текущее SSE и переподключиться к новому туннелю, а не держать
+        # соединение со старым (split-brain «REST новый / события старые»)
+        self._stream_gen = 0
+        self._stream_cb: Optional[Callable[[dict], None]] = None
+        self._cur_resp = None
         self.last_ok: Optional[str] = None
         self.last_error: str = ""
         self.online = False
@@ -313,6 +319,12 @@ class ThinkingClient:
         # URL. Ошибки старого адреса к новому отношения не имеют.
         self._cb_errors = self._cb_stream_errors = 0
         self._cb_open_until = self._cb_stream_until = 0.0
+        # Живой SSE держит соединение со СТАРЫМ туннелем: без перезапуска
+        # панель получала события с мёртвого адреса, а REST уже ходил на
+        # новый — split-brain «REST новый / события старые» (аудит B).
+        if self._reader and self._reader.is_alive():
+            self.stop_stream()
+            self.start_stream(self._stream_cb or (lambda ev: None))
         return True
 
     def set_token(self, token: str) -> Path:
@@ -799,28 +811,44 @@ class ThinkingClient:
     def start_stream(self, on_event: Callable[[dict], None]) -> None:
         if self._reader and self._reader.is_alive():
             return
+        self._stream_cb = on_event
         self._stop.clear()
+        self._stream_gen += 1
         self._reader = threading.Thread(target=self._stream_loop,
-                                        args=(on_event,), daemon=True)
+                                        args=(on_event, self._stream_gen),
+                                        daemon=True)
         self._reader.start()
 
     def stop_stream(self) -> None:
+        self._stream_gen += 1
         self._stop.set()
+        # Закрываем текущее соединение: иначе поток сидел в чтении SSE до
+        # таймаута (до 40 с) и переподключение на новый адрес задерживалось
+        resp = self._cur_resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        th = self._reader
+        if th is not None and th.is_alive() and th is not threading.current_thread():
+            th.join(timeout=3.0)
 
-    def _stream_loop(self, on_event: Callable[[dict], None]) -> None:
+    def _stream_loop(self, on_event: Callable[[dict], None], gen: int) -> None:
         delay = float(self.cfg.get("reconnect_delay", 5))
         # Таймаут чтения обязан быть больше интервала ping сервера (25 с):
         # иначе «тихий» поток всегда рвётся и не доживает до следующего события.
         read_to = max(30.0, float(self.cfg.get("stream_timeout", 40)))
-        while not self._stop.is_set():
+        while not self._stop.is_set() and gen == self._stream_gen:
             try:
                 with self._open("GET", "/events/stream",
                                 timeout=read_to, stream=True) as resp:
+                    self._cur_resp = resp
                     self.stream_ok = True
                     self.stream_error = ""
                     buf: list[str] = []
                     for raw in resp:
-                        if self._stop.is_set():
+                        if self._stop.is_set() or gen != self._stream_gen:
                             break
                         line = raw.decode("utf-8", "replace").rstrip("\r\n")
                         if line.startswith("data:"):
@@ -842,6 +870,8 @@ class ThinkingClient:
                 else:
                     log.warning("поток мыслей оборвался: %s", exc)
                 time.sleep(delay)
+            finally:
+                self._cur_resp = None
 
     def _dispatch(self, chunk: str, on_event: Callable[[dict], None]) -> None:
         try:
@@ -1225,7 +1255,13 @@ class ThinkingClient:
         if not out:
             try:
                 out = self._chat_via_plan(text, context, max_steps)
-            except (ThinkingError, SchemaError):
+            except (ThinkingError, SchemaError) as exc:
+                # Аудит B: третий путь ошибки чата тоже не писался в учёт —
+                # сервер без /chat и с упавшим /plan давал тихую заглушку
+                self.stats["errors"] += 1
+                self._record_chat(text, "", t0, fallback=True, ok=False,
+                                  error=f"чат через /plan не удался: {exc}"[:400],
+                                  author=author)
                 out = {"reply": "", "source": "local-fallback", "fallback": True,
                        "tokens_in": 0, "tokens_out": 0, "tokens_estimate": False}
         reply = ChatReply.from_dict(out)
@@ -1415,6 +1451,13 @@ class ThinkingClient:
             # Ошибки самого сервера не повторяем — он ответит тем же.
             if str(exc).startswith("сервер:"):
                 raise
+            # Аудит B: обрыв потока чата не писался ни в stats["errors"], ни в
+            # журнал — при мёртвом туннеле «Диагностика» показывала ноль
+            # ошибок, хотя каждый чат падал и спасался фолбэком.
+            self.stats["errors"] += 1
+            self._record_chat(text, "", t0, fallback=False, ok=False,
+                              error=f"поток чата не прошёл: {exc}"[:400],
+                              author=author)
             log.warning("поток чата не прошёл (%s) — пробую /chat без потока", exc)
             # author пробрасываем: диалог человека, спасённый фолбэком,
             # иначе уходит в журнал как агентский (аудит B-2)

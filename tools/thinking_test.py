@@ -2434,6 +2434,64 @@ def test_coerce_plan_hardening() -> None:
           "coerce_plan: ограничения Plan._steps учтены")
 
 
+def test_server_resource_fixes() -> None:
+    """Волна B: блокирующие вызовы в async-обработчиках убраны.
+
+    Сервер исполняется только на Colab, поэтому здесь маркеры + сверка
+    поведения там, где функцию можно вырезать и вызвать локально.
+    """
+    src = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
+    check("def _gpu_info" in src and "_GPU_INFO" in src,
+          "Colab: import torch в /health кэшируется, а не в цикле событий")
+    check("asyncio.to_thread(_read_dump, path)" in src,
+          "Colab: /dump читается в потоке, а не блокирует цикл событий")
+    check("q.put_nowait(None)" in src and "if ev is None:" in src,
+          "Colab: переполненная очередь событий закрывает поток сентинелом")
+    check("def _env_text" in src and "_ENV_CACHE" in src,
+          "Colab: thinking_env.sh читается по mtime, а не на каждый запрос")
+    check("SEM_WAIT_S" in src and "sem_slot" in src,
+          "Colab: семафор генерации с таймаутом (волна 2)")
+    check("stream_aborted" in src and "stream_first_ms" in src,
+          "Colab: телеметрия потоков в /metrics (волна 2)")
+
+    cli_src = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    check("--no-access-log" in (ROOT / "thinking" / "colab" / "cell_d_launch.py")
+          .read_text(encoding="utf-8"),
+          "Colab: uvicorn без access-log — токен из query не уезжает в /dump")
+    check("headers=hdr" in (ROOT / "thinking" / "colab" / "cell_d_launch.py")
+          .read_text(encoding="utf-8"),
+          "Colab: wait_http ждёт /health с токеном, а не 60 с впустую")
+
+    client_src = (ROOT / "thinking" / "client.py").read_text(encoding="utf-8")
+    check("_stream_gen" in client_src and "_cur_resp" in client_src,
+          "клиент: смена адреса разрывает SSE и переподключается к новому")
+    check("поток чата не прошёл" in client_src,
+          "клиент: обрыв потока чата пишется в errors и журнал")
+
+
+def test_plan_redacts_all_text_fields() -> None:
+    """Аудит B: редактировался только rationale, остальные тексты — сырыми."""
+    secret = "password=hunter2"
+    p = Plan.from_dict({"goal": f"задача {secret}",
+                        "rationale": f"потому что {secret}",
+                        "fallback": f"иначе {secret}",
+                        "sub_goals": [f"цель {secret}"],
+                        "constraints": [f"ограничение {secret}"],
+                        "contradictions": [f"против {secret}"],
+                        "success_criteria": [f"критерий {secret}"],
+                        "unknown_files": [f"файл {secret}"],
+                        "steps": [{"id": 1, "action": "verify",
+                                    "desc": f"шаг {secret}"}]})
+    blob = " ".join([p.goal, p.rationale, p.fallback, " ".join(p.sub_goals),
+                     " ".join(p.constraints), " ".join(p.contradictions),
+                     " ".join(p.success_criteria), " ".join(p.unknown_files),
+                     " ".join(s.desc for s in p.steps)])
+    check("hunter2" not in blob,
+          "план: секрет вычищен из ВСЕХ текстовых полей, а не только rationale")
+    check(p.goal.startswith("задача") and p.steps[0].desc.startswith("шаг"),
+          "план: поля не опустели после редактирования")
+
+
 def main() -> int:
     # CI (windows-latest, локаль en-US): stdout = cp1252, а печатаем
     # по-русски — без переконфигурации финальный счётчик роняет процесс
@@ -2459,6 +2517,8 @@ def main() -> int:
     test_panel_host_and_models()
     test_audit_wave_a()
     test_coerce_plan_hardening()
+    test_server_resource_fixes()
+    test_plan_redacts_all_text_fields()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()
