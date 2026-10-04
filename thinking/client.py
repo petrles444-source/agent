@@ -151,6 +151,26 @@ def _append_jsonl(path: Path, obj: dict) -> None:
         log.debug("не дописался %s: %s", path, exc)
 
 
+def _set_read_timeout(resp: object, seconds: float) -> None:
+    """Сменить таймаут чтения УЖЕ открытого ответа.
+
+    `urlopen` задаёт сокет-таймаут один раз на всё тело, а нам нужно разное
+    терпение до первого байта и после: на CPU модель думает долго (замер
+    05.10 через живую телеметрию сервера: первый байт плана — 85.8 с), а
+    между токенами пауза в разы меньше. Один таймаут на оба случая — это
+    либо слишком долгое ожидание обрыва, либо отказ живого потока (живой
+    прогон 04.10: поток рвался на 45-й секунде, а сервер ещё даже не
+    начал отдавать текст).
+    """
+    try:
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None),
+                       "_sock", None)
+        if sock is not None:
+            sock.settimeout(float(seconds))
+    except Exception:                                       # noqa: BLE001
+        log.debug("не удалось сменить таймаут чтения: %s", seconds)
+
+
 def _is_read_timeout(exc: BaseException) -> bool:
     """Транспорт мёртв: обрыв/таймаут чтения, а не падение самого сервера."""
     if isinstance(exc, (socket.timeout, TimeoutError)):
@@ -1401,7 +1421,12 @@ class ThinkingClient:
         Ошибки сервера/схемы (ThinkingError) не повторяются.
         """
         stall = float(self.cfg.get("stream_stall", 45))
-        budget = max(stall * 2, float(self.cfg.get("chat_timeout", 600)))
+        # До первого байта терпение другое: модель на CPU думает минутами
+        # (живой замер 05.10 через телеметрию сервера: первый байт плана
+        # 85.8 с), и общий stall 45 с рвал ещё не начавшийся поток. После
+        # первого события возвращаемся к короткому таймауту — там он и нужен.
+        first_stall = max(stall, float(self.cfg.get("stream_stall_first", 180)))
+        budget = max(first_stall * 2, float(self.cfg.get("chat_timeout", 600)))
         total = 1 + max(0, int(self.cfg.get("stream_retries", 2)))
         t0 = time.time()
         last: Optional[BaseException] = None
@@ -1410,11 +1435,16 @@ class ThinkingClient:
             done: dict = {}
             try:
                 with self._open("POST", path, body, stream=True,
-                                timeout=stall) as resp:
+                                timeout=first_stall) as resp:
+                    got_any = False
                     for raw in resp:
                         line = raw.decode("utf-8", "replace").strip()
                         if not line.startswith("data:"):
-                            continue
+                            continue          # «: open», «: ping» — это не данные
+                        if not got_any:
+                            got_any = True
+                            # поток пошёл — дальше длинные паузы недопустимы
+                            _set_read_timeout(resp, stall)
                         try:
                             ev = json.loads(line[5:].strip())
                         except json.JSONDecodeError:

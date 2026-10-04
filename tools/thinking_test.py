@@ -1347,6 +1347,26 @@ def test_mock_llm_stub() -> None:
               "stream_stall оборвал бы чтение)")
         check(c.stats["plans"] >= 2,
               "заглушка: обычные запросы не пострадали от режимов")
+
+        # --- поток БЕЗ пингов: терпение до первого байта -----------------
+        # Живой замер 05.10: сервер отдаёт первый байт плана через ~86 с, и
+        # пинги через туннель не доходят. Прежний общий `stream_stall` 45 с
+        # рвал поток, который ещё даже не начался.
+        cn = make_client(**fast, stream_stall=1.0, stream_stall_first=8.0,
+                         chat_path=str(TMP / "nopings_chat.jsonl"))
+        cn.base = serve(mode="slow", first_delay=2.5, ping=0)
+        np_rep = cn.chat_stream("медленный старт без пингов")
+        check(bool(np_rep.get("reply"))
+              and np_rep.get("stream_fallback") is not True,
+              "поток без пингов: клиент дождался первого байта по "
+              "stream_stall_first, а не оборвался по stream_stall")
+        # контроль: без терпения поток действительно рвётся (тест не пустой)
+        cn2 = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+                          chat_path=str(TMP / "nopings2_chat.jsonl"))
+        cn2.base = serve(mode="slow", first_delay=3.0, ping=0)
+        np2 = cn2.chat_stream("нет терпения")
+        check(np2.get("stream_fallback") is True,
+              "контроль: с равными таймаутами поток без пингов всё-таки рвётся")
     finally:
         for srv in running:
             srv.shutdown()

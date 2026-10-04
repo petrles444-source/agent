@@ -114,6 +114,13 @@ def _port_busy(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def _ms(value: object) -> str:
+    """Миллисекунды в человекочитаемом виде для doctor."""
+    if isinstance(value, (int, float)):
+        return f"{int(value) / 1000:.1f} с"
+    return "—"
+
+
 def cmd_doctor(client: ThinkingClient, args: argparse.Namespace) -> int:
     ok = client.health(timeout=4)
     reason = "" if ok else offline_reason(client)
@@ -144,6 +151,25 @@ def cmd_doctor(client: ThinkingClient, args: argparse.Namespace) -> int:
                  "Google-аккаунт. На будущее: Kaggle (~30 ч GPU/нед), "
                  "Paperspace, локальный runtime.")
     _out(f"TOKEN:    {'задан' if client.token else 'НЕ задан'}")
+    # Телеметрия потоков с сервера: по ней видно, рвётся ДОСТАВКА или
+    # ГЕНЕРАЦИЯ. Раньше это приходилось выяснять по косвенным признакам
+    # (сорок пять секунд тишины), и гипотезы множились (живой прогон 04.10).
+    try:
+        mt = client._json("GET", "/metrics", None,
+                          timeout=min(client.timeout, 15))
+        aborted = int(mt.get("stream_aborted") or 0)
+        first = mt.get("stream_first_ms_avg")
+        dur = mt.get("stream_ms_avg")
+        wait = mt.get("sem_wait_ms_avg")
+        _out(f"ПОТОКИ:   обрывов={aborted}  первый байт={_ms(first)}  "
+             f"длина={_ms(dur)}  очередь={_ms(wait)}  "
+             f"таймаутов очереди={mt.get('sem_timeouts')}")
+        if aborted:
+            _out("! ПОТОКИ: сервер не довёл потоки до конца. Смотри ленту "
+                 "«Связь агентов»: строка «поток оборван на N мс» от сервера "
+                 "означает, что генерация шла, а оборвало соединение.")
+    except Exception:
+        pass                                   # старый сервер без /metrics
     if client.cfg.get("enabled", True):
         client.sync_history(tail=10)
         _out(f"STREAM:   last_seq={client.last_seq}  в буфере {len(client.buffered)}"

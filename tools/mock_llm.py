@@ -233,7 +233,10 @@ class MockState:
         self.mode = mode if mode in MODES else "normal"
         self.delay = max(0.0, float(delay))
         self.first_delay = max(0.0, float(first_delay))
-        self.ping = max(0.05, float(ping))
+        # ping = 0 — пинги НЕ шлём вовсе: так воспроизводится живой случай,
+        # когда они не доходят через туннель (клиент обязан терпеть до
+        # первого байта по stream_stall_first, а не по stream_stall)
+        self.ping = max(0.0, float(ping))
         self.max_tokens = int(max_tokens)
         self.dev_max_tokens = int(dev_max_tokens)
         self.token = str(token)
@@ -457,6 +460,9 @@ def make_handler(state: MockState) -> type:
                 time.sleep(state.first_delay)   # до заголовков писать нельзя
                 return True
             while time.time() < end:
+                if state.ping <= 0:            # режим «без пингов»
+                    time.sleep(max(0.02, end - time.time()))
+                    continue
                 time.sleep(min(state.ping, max(0.02, end - time.time())))
                 try:
                     self._ping()
