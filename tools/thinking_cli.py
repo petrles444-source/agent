@@ -956,11 +956,16 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
         # сессиями не засыпает, туннель считается живым.
         warm_every = max(1, int(1500 / every))
         n = 0
+        quiet_until = 0.0
+        last_note = ""
         while not stop_poll.wait(every):
             n += 1
+            if time.time() < quiet_until:
+                continue          # молчим: тот же адрес, тот же провал
             try:
                 _sync_target()
                 client.sync_history(tail=50)
+                last_note, quiet_until = "", 0.0
                 if n % warm_every == 0:
                     try:
                         ok = client.health(timeout=15)
@@ -968,7 +973,29 @@ def cmd_panel(client: ThinkingClient, args: argparse.Namespace) -> int:
                         ok = False
                     _out(f"[прогрев] /health {'ok' if ok else 'не прошёл'}")
             except Exception as exc:                           # noqa: BLE001
-                _out(f"! опрос событий не прошёл: {exc}")
+                # Живой случай 04.10: туннель умер (502 → 530/1033 → адрес
+                # перестал резолвиться), и опрос писал одно и то же каждые
+                # 5 с — около 600 строк «предохранитель: пауза ещё N с» за
+                # паузу, и настоящий сигнал тонул в шуме. Теперь причина
+                # называется один раз, дальше молчим, а на смену адреса
+                # реагируем сразу (его перезагрузит reload_config).
+                note = str(exc)
+                if note == last_note:
+                    quiet_until = time.time() + 300
+                    continue
+                last_note = note
+                if any(m in note for m in ("502", "530", "1033", "522",
+                                          "524", "getaddrinfo")):
+                    # туннель/адрес мёртв: стучаться бессмысленно
+                    quiet_until = time.time() + 120
+                    _out(f"! опрос событий: туннель недоступен — {note[:160]}")
+                    _out("  Нужен новый адрес (Colab перезапущен или ноутбук "
+                         "закрыт). Панель продолжит опрос сама.")
+                elif "предохранитель" in note:
+                    quiet_until = time.time() + 120   # пауза и так длинная
+                    _out(f"! опрос событий: {note[:200]}")
+                else:
+                    _out(f"! опрос событий не прошёл: {note[:200]}")
 
     threading.Thread(target=_poll_loop, daemon=True).start()
 

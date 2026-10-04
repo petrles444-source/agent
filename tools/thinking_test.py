@@ -355,6 +355,13 @@ def test_files() -> None:
         check(f'"{cmd}"' in cli, f"CLI: команда {cmd} объявлена")
     check("результат: python tools/thinking_cli.py tail" in cli,
           "CLI: фоновая рефлексия объясняет, где посмотреть результат")
+    # Живой случай 04.10: туннель умер, и опрос писал «предохранитель: пауза
+    # ещё N с» каждые 5 с — около 600 строк за паузу, и сигнал тонул в шуме.
+    check("quiet_until" in cli and "туннель недоступен" in cli,
+          "панель: опрос не повторяет одну и ту же ошибку каждые 5 с")
+    client_src = (ROOT / "thinking" / "client.py").read_text(encoding="utf-8")
+    check("_last_sync_note" in client_src,
+          "клиент: sync_history не пишет одну и ту же ошибку сотни раз")
 
 
 def test_reliability() -> None:

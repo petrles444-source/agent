@@ -926,12 +926,21 @@ class ThinkingClient:
             log.debug("обработчик события упал: %s", exc)
 
     def sync_history(self, tail: int = 100) -> list[dict]:
-        """Дотягивает историю по REST — работает даже когда SSE недоступен."""
+        """Дотягивает историю по REST — работает даже когда SSE недоступно."""
         try:
             data = self.events(tail=tail)
         except Exception as exc:
-            log.warning("sync_history: %s", exc)
+            # Не повторяем одну и ту же строку каждые 5 с: при мёртвом
+            # туннеле это давало сотни одинаковых предупреждений и
+            # настоящая причина тонула в шуме (живой случай 04.10).
+            note = str(exc)
+            if note != getattr(self, "_last_sync_note", ""):
+                self._last_sync_note = note
+                log.warning("sync_history: %s", note)
+            else:
+                log.debug("sync_history: %s (тот же провал)", note)
             return []
+        self._last_sync_note = ""
         out = data.get("events") or []
         for ev in out:
             if isinstance(ev, dict):
