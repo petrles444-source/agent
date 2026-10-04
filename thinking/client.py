@@ -510,7 +510,7 @@ class ThinkingClient:
         доживает до конца ответа (аудит B-5).
         """
         _pieces, done = self._stream_read("/reflect/stream", body,
-                                          label="рефлексия")
+                                          label="поток рефлексии")
         resp = done.get("response")
         if not isinstance(resp, dict):
             raise ThinkingError("поток рефлексии завершился без ответа")
