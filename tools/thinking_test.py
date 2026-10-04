@@ -789,8 +789,9 @@ def test_budget_matches_running_model() -> None:
     recalc = launch.index('os.environ["THINKING_MAX_TOKENS"] = _match[1]', loop)
     check(recalc > loop, "ячейка D: бюджет пересчитывается после выбора модели")
     tail = launch[recalc:recalc + 700]
-    check("MODEL = cand" in launch[loop:loop + 900],
-          "ячейка D: MODEL обновляется на ту, что поднялась")
+    tail_marker = launch.index("if health is None:", loop)
+    check(loop < launch.index("MODEL = cand", loop) < tail_marker,
+          "ячейка D: MODEL обновляется на ту, что поднялась (внутри цикла выбора)")
     check("setdefault" not in tail,
           "ячейка D: пересчёт затирает бюджет, а не молчит из-за setdefault")
     # причина отказа модели показывается, а не просто «не поднялась»
@@ -822,6 +823,9 @@ def test_failure_diagnostics() -> None:
     check("версию определить не удалось" in
           (ROOT / "thinking" / "colab" / "cell_a_setup.py").read_text(encoding="utf-8"),
           "ячейка A: печатает версию движка (от неё зависит поддержка Qwen3)")
+    # нужную память видно ДО ожидания, а не после отказа
+    check("веса+KV" in launch and "kv_gb" in launch,
+          "ячейка D: до ожидания печатает требуемую память (веса+KV)")
 
     # SystemExit внутри ячейки Colab IPython принимает за просьбу выключить ядро:
     # «Run all» печатал «An exception has occurred» и «To exit; use 'exit'».
@@ -1183,6 +1187,25 @@ def test_dev_metrics_limits() -> None:
           "ячейка A: каталог моделей — словарь, теги уникальны по построению")
     check("for tag in WANTED_TAGS:" in setup,
           "ячейка A: качаем теги выбранного профиля, без дублей")
+    # Запасная модель профиля обязана быть заметно меньше основной.
+    # Иначе откат бесполезен: если основная не влезла в RAM по памяти,
+    # модель того же размера тоже не влезет, и мы просто потратим на неё
+    # время и диск (именно так был устроен профиль strong: основная 14B и
+    # запасная Coder-14B — обе 8.4 ГБ).
+    import re as _re
+    # порог размера каждого тега прямо из CATALOG (в байтах, как в ячейке A)
+    _CATALOG_SIZE = {t: int(sz.replace("_", "")) for t, sz in
+                     _re.findall(r'"([a-z0-9_.-]+)":\s*\(\s*"[^"]+"\s*,\s*([\d_]+)\s*,', setup)}
+    _prof_block = setup.split("PROFILES")[1].split("\nPROFILE =")[0]
+    for _prof, _body in _re.findall(r'"([a-z0-9_.-]+)":\s*\[([^\]]*)\]', _prof_block):
+        _tags = _re.findall(r'"([a-z0-9_.-]+)"', _body)
+        if len(_tags) < 2:
+            continue
+        _sizes = [_CATALOG_SIZE.get(t) for t in _tags]
+        check(all(_sizes) and _sizes[-1] < _sizes[0],
+              f"профиль {_prof}: запасная {_tags[-1]} меньше основной {_tags[0]} "
+              f"(иначе откат не спасёт при нехватке памяти)")
+
     check('"coder-14b":' in setup and '"coder-32b":' in setup,
           "ячейка A: кодерские модели помечены отдельно от обычных")
 
