@@ -60,8 +60,15 @@ if os.path.exists(env_file):
 assert os.path.exists(model_file), "сначала выполните ячейку A (установка)"
 MODEL = open(model_file, encoding="utf-8").read().strip()
 assert os.path.exists(MODEL), f"модель не найдена: {MODEL}"
-MODELS = [m for m in (open(models_file, encoding="utf-8").read().split("\n")
-                      if os.path.exists(models_file) else []) if m] or [MODEL]
+# Цепочка отката — из отдельного файла: в thinking_models.txt лежит всё, что
+# можно переключить во вкладке «Модели», включая 7B, а откат обязан вести к
+# меньшей модели (на CPU 7B считает в разы медленнее 3B). Старые ноутбуки
+# chain-файла не писали — там берём models.txt, как было.
+chain_file = "/content/thinking_chain.txt"
+if not os.path.exists(chain_file):
+    chain_file = models_file
+MODELS = [m for m in (open(chain_file, encoding="utf-8").read().split("\n")
+                      if os.path.exists(chain_file) else []) if m] or [MODEL]
 print("MODEL:", MODEL, "| запасные:", [os.path.basename(m) for m in MODELS[1:]])
 
 # Длина ответа — единственное, для чего нужны бюджеты: рантайм бесплатный,

@@ -177,7 +177,17 @@ PROFILE = (os.environ.get("THINKING_PROFILE") or "auto").strip().lower()
 if PROFILE in ("", "auto"):
     PROFILE = "gpu" if GPU else "light"
 WANTED_TAGS = PROFILES.get(PROFILE) or PROFILES["light"]
-say(f"профиль моделей: {PROFILE} → {', '.join(WANTED_TAGS)}")
+EXTRA_TAGS = [t for t in ALSO.get(PROFILE, []) if t not in WANTED_TAGS]
+say(f"профиль моделей: {PROFILE}")
+# Что именно скачается — и почему столько. Раньше профиль печатался одной
+# строкой («dev → 3b, 1.5b»), а качалось ещё и 7B из ALSO, и человек
+# спрашивал, откуда взялся лишний гигабайт (04.10).
+say(f"  активная + откат: {', '.join(WANTED_TAGS)}")
+if EXTRA_TAGS:
+    say(f"  дополнительно для переключения во вкладке «Модели»: "
+        f"{', '.join(EXTRA_TAGS)} — в цепочку отката НЕ входит")
+say(f"  всего к загрузке ≈"
+    f"{sum(CATALOG[t][1] for t in WANTED_TAGS + EXTRA_TAGS) / 2**30:.1f} ГБ")
 if PROFILE not in PROFILES:
     say(f"  ⚠ неизвестный профиль, взят light (доступно: {', '.join(PROFILES)})")
 
@@ -208,17 +218,17 @@ def _fetch(repo: str, min_size: int) -> str:
 
 
 MODELS: list[str] = []
+EXTRA: list[str] = []                       # скачаны, но не в цепочке отката
 tag_of: dict[str, str] = {}                  # путь → тег (для выбора активной)
 # Качаем и цепочку отката, и дополнительные (ALSO), но в цепочку попадают
 # только модели профиля — дополнительные лежат на диске для переключения.
-for tag in list(WANTED_TAGS) + [t for t in ALSO.get(PROFILE, [])
-                                if t not in WANTED_TAGS]:
+for tag in list(WANTED_TAGS) + EXTRA_TAGS:
     repo, min_size, label, _rank = CATALOG[tag]
     path = _has(tag)
     if path:
         say(f"{tag}: уже на диске ({os.path.getsize(path) / 2**30:.2f} ГБ) — пропускаем")
+        (MODELS if tag in WANTED_TAGS else EXTRA).append(path)
         if tag in WANTED_TAGS:
-            MODELS.append(path)
             tag_of[path] = tag
         continue
     say(f"{tag}: качаю {repo}…")
@@ -232,6 +242,7 @@ for tag in list(WANTED_TAGS) + [t for t in ALSO.get(PROFILE, [])
             MODELS.append(path)
             tag_of[path] = tag
         else:
+            EXTRA.append(path)
             say("  (вне цепочки отката — только для переключения во вкладке «Модели»)")
     else:
         say(f"  {tag}: не скачалась, пропускаем (работаем на остальных)")
@@ -240,6 +251,11 @@ if not MODELS:                               # аварийный план: чт
     MODELS = have
     tag_of = {}
 assert MODELS, "ни одна модель не нашлась"
+# Переключать должно быть на что: цепочка отката плюс всё, что доехало
+# сверх неё. Раньше дополнительные модели скачивались и НЕ попадали ни в
+# thinking_models.txt, поэтому во вкладке «Модели» их не было видно —
+# 4,7 ГБ лежали на диске молча (04.10).
+SWITCHABLE = MODELS + [p for p in EXTRA if p not in MODELS]
 
 # Активная — первая из профиля, что реально скачалась; если профиль не дал
 # ничего, берём самую сильную из того, что лежит на диске.
@@ -278,6 +294,11 @@ say(f"ГОТОВО за {time.time()-START:.0f}с. Модели: "
                 for p in MODELS))
 for p in MODELS:
     say(f"  · {_hint(p)}")
+if EXTRA:
+    say("  для переключения во вкладке «Модели» дополнительно: "
+        + ", ".join(os.path.basename(p) for p in EXTRA))
+    for p in EXTRA:
+        say(f"  · {_hint(p)}")
 if not GPU:
     say("  ⚠ Рантайм на CPU: большие модели качаются заранее, но считаются "
         "медленно — переключи Runtime на T4 GPU, если нужна скорость.")
@@ -285,8 +306,13 @@ say(f"активная: {MODEL}  ·  профиль: {PROFILE}  ·  "
     "переключение — в панели (вкладка «Модели»)")
 with open("/content/thinking_model_path.txt", "w", encoding="utf-8") as fh:
     fh.write(MODEL)
-with open("/content/thinking_models.txt", "w", encoding="utf-8") as fh:
+# Два файла намеренно: цепочка отката (её перебирает ячейка D, и откат
+# обязан вести к меньшей модели) — отдельно от всего, что можно выбрать
+# во вкладке «Модели».
+with open("/content/thinking_chain.txt", "w", encoding="utf-8") as fh:
     fh.write("\n".join(MODELS) + "\n")
+with open("/content/thinking_models.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(SWITCHABLE) + "\n")
 with open("/content/thinking_backend.txt", "w", encoding="utf-8") as fh:
     fh.write("llama_cpp\n")
 print("OK-A")

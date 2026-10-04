@@ -1674,10 +1674,30 @@ def test_colab_cells() -> None:
     check("WANTED_TAGS" in setup and "PROFILES" in setup,
           "ячейка A: профиль выбирает, что именно качать")
 
+    # Аудит 04.10: профиль печатался одной строкой («dev → 3b, 1.5b»), а
+    # качалось ещё и 7B из ALSO, и человек спрашивал, откуда взялись лишние
+    # 4,7 ГБ. Теперь печатается и активная цепочка, и «дополнительно», и
+    # итоговый размер.
+    check("EXTRA_TAGS" in setup and "в цепочку отката НЕ входит" in setup,
+          "ячейка A: профиль объясняет, что качается сверх цепочки отката")
+    check("всего к загрузке" in setup,
+          "ячейка A: печатает, сколько мегабайт уйдёт на загрузку")
+    # и главное: скачанное сверх цепочки должно быть видно в переключателе
+    check("SWITCHABLE" in setup
+          and 'fh.write("\\n".join(SWITCHABLE) + "\\n")' in setup,
+          "ячейка A: доп. модели попадают в список для переключения")
+    check("thinking_chain.txt" in setup,
+          "ячейка A: цепочка отката пишется отдельным файлом")
+
     # бюджеты задают длину ответа и не переполняют окно
     launch = (ROOT / "thinking" / "colab" / "cell_d_launch.py").read_text(encoding="utf-8")
     setup_c = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(encoding="utf-8")
     check("MODEL_BUDGETS" in launch, "ячейка D: бюджеты по моделям одной таблицей")
+    check('chain_file = "/content/thinking_chain.txt"' in launch
+          and "chain_file = models_file" in launch,
+          "ячейка D: откат перебирает цепочку, а не весь список моделей")
+    check("thinking_models.txt" in setup_c,
+          "ячейка C: переключатель моделей читает список всех моделей")
     check("THINKING_DEV_MAX_TOKENS" in launch,
           "ячейка D: у режима разработки свой бюджет")
     check('("30b-a3b"' in launch and launch.index('("30b-a3b"')
@@ -1766,8 +1786,8 @@ def test_dev_metrics_limits() -> None:
     # качания идёт по тегам профиля (раньше здесь был dict.fromkeys)
     check("CATALOG: dict[str, tuple[str, int, str, int]]" in setup,
           "ячейка A: каталог моделей — словарь, теги уникальны по построению")
-    check("for tag in list(WANTED_TAGS) + [t for t in ALSO.get(PROFILE, [])" in setup
-          and "if t not in WANTED_TAGS]:" in setup,
+    check("EXTRA_TAGS = [t for t in ALSO.get(PROFILE, []) if t not in WANTED_TAGS]" in setup
+          and "for tag in list(WANTED_TAGS) + EXTRA_TAGS:" in setup,
           "ячейка A: качаем теги профиля плюс ALSO, без дублей")
     # Запасная модель профиля обязана быть заметно меньше основной.
     # Иначе откат бесполезен: если основная не влезла в RAM по памяти,
