@@ -1466,6 +1466,23 @@ def test_mock_llm_stub() -> None:
               "тихий период наступает после первой команды, если внутри неё "
               "три обрезанные попытки")
 
+        # --- тихий период, наступивший ВНУТРИ команды, обрывает её ---------
+        # Живой замер 05.10: план шёл 402 с, потому что тишина наступила
+        # после второй попытки, а третья всё равно была потрачена.
+        state3 = TMP / "stream_state3.json"
+        cs3 = make_client(**fast, stream_stall=1.0, stream_stall_first=1.0,
+                          stream_retries=2, stream_first_streak=1,
+                          stream_first_pause=600, state_path=str(state3),
+                          log_path=str(TMP / "s3_log.jsonl"),
+                          reports_path=str(TMP / "s3_rep.jsonl"))
+        srv3 = serve(mode="slow", first_delay=2.5, ping=0)
+        cs3.base = srv3
+        cs3.plan_with_fallback("тишина наступила внутри команды")
+        cnt3 = running[-1].mock_state.counters["requests"]
+        check(cnt3 == 2,
+              f"тихий период внутри команды обрывает её: 1 попытка потока + "
+              f"1 обычный запрос (запросов {cnt3}, было бы 4)")
+
         # --- 429: повторяется, но предохранитель не открывает --------------
         # Настоящий сервер считает частоту в том же _auth, что и токен, при
         # RPS=5 (cell_c:695-704): 429 получает и опрос /health панели. Если бы

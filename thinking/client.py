@@ -1610,6 +1610,12 @@ class ThinkingClient:
             self._note_stream(last)
             if attempt >= total or time.time() - t0 > budget:
                 break
+            if self.stream_quiet():
+                # Тихий период наступил ПРЯМО в этой команде: дальнейшие
+                # попытки на этом транспорте заведомо обрезаны, и ждать их —
+                # это минуты впустую (живой замер 05.10: 402 с вместо ~86).
+                log.warning("%s: тихий период наступил, прекращаю попытки", label)
+                break
             log.warning("%s %s оборвался (%s), повтор %d/%d",
                         label, path, last, attempt, total - 1)
             if on_retry:
