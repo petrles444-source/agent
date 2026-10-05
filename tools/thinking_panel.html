@@ -501,7 +501,7 @@
       Переключение перезапускает движок в рантайме: обычно 20–60 секунд,
       во время переключения чат недоступен. У каждой модели есть подсказка
       нужного режима (CPU / T4 GPU).</p>
-    <div class="warnbox b" id="gpuwarn"></div>
+    <p class="hint" id="gpunote"></p>
     <div class="mem">
       <button class="mini" onclick="loadModels()">Обновить список</button>
       <span id="modelnote" class="meta"></span>
@@ -1183,16 +1183,18 @@ async function loadModels() {
     document.getElementById("c-model").textContent =
       data && data.active_label ? data.active_label : "—";
     box.textContent = "";
-    // Без GPU: честно предупреждаем и предлагаем путь CPU / смена аккаунта
-    const gw = document.getElementById("gpuwarn");
+    /* Раньше здесь висел второй такой же баннер про GPU — дубль верхней
+       полосы (скриншот жалобы: два одинаковых окна). Теперь здесь только
+       короткая строка о текущем рантайме, а инструкция — наверху, один
+       раз. */
+    const gn = document.getElementById("gpunote");
     if (data && data.gpu === false) {
-      gw.style.display = "block";
-      gw.textContent = "GPU сейчас недоступен (бесплатные GPU-часы, видимо, "
-        + "исчерпаны). Путь: продолжить на CPU с 1.5B/3B (медленно) либо "
-        + "сменить Google-аккаунт — лимит бесплатного Colab обычно даётся "
-        + "на сутки. Проверить состояние: в Colab Сессия → Лимиты.";
+      gn.textContent = "Сейчас считает CPU. Как ускорить — в верхней полосе "
+        + "панели (или переключи рантайм на T4 GPU).";
+    } else if (data && data.gpu) {
+      gn.textContent = "Сейчас считает " + data.gpu + ".";
     } else {
-      gw.style.display = "none";
+      gn.textContent = "";
     }
     if (!list.length) {
       box.appendChild(el("div", "empty",
@@ -1928,11 +1930,20 @@ async function state() {
     }
   } catch (e) { setBadge(false); }
 }
-/* Лимиты бесплатного Colab: чётких квот нет, цифры в сообщениях — ориентир.
-   GPU-сессии обычно 2–4 ч; остаток CPU (бывает и ~28 ч) не гарантия. Если
-   встало — смотри в Colab: Сессия → Лимиты; лимиты часто возвращаются
-   примерно через сутки (или смена аккаунта). Путь: дотянуть на GPU → CPU →
-   сменить аккаунт. */
+/* Что делать с рантаймом — инструкция, а не догадки.
+   Раньше здесь писалось «бесплатные GPU-часы, видимо, исчерпаны» и дальше
+   «подождать ~сутки или сменить Google-аккаунт»: ни то, ни другое не было
+   проверено, а человеку нужна была конкретная последовательность действий.
+   Теперь — что означает CPU/GPU для скорости и что нажать, чтобы ускориться. */
+const CPU_HOWTO = "Сейчас считает CPU: 3B ≈ 2,5 ток/с (план 1–3 минуты, ответ "
+  + "в чате — минутами), в RAM помещаются только 1.5B/3B, 7B и крупнее "
+  + "не запустятся. Нужна скорость — переключи рантайм: Colab Runtime → "
+  + "Change runtime type → Hardware accelerator → T4 GPU, затем Runtime → "
+  + "Restart session (2–3 минуты). Нужен настоящий буст — Colab Pro "
+  + "(около 10 $ в месяц): стабильный GPU без суточных ограничений и больше "
+  + "VRAM.";
+const GPU_LONG = "GPU-сессия идёт уже";
+
 function showLimitWarn(h) {
   const w = document.getElementById("limitwarn");
   const up = Number(h.uptime_s || 0);
@@ -1940,25 +1951,22 @@ function showLimitWarn(h) {
   const noGpu = h.gpu != null && String(h.gpu) === "cpu";
   const parts = [];
   if (gpu && up >= 7200) {
-    parts.push("GPU-сессия идёт уже " + Math.round(up / 60) + " мин: бесплатный "
-      + "GPU в Colab обычно живёт 2–4 часа (это не баг, а особенность). "
-      + "Сохрани ноутбук заранее: дальше — CPU с 1.5B/3B, либо пауза ~сутки "
-      + "(лимиты часто возвращаются через 24 ч), либо другой аккаунт.");
+    parts.push(GPU_LONG + " " + Math.round(up / 60) + " мин: у бесплатного "
+      + "Colab GPU-время ограничено, и когда оно закончится, сессия перейдёт "
+      + "на CPU — скорость упадёт в разы. Сохрани ноутбук заранее.");
   }
   if (gpu && up >= 13500) {
-    parts.push("Сессия подолгу на GPU — если работа встала, проверь Colab: "
-      + "Сессия → Лимиты; время бывает разным и не гарантировано.");
+    parts.push(GPU_LONG + " " + Math.round(up / 60) + " мин — скорость "
+      + "уже упала или вот-вот упадёт. Дальше работа пойдёт на CPU.");
   }
   if (!gpu && up >= 93600) {
-    parts.push("CPU-сессия работает уже " + Math.round(up / 3600) + " ч: Colab "
-      + "показывал остаток в десятки часов, но это лишь ориентир — при "
-      + "остановке проверь Сессия → Лимиты (обычно возвращаются через сутки).");
+    parts.push("Сессия на CPU уже " + Math.round(up / 3600) + " ч. Скорость "
+      + "низкая — ускориться можно только сменой рантайма на T4 GPU "
+      + "(Runtime → Change runtime type), а без ограничений по времени — "
+      + "Colab Pro.");
   }
   if (noGpu && up >= 600) {
-    parts.push("GPU сейчас недоступен (бесплатные GPU-часы, видимо, исчерпаны): "
-      + "работаем на CPU с 1.5B/3B; восстановить GPU — подождать ~сутки или "
-      + "сменить Google-аккаунт. Альтернатива на будущее: Kaggle (~30 ч GPU "
-      + "в неделю), Paperspace Gradient, локальный runtime.");
+    parts.push(CPU_HOWTO);
   }
   if (parts.length) {
     w.textContent = parts.join(" ");

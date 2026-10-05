@@ -2068,17 +2068,16 @@ def test_dev_metrics_limits() -> None:
                    "/api/dev/rollback", "/api/dev/run", "за сегодня",
                    "за всё время", "calls_agent", "calls_chat", "Связь агентов"):
         check(marker in html, f"панель: есть {marker}")
-    check("2–4" in html and "сутки" in html,
-          "панель: лимиты Colab объяснены без пугающих цифр")
+    check("Change runtime type" in html and "Colab Pro" in html,
+          "панель: про рантайм написано инструкцией (куда нажать, что это даёт)")
 
     # --- CLI: маршруты токена/рефлексии/разработки и предупреждения ---
     cli = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
     for marker in ("/api/token", "/api/reflect-metrics", "/api/dev/chat",
                    "/api/dev/file", "/api/dev/run", "/api/dev/rollback",
-                   "/api/dev/files", "/api/dev/log", "ЛИМИТЫ",
+                   "/api/dev/files", "/api/dev/log", "Change runtime type",
                    '"reflect-metrics"'):
         check(marker in cli, f"CLI: {marker} есть")
-    check("Kaggle" in cli, "CLI: doctor упоминает запасные бесплатные платформы")
 
     # --- dev-функции живьём (регресс: запуск искал файл в dev_sandbox/dev_sandbox/) ---
     droot = TMP / "dev_sandbox"
@@ -3082,6 +3081,98 @@ def test_set_url_keeps_token() -> None:
         tmp.unlink(missing_ok=True)
 
 
+def test_gpu_notice_is_actionable() -> None:
+    """Про GPU — инструкция, один раз, без догадок.
+
+    Жалоба пользователя (скриншот): в верхней полосе и во вкладке «Модели»
+    висели два одинаковых окна, и оба говорили «бесплатные GPU-часы, видимо,
+    исчерпаны — подождать ~сутки или сменить аккаунт». Ничто из этого не
+    проверено, а человеку нужно было знать, что нажать.
+    """
+    html = (ROOT / "tools" / "thinking_panel.html").read_text(encoding="utf-8")
+    cli = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+
+    # догадки остались только в пояснениях к коду — вырезаем комментарии,
+    # иначе проверка ловила бы собственные комментарии разработчика
+    def _interface_only(text: str) -> str:
+        out, in_block = [], False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("/*", "*", "<!--")):
+                in_block = stripped.startswith("/*") and not stripped.endswith("*/")
+                continue
+            if in_block:
+                if stripped.endswith("*/"):
+                    in_block = False
+                continue
+            if stripped.startswith(("//", "#")):
+                continue
+            # хвостовые комментарии в коде
+            cut = re.sub(r"/\*.*?\*/", "", line)
+            cut = re.sub(r"(?<!:)//.*$", "", cut)
+            out.append(cut)
+        return "\n".join(out)
+
+    interface = _interface_only(html)
+    cli_iface = _interface_only(cli)
+
+    # дубль убран: блок с id="gpuwarn" был и наверху, и во вкладке
+    check(html.count('id="gpuwarn"') == 0,
+          f"панель: баннер про GPU не дублируется во вкладке «Модели» "
+          f"(найдено вхождений: {html.count('id=\"gpuwarn\"')})")
+    check('id="gpunote"' in html,
+          "панель: во вкладке «Модели» есть короткая строка о рантайме")
+
+    # никаких догадок в тексте интерфейса (пояснения в комментариях — можно)
+    for phrase in ("исчерпан", "GPU-часы", "сменить Google-аккаунт",
+                   "подождать ~сутки", "Kaggle", "вероятно", "видимо"):
+        check(phrase not in interface,
+              f"панель: убрано догадочное «{phrase}» из текста для человека")
+    for phrase in ("исчерпан", "GPU-часы", "подождать ~сутки",
+                   "сменить Google-аккаунт", "Kaggle", "видимо"):
+        check(phrase not in cli_iface, f"doctor: убрано догадочное «{phrase}»")
+
+    # что должно быть вместо этого
+    for needle, what in (
+            ("Change runtime type", "как переключить рантайм"),
+            ("Colab Pro", "платный вариант без лимитов"),
+            ("ток/с", "влияние CPU/GPU на скорость")):
+        check(needle in html, f"панель: есть инструкция — {what}")
+        check(needle in cli, f"doctor: есть инструкция — {what}")
+
+
+def test_server_rev_stamp() -> None:
+    """Ревью сборки: сервер на Colab сообщает, из какого кода собран.
+
+    Живой прогон 05.10: клиент был новый, а ноутбук на Colab — старый (без
+    /plan/async). Это выглядело как поломка, и причину пришлось искать
+    вручную по openapi.json. Теперь достаточно одного doctor.
+    """
+    build = (ROOT / "scripts" / "build_colab.py").read_text(encoding="utf-8")
+    server = (ROOT / "thinking" / "colab" / "cell_c_server.py").read_text(
+        encoding="utf-8")
+    cli = (ROOT / "tools" / "thinking_cli.py").read_text(encoding="utf-8")
+    check('SERVER_REV = "local"' in server,
+          "ревью: в ячейке C есть SERVER_REV, который подставляет сборка")
+    check('"rev": SERVER_REV' in server,
+          "ревью: /health отдаёт rev сборки")
+    check("SERVER_REV" in build and "_save_server_rev" in build,
+          "ревью: сборка проставляет rev и записывает его в конфиг")
+    check("server_rev" in build and "server_rev" in cli,
+          "ревью: doctor знает ожидаемое ревью")
+    check("СЕРВЕР УСТАРЕЛ" in cli,
+          "ревью: doctor прямо говорит, что на Colab старый ноутбук")
+    # собранный ноутбук несёт настоящий rev, а не заглушку
+    nb = ROOT / "colab" / "thinking_agent_ver3.ipynb"
+    if nb.exists():
+        text = nb.read_text(encoding="utf-8")
+        check('SERVER_REV = \\"local\\"' not in text,
+              "ревью: в собранном ноутбуке rev уже подставлен")
+        cfg = (ROOT / "config" / "thinking.json").read_text(encoding="utf-8")
+        check("server_rev" in cfg,
+              "ревью: ожидаемое ревью записано в config/thinking.json")
+
+
 def test_token_batches() -> None:
     """Токены склеиваются в пачки — так их проносит прокси (живой замер 05.10).
 
@@ -3152,6 +3243,8 @@ def main() -> int:
     test_personal_notebook_not_committed()
     test_set_url_keeps_token()
     test_token_batches()
+    test_server_rev_stamp()
+    test_gpu_notice_is_actionable()
     test_benefits_no_double_count()
     test_token_honesty()
     test_secrets_smart()

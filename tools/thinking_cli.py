@@ -128,28 +128,46 @@ def cmd_doctor(client: ThinkingClient, args: argparse.Namespace) -> int:
     _out(f"HEALTH:   {'ok' if ok else 'НЕТ'}" + (f" ({reason})" if reason else ""))
     if ok:
         h = getattr(client, "health_data", {}) or {}
+        # Ревью сборки: сервер на Colab отдаёт rev, с которым он собран.
+        # Если он не совпадает с ожидаемым — загружен старый ноутбук, и
+        # никакие настройки ПК это не починят. Раньше такая ситуация
+        # выглядела как «всё сломалось», и причину приходилось искать
+        # вручную по openapi.json.
+        want = str(client.cfg.get("server_rev") or "")
+        got = str(h.get("rev") or "")
+        if want and got != want:
+            # Нет rev — тоже устаревание: сервер, который его не отдаёт,
+            # собран до появления ревью (живой прогон 05.10).
+            _out(f"РЕВЬЮ:    сервер на Colab {got or 'не сообщает'}, "
+                 f"ожидается {want}")
+            _out("! СЕРВЕР УСТАРЕЛ: на Colab запущен старый ноутбук. "
+                 "Загрузите заново "
+                 "colab/thinking_agent_personal.ipynb (Upload notebook) "
+                 "и выполните Runtime → Run all. Настройки ПК тут не помогут.")
+        else:
+            _out(f"РЕВЬЮ:    {got}")
         _out(f"MODEL:    {h.get('model')}  upstream={h.get('upstream')}")
         _out(f"GPU:      {h.get('gpu')}  vram={h.get('vram_used_gb')} GB  uptime={h.get('uptime_s')} с")
         _out(f"PLANS:    {h.get('plans')}   событий: {h.get('events')}")
-        # Бесплатный Colab без чётких квот: GPU-сессии обычно 2–4 ч, остаток
-        # CPU (бывает ~28 ч) — только ориентир. Не пугаем конкретным числом,
-        # а напоминаем проверить лимиты, когда всё встало.
+        # Про рантайм — инструкция, а не догадки. Раньше здесь писалось
+        # «бесплатные GPU-часы, видимо, закончились» и дальше «подождать
+        # ~сутки или сменить аккаунт»: ни то, ни другое не проверено, а
+        # человеку нужна была конкретная последовательность действий.
         up = h.get("uptime_s")
         gpu = str(h.get("gpu") or "cpu")
         if isinstance(up, (int, float)) and gpu != "cpu" and up >= 7200:
-            _out(f"! ЛИМИТЫ: GPU-сессия идёт уже {up / 60:.0f} мин — бесплатный "
-                 f"GPU обычно живёт 2–4 ч. Сохрани ноутбук заранее; если всё "
-                 f"встало — Colab: Сессия → Лимиты (цифры меняются и не "
-                 f"гарантированы). Дальше: CPU, пауза ~сутки или смена аккаунта.")
+            _out(f"! GPU идёт {up / 60:.0f} мин: у бесплатного Colab GPU-время "
+                 f"ограничено, дальше сессия перейдёт на CPU. Сохрани ноутбук "
+                 f"заранее; без ограничений по времени — Colab Pro (~10 $/мес).")
         if isinstance(up, (int, float)) and up >= 93600 and gpu == "cpu":
-            _out(f"! ЛИМИТЫ: CPU-сессия работает {up / 3600:.0f} ч — остаток "
-                 f"в Colab лишь ориентир; при остановке проверь Сессия → "
-                 f"Лимиты (обычно возвращаются через сутки).")
+            _out(f"! CPU уже {up / 3600:.0f} ч — скорость низкая. Ускорить: "
+                 f"Runtime → Change runtime type → T4 GPU. Без лимитов по "
+                 f"времени — Colab Pro.")
         if gpu == "cpu":
-            _out("! БЕЗ GPU: бесплатные GPU-часы, видимо, закончились — можно "
-                 "продолжить на CPU (медленно), подождать ~сутки или сменить "
-                 "Google-аккаунт. На будущее: Kaggle (~30 ч GPU/нед), "
-                 "Paperspace, локальный runtime.")
+            _out("CPU: 3B ≈ 2,5 ток/с (план 1–3 мин), помещаются только 1.5B/3B. "
+                 "Ускориться — Runtime → Change runtime type → T4 GPU, затем "
+                 "Restart session. Нужен буст без ограничений — Colab Pro "
+                 "(~10 $/мес).")
     _out(f"TOKEN:    {'задан' if client.token else 'НЕ задан'}")
     # Телеметрия потоков с сервера: по ней видно, рвётся ДОСТАВКА или
     # ГЕНЕРАЦИЯ. Раньше это приходилось выяснять по косвенным признакам
@@ -480,10 +498,11 @@ def cmd_models(client: ThinkingClient, args: argparse.Namespace) -> int:
     if not data:
         _out("! Colab-сервер не знает /models — перезапусти ноутбук")
         return 4
-    _out("GPU: " + ("есть (T4) — модели считаются быстро"
-                    if data.get("gpu") else
-                    "нет — бесплатные GPU-часы кончились: можно сменить "
-                    "Google-аккаунт или продолжить на CPU"))
+    _out("GPU: " + (str(data.get("gpu") or "есть") +
+                    " — модели считаются быстро" if data.get("gpu") else
+                    "нет, считает CPU: 3B ≈ 2,5 ток/с. Ускорить — "
+                    "Runtime → Change runtime type → T4 GPU; без лимитов по "
+                    "времени — Colab Pro (~10 $/мес)"))
     for m in data.get("models") or []:
         mark = "*" if m.get("active") else " "
         _out(f"{mark} {m.get('label'):<8} {m.get('size_gb')} ГБ  {m.get('path')}")

@@ -26,6 +26,13 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------- конфиг ---
+# Ревью сборки ноутбука. При запуске файла напрямую остаётся "local";
+# scripts/build_colab.py подставляет сюда короткий хэш всех ячеек и тем же
+# значением обновляет config/thinking.json → doctor одной строкой говорит,
+# что сервер на Colab собран из другого кода. Без этого устаревший ноутбук
+# выглядел как «всё сломалось», хотя ловить причину приходилось вручную
+# (живой прогон 05.10: сервер без /plan/async при новом клиенте).
+SERVER_REV = "local"
 _ENV_CACHE: dict = {"mt": None, "text": ""}
 
 
@@ -977,7 +984,8 @@ async def health(x_agent_token: str = Header(default=""), token: str = ""):
     gpu, vram = _gpu_info()
     return {"status": "ok", "model": MODEL_NAME, "upstream": UPSTREAM,
             "uptime_s": int(time.time() - S.t0), "plans": len(S.plans),
-            "events": S.seq, "gpu": gpu, "vram_used_gb": vram}
+            "events": S.seq, "gpu": gpu, "vram_used_gb": vram,
+            "rev": SERVER_REV}
 
 
 @app.get("/metrics")

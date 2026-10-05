@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
+import re
 import secrets
 import sys
 import time
@@ -110,6 +112,48 @@ def _read_cell(name: str) -> str:
     if lines and lines[0].startswith("%%"):
         lines = lines[1:]
     return "\n".join(lines)
+
+
+def _stamped_cells() -> tuple[dict, str]:
+    """Исходники ячеек с проставленным ревью и его короткий хэш.
+
+    Ячейка C получает `SERVER_REV = "<rev>"`, тем же rev помечается
+    config/thinking.json → doctor сравнивает его с тем, что отдаёт живой
+    /health. Один этот механизм заменяет угадывание «новый ли ноутбук
+    загружен»: в 05.10 устаревший сервер выглядел как поломка, и ловить
+    причину пришлось вручную (по openapi.json).
+    """
+    names = ("cell_a_setup.py", "cell_c_server.py", "cell_d_launch.py",
+             "cell_e_background.py", "cell_f_stop.py")
+    sources = {n: _read_cell(n) for n in names}
+    rev = hashlib.sha256(
+        "\x00".join(sources[n] for n in names).encode("utf-8")).hexdigest()[:8]
+    server = sources["cell_c_server.py"]
+    stamped, count = re.subn(r'^SERVER_REV = "local"$',
+                             f'SERVER_REV = "{rev}"', server,
+                             count=1, flags=re.MULTILINE)
+    if count != 1:
+        raise SystemExit(
+            "в cell_c_server.py нет строки SERVER_REV = \"local\" — "
+            "проверь, что она на месте и не переименована")
+    sources["cell_c_server.py"] = stamped
+    return sources, rev
+
+
+def _save_server_rev(rev: str) -> None:
+    """Записывает rev в config/thinking.json, чтобы doctor знал ожидаемый."""
+    path = ROOT / "config" / "thinking.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        say(f"! не обновить server_rev в {path.name}: {exc}")
+        return
+    if data.get("server_rev") == rev:
+        return
+    data["server_rev"] = rev
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+    say(f"config/thinking.json: server_rev = {rev}")
 
 
 def _nb_cell(kind: str, source: str) -> dict:
@@ -286,8 +330,10 @@ def make_notebook(url: str, inline: bool = True, ver: str = "",
     if inline:
         # %%writefile обязан быть первой строкой ячейки, поэтому папки создаёт
         # первая ячейка (os.makedirs) — иначе запись падает с FileNotFoundError.
+        cells_src, rev = _stamped_cells()
+        _save_server_rev(rev)
         write = lambda path, name: _nb_cell(
-            "code", f"%%writefile {path}\n{_read_cell(name)}")
+            "code", f"%%writefile {path}\n{cells_src[name]}")
         cells += [
             _nb_cell("code",
                      "#@title 1/7 · Исходники внутри ноутбука — загрузка не нужна\n"
