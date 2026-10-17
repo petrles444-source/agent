@@ -1,0 +1,85 @@
+/* Сеть проектов — общий стиль. Один файл на все страницы. */
+:root{
+  --bg:#0b1220; --bg-alt:#0f1a2b; --card:#16233a; --line:#24344f;
+  --txt:#e6edf6; --dim:#93a4bd; --accent:#38bdf8; --accent2:#22d3ee;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;scroll-padding-top:74px}
+body{background:var(--bg);color:var(--txt);line-height:1.65;
+  font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1040px;margin:0 auto;padding:0 20px}
+
+.nav{position:sticky;top:0;z-index:50;background:rgba(11,18,32,.9);
+  backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+.brand{display:flex;align-items:center;gap:9px;color:var(--txt);text-decoration:none;
+  font-weight:800;font-size:18px;letter-spacing:.3px}
+.nav nav{display:flex;align-items:center;gap:18px}
+.nav nav a{color:var(--dim);text-decoration:none;font-size:14px}
+.nav nav a:hover{color:var(--accent)}
+
+.hero{padding:66px 0 50px;position:relative;overflow:hidden}
+.hero::before{content:"";position:absolute;inset:-45% 45% auto -25%;height:480px;
+  background:radial-gradient(closest-side,rgba(56,189,248,.16),transparent);pointer-events:none}
+.crumb{display:inline-flex;align-items:center;gap:7px;margin-bottom:20px;
+  padding:5px 13px;border-radius:999px;background:rgba(56,189,248,.09);
+  border:1px solid rgba(56,189,248,.26);color:var(--accent);
+  font-size:12.5px;font-weight:600;text-decoration:none}
+.crumb:hover{background:rgba(56,189,248,.16)}
+.hero h1{font-size:clamp(31px,6vw,54px);line-height:1.08;font-weight:800;
+  letter-spacing:-1.4px;margin-bottom:18px;max-width:15em}
+.lead{font-size:clamp(15.5px,2.1vw,18px);color:var(--dim);max-width:660px;margin-bottom:28px}
+.cta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:40px}
+.btn{display:inline-block;padding:12px 24px;border-radius:9px;text-decoration:none;
+  font-weight:700;font-size:15px;transition:transform .12s,filter .15s}
+.btn:hover{transform:translateY(-2px)}
+.btn-main{background:linear-gradient(100deg,var(--accent),var(--accent2));color:#06121f}
+.btn-main:hover{filter:brightness(1.08)}
+.btn-ghost{background:transparent;color:var(--accent);border:1.5px solid rgba(56,189,248,.4)}
+.btn-ghost:hover{background:rgba(56,189,248,.08)}
+
+.facts{display:flex;gap:36px;flex-wrap:wrap}
+.facts div{display:flex;flex-direction:column}
+.facts b{font-size:28px;font-weight:800;color:var(--accent);line-height:1.2}
+.facts span{font-size:13px;color:var(--dim)}
+
+.sect{padding:58px 0;border-top:1px solid var(--line)}
+.sect.alt{background:var(--bg-alt)}
+.sect h2{font-size:clamp(23px,3.6vw,31px);font-weight:800;letter-spacing:-.6px;margin-bottom:26px}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(272px,1fr));gap:17px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:24px}
+.card .ico{font-size:25px;margin-bottom:12px}
+.card h3{font-size:17px;font-weight:700;margin-bottom:8px}
+.card p{color:var(--dim);font-size:14.6px}
+
+.note{margin-top:22px;padding:20px 22px;background:rgba(56,189,248,.05);
+  border:1px solid rgba(56,189,248,.22);border-left:4px solid var(--accent);
+  border-radius:9px;color:var(--dim);font-size:14.6px}
+.note b{color:var(--txt)}
+
+/* ---- сеть проектов ---- */
+.net{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:13px}
+.net a{display:flex;flex-direction:column;gap:4px;padding:17px 19px;border-radius:11px;
+  background:var(--card);border:1px solid var(--line);text-decoration:none;transition:.15s}
+.net a:hover{border-color:rgba(56,189,248,.55);background:rgba(56,189,248,.06);transform:translateY(-2px)}
+.net .t{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15.5px;color:var(--txt)}
+.net .t em{font-style:normal;font-size:18px}
+.net .d{font-size:13.4px;color:var(--dim);line-height:1.5}
+.net a.me{border-color:rgba(56,189,248,.5);background:rgba(56,189,248,.07)}
+.badge{align-self:flex-start;font-size:11px;font-weight:700;letter-spacing:.4px;
+  color:var(--accent);background:rgba(56,189,248,.13);padding:2px 9px;border-radius:999px}
+
+footer{padding:30px 0;border-top:1px solid var(--line);text-align:center;
+  color:var(--dim);font-size:13.4px}
+footer a{color:var(--accent);text-decoration:none}
+footer p{margin-bottom:6px}
+
+@media(max-width:700px){
+  .nav nav a:not(.net-btn){display:none}
+  .hero{padding:44px 0 36px}
+  .facts{gap:24px}.facts b{font-size:23px}
+  .sect{padding:44px 0}
+  .cta .btn{width:100%;text-align:center}
+}
