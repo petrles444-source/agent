@@ -60,13 +60,13 @@ body{background:var(--bg);color:var(--txt);line-height:1.65;
 .note b{color:var(--txt)}
 
 /* ---- сеть проектов ---- */
-.net{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:13px}
-.net a{display:flex;flex-direction:column;gap:4px;padding:17px 19px;border-radius:11px;
+.net,.net-card{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:13px}
+.net a,.net-card a{display:flex;flex-direction:column;gap:4px;padding:17px 19px;border-radius:11px;
   background:var(--card);border:1px solid var(--line);text-decoration:none;transition:.15s}
-.net a:hover{border-color:rgba(56,189,248,.55);background:rgba(56,189,248,.06);transform:translateY(-2px)}
-.net .t{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15.5px;color:var(--txt)}
+.net a:hover,.net-card a:hover{border-color:rgba(56,189,248,.55);background:rgba(56,189,248,.06);transform:translateY(-2px)}
+.net .t,.net-card .t{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15.5px;color:var(--txt)}
 .net .t em{font-style:normal;font-size:18px}
-.net .d{font-size:13.4px;color:var(--dim);line-height:1.5}
+.net .d,.net-card .d{font-size:13.4px;color:var(--dim);line-height:1.5}
 .net a.me{border-color:rgba(56,189,248,.5);background:rgba(56,189,248,.07)}
 .badge{align-self:flex-start;font-size:11px;font-weight:700;letter-spacing:.4px;
   color:var(--accent);background:rgba(56,189,248,.13);padding:2px 9px;border-radius:999px}
